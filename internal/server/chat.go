@@ -366,6 +366,12 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, public
 	case writeFailed:
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
+	case errors.Is(readErr, context.Canceled):
+		// The upstream read is tied to the request context, so a student
+		// closing the connection surfaces here as a canceled read, not as a
+		// failed write.
+		ev.Status = spool.StatusCanceled
+		ev.ErrorType = "client_disconnected"
 	case readErr != nil:
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_interrupted"
