@@ -1,0 +1,115 @@
+// Package spool records one usage event per request as a JSONL line. The
+// spool is the gateway's outbox: a future control-plane reporter reads these
+// files and ships them in batches, deduplicating on eventUuid, so the format
+// here is already the wire format. Prompt and response bodies have no field
+// to land in, by design.
+package spool
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// Event statuses, mirroring what the request path can observe.
+const (
+	StatusOK           = "OK"
+	StatusAuthRejected = "AUTH_REJECTED"
+	StatusRateLimited  = "RATE_LIMITED"
+	StatusBadRequest   = "BAD_REQUEST"
+	StatusUpstreamErr  = "UPSTREAM_ERROR"
+	StatusTimeout      = "TIMEOUT"
+	StatusCanceled     = "CANCELED"
+)
+
+// Event is one request's accounting record.
+type Event struct {
+	EventUUID       string    `json:"eventUuid"`
+	KeyID           string    `json:"keyId,omitempty"`
+	PublicModelName string    `json:"publicModelName,omitempty"`
+	Status          string    `json:"status"`
+	ErrorType       string    `json:"errorType,omitempty"`
+	InputTokens     int       `json:"inputTokens"`
+	OutputTokens    int       `json:"outputTokens"`
+	Estimated       bool      `json:"estimated,omitempty"`
+	LatencyMs       int64     `json:"latencyMs"`
+	TtftMs          int64     `json:"ttftMs,omitempty"`
+	RequestedAt     time.Time `json:"requestedAt"`
+}
+
+// Writer appends events to a per-day file (usage-YYYYMMDD.jsonl, UTC) in the
+// spool directory. Writes are serialized; a write failure is returned to the
+// caller for logging but never blocks the response that already went out.
+type Writer struct {
+	mu  sync.Mutex
+	dir string
+	day string
+	f   *os.File
+}
+
+// Open ensures the spool directory exists.
+func Open(dir string) (*Writer, error) {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, fmt.Errorf("spool: %w", err)
+	}
+	return &Writer{dir: dir}, nil
+}
+
+// Write appends one event.
+func (w *Writer) Write(ev Event) error {
+	line, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("spool: %w", err)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	day := ev.RequestedAt.UTC().Format("20060102")
+	if w.f == nil || day != w.day {
+		if w.f != nil {
+			_ = w.f.Close()
+		}
+		f, err := os.OpenFile(filepath.Join(w.dir, "usage-"+day+".jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+		if err != nil {
+			return fmt.Errorf("spool: %w", err)
+		}
+		w.f = f
+		w.day = day
+	}
+	if _, err := w.f.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("spool: %w", err)
+	}
+	return nil
+}
+
+// Close releases the current file.
+func (w *Writer) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return nil
+	}
+	err := w.f.Close()
+	w.f = nil
+	return err
+}
+
+// NewEventUUID returns a random 128-bit identifier in UUIDv4 form. It exists
+// so batch ingestion can be retried without double-counting.
+func NewEventUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing means the process has bigger problems; a
+		// timestamp keeps the event usable rather than dropping it.
+		return fmt.Sprintf("t-%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	dst := make([]byte, 32)
+	hex.Encode(dst, b[:])
+	return string(dst[0:8]) + "-" + string(dst[8:12]) + "-" + string(dst[12:16]) + "-" + string(dst[16:20]) + "-" + string(dst[20:32])
+}

@@ -1,15 +1,90 @@
 // Command llm-gateway is the campus LLM API gateway: it terminates
-// OpenAI-compatible requests from student code, authenticates API keys,
-// enforces usage limits, and forwards to the configured upstream model
-// server.
+// OpenAI-compatible requests from student code, authenticates API keys
+// against a snapshot document, enforces usage limits, forwards to the
+// configured upstream model server, and meters usage into a local spool.
 package main
 
 import (
-	"fmt"
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/pnuops/pickle-llm-gateway/internal/config"
+	"github.com/pnuops/pickle-llm-gateway/internal/limits"
+	"github.com/pnuops/pickle-llm-gateway/internal/server"
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
+	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "llm-gateway: gateway is not implemented yet")
-	os.Exit(1)
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
+	cfg, err := config.FromEnv()
+	if err != nil {
+		log.Error("startup failed", "error", err)
+		os.Exit(1)
+	}
+	store, err := snapshot.Open(cfg.SnapshotPath, log)
+	if err != nil {
+		log.Error("startup failed", "error", err)
+		os.Exit(1)
+	}
+	sp, err := spool.Open(cfg.SpoolDir)
+	if err != nil {
+		log.Error("startup failed", "error", err)
+		os.Exit(1)
+	}
+	srv := server.New(cfg, store, limits.New(nil), sp, log)
+
+	hs := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
+	go func() {
+		t := time.NewTicker(cfg.SnapshotPollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				store.Refresh()
+			case <-hup:
+				store.Refresh()
+			}
+		}
+	}()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- hs.ListenAndServe() }()
+	log.Info("llm-gateway listening", "addr", cfg.Listen, "generation", store.Generation())
+
+	select {
+	case <-ctx.Done():
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("listener failed", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = hs.Shutdown(shutdownCtx)
+	if err := sp.Close(); err != nil {
+		log.Error("spool close failed", "error", err)
+	}
+	log.Info("llm-gateway stopped")
 }
