@@ -399,8 +399,8 @@ func rewriteChunk(payload []byte, publicName string) (out []byte, u *usage, cont
 		}
 	}
 	if choices, _ := m["choices"].([]any); len(choices) > 0 {
-		if c0, _ := choices[0].(map[string]any); c0 != nil {
-			if delta, _ := c0["delta"].(map[string]any); delta != nil {
+		if first, _ := choices[0].(map[string]any); first != nil {
+			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {
 					contentChars = len(content)
 				}
