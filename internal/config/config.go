@@ -20,6 +20,11 @@ type Upstream struct {
 	Ref     string // lowercase reference name, as used in the snapshot
 	BaseURL string // e.g. https://api.openai.com/v1
 	APIKey  string // may be empty for an unauthenticated upstream (a local vLLM)
+	// CapField is the request field the gateway injects the per-model output
+	// cap into. Modern OpenAI-compatible servers take max_completion_tokens
+	// (the default); servers that only honor the legacy field are configured
+	// with max_tokens here, otherwise the cap would be silently ignored.
+	CapField string
 }
 
 // Config is everything the daemon needs to run.
@@ -148,8 +153,10 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			ref, field = strings.TrimSuffix(rest, "_BASE_URL"), "base"
 		case strings.HasSuffix(rest, "_API_KEY"):
 			ref, field = strings.TrimSuffix(rest, "_API_KEY"), "key"
+		case strings.HasSuffix(rest, "_CAP_FIELD"):
+			ref, field = strings.TrimSuffix(rest, "_CAP_FIELD"), "cap"
 		default:
-			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL or _API_KEY)")
+			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY or _CAP_FIELD)")
 			continue
 		}
 		if ref == "" {
@@ -159,16 +166,29 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		id := strings.ToLower(ref)
 		u := ups[id]
 		u.Ref = id
-		if field == "base" {
+		switch field {
+		case "base":
 			u.BaseURL = strings.TrimRight(val, "/")
-		} else {
+		case "key":
 			u.APIKey = val
+		case "cap":
+			u.CapField = val
 		}
 		ups[id] = u
 	}
 	for id, u := range ups {
 		if u.BaseURL == "" {
-			errs = append(errs, "upstream "+id+" has an API key but no "+envPrefix+"UPSTREAM_"+strings.ToUpper(id)+"_BASE_URL")
+			errs = append(errs, "upstream "+id+" is missing "+envPrefix+"UPSTREAM_"+strings.ToUpper(id)+"_BASE_URL")
+			delete(ups, id)
+			continue
+		}
+		switch u.CapField {
+		case "":
+			u.CapField = "max_completion_tokens"
+			ups[id] = u
+		case "max_completion_tokens", "max_tokens":
+		default:
+			errs = append(errs, "upstream "+id+" has an unknown cap field "+u.CapField+" (max_completion_tokens or max_tokens)")
 			delete(ups, id)
 		}
 	}

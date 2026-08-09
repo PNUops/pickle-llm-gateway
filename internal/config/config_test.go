@@ -80,3 +80,27 @@ func TestMultipleUpstreams(t *testing.T) {
 		t.Fatalf("upstreams: %+v", ups)
 	}
 }
+
+func TestCapFieldParsing(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_A_BASE_URL=https://a.example/v1",
+		"LLMGW_UPSTREAM_B_BASE_URL=https://b.example/v1",
+		"LLMGW_UPSTREAM_B_CAP_FIELD=max_tokens",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if ups["a"].CapField != "max_completion_tokens" {
+		t.Fatalf("default cap field not applied: %+v", ups["a"])
+	}
+	if ups["b"].CapField != "max_tokens" {
+		t.Fatalf("explicit cap field lost: %+v", ups["b"])
+	}
+	_, errs = upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_C_BASE_URL=https://c.example/v1",
+		"LLMGW_UPSTREAM_C_CAP_FIELD=max_new_tokens",
+	})
+	if len(errs) == 0 {
+		t.Fatal("unknown cap field accepted")
+	}
+}
