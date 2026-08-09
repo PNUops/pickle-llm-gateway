@@ -44,9 +44,10 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 지원하지 않는 파라미터는 이름을 밝혀 거부하므로, 업스트림을 바꿔도 학생 코드가 보내는
 요청의 의미는 달라지지 않습니다.
 
-토큰 사용량은 업스트림이 돌려주는 usage 값으로 기록합니다. 스트리밍 요청에는
-`stream_options.include_usage`를 강제로 켜서 마지막 조각의 사용량을 받습니다. 연결이
-중간에 끊기면 크기 기반 추정치를 `estimated` 표시와 함께 기록합니다. 기록은 하루 단위
+토큰 사용량은 업스트림이 돌려주는 usage 값으로 기록합니다. 스트리밍 요청은 업스트림에
+`stream_options.include_usage`를 강제로 켜서 마지막 조각의 사용량을 받되, 학생이 직접
+요청하지 않았다면 그 조각은 계측에만 쓰고 응답으로는 보내지 않습니다. 사용량을 얻지
+못한 채 끝난 요청은 크기 기반 추정치를 `estimated` 표시와 함께 기록합니다. 기록은 하루 단위
 JSONL 파일에 쌓이며, 항목마다 고유한 `eventUuid`가 있어 이후 수집이 중복 없이
 재시도될 수 있습니다.
 
@@ -95,6 +96,7 @@ go run ./cmd/llm-gateway
 | `LLMGW_SPOOL_DIR` | ✔ | 사용량 기록 디렉터리 |
 | `LLMGW_UPSTREAM_<REF>_BASE_URL` | ✔ | 업스트림 주소. `<REF>`는 스냅샷의 `upstreamRef`와 대소문자 무관하게 대응 |
 | `LLMGW_UPSTREAM_<REF>_API_KEY` | | 업스트림 인증 토큰. 비우면 인증 없이 호출 |
+| `LLMGW_UPSTREAM_<REF>_CAP_FIELD` | | 출력 상한을 주입할 필드. 기본 `max_completion_tokens`, 구형 서버는 `max_tokens` 지정 |
 
 <details>
 <summary>조정 값 (기본값으로 동작)</summary>
