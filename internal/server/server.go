@@ -71,18 +71,19 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // authenticate resolves the bearer token to a key entry, refusing anything
-// but an ACTIVE, unexpired key. It returns the key and, on refusal, the error
-// to send and the spool status to record.
-func (s *Server) authenticate(r *http.Request) (*snapshot.Key, *apiError) {
+// but an ACTIVE, unexpired key. The lookup comes from the caller so a request
+// authenticates against the same snapshot view it does everything else with.
+// The auth scheme is matched case-insensitively (RFC 7235).
+func (s *Server) authenticate(r *http.Request, lookup func(string) *snapshot.Key) (*snapshot.Key, *apiError) {
 	h := r.Header.Get("Authorization")
-	if h == "" {
+	const scheme = "bearer "
+	if len(h) <= len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
 		return nil, &errMissingKey
 	}
-	token, ok := strings.CutPrefix(h, "Bearer ")
-	if !ok || token == "" {
+	token := strings.TrimSpace(h[len(scheme):])
+	if token == "" {
 		return nil, &errMissingKey
 	}
-	_, lookup, _ := s.store.Current()
 	key := lookup(snapshot.HashToken(token))
 	if key == nil {
 		return nil, &errInvalidKey
@@ -104,12 +105,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errMethod)
 		return
 	}
-	doc, _, _ := s.store.Current()
+	doc, keyLookup, _ := s.store.Current()
 	if !doc.ServiceEnabled {
 		writeAPIError(w, errServiceDisabled)
 		return
 	}
-	key, authErr := s.authenticate(r)
+	key, authErr := s.authenticate(r, keyLookup)
 	if authErr != nil {
 		writeAPIError(w, *authErr)
 		return

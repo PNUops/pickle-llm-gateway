@@ -27,19 +27,28 @@ const (
 	upstreamCred  = "upstream-secret-cred"
 )
 
+type mockOpts struct {
+	delay       time.Duration
+	status      int
+	errBody     string
+	rawResp     string        // non-stream: raw body override (may be invalid JSON)
+	noUsage     bool          // non-stream: omit the usage field
+	splitEvent  bool          // stream: split the first event across two data lines
+	brokenChunk bool          // stream: emit an unparseable data payload first
+	chunkDelay  time.Duration // stream: pause before each chunk
+}
+
 type upstreamMock struct {
 	mu       sync.Mutex
 	lastBody map[string]json.RawMessage
 	lastAuth string
-	delay    time.Duration
-	status   int
-	errBody  string
+	opts     mockOpts
 }
 
-func (u *upstreamMock) set(f func(*upstreamMock)) {
+func (u *upstreamMock) set(f func(*mockOpts)) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	f(u)
+	f(&u.opts)
 }
 
 func (u *upstreamMock) last() (map[string]json.RawMessage, string) {
@@ -55,15 +64,15 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	u.lastBody = params
 	u.lastAuth = r.Header.Get("Authorization")
-	delay, status, errBody := u.delay, u.status, u.errBody
+	cp := u.opts
 	u.mu.Unlock()
 
-	if delay > 0 {
-		time.Sleep(delay)
+	if cp.delay > 0 {
+		time.Sleep(cp.delay)
 	}
-	if status != 0 && status != http.StatusOK {
-		w.WriteHeader(status)
-		_, _ = io.WriteString(w, errBody)
+	if cp.status != 0 && cp.status != http.StatusOK {
+		w.WriteHeader(cp.status)
+		_, _ = io.WriteString(w, cp.errBody)
 		return
 	}
 	streaming := false
@@ -72,23 +81,39 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	if !streaming {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"chatcmpl-t1","object":"chat.completion","created":1700000000,"model":"`+upstreamModel+`","choices":[{"index":0,"message":{"role":"assistant","content":"안녕하세요"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`)
+		switch {
+		case cp.rawResp != "":
+			_, _ = io.WriteString(w, cp.rawResp)
+		case cp.noUsage:
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-t1","object":"chat.completion","model":"`+upstreamModel+`","choices":[{"index":0,"message":{"role":"assistant","content":"안녕하세요"},"finish_reason":"stop"}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-t1","object":"chat.completion","created":1700000000,"model":"`+upstreamModel+`","choices":[{"index":0,"message":{"role":"assistant","content":"안녕하세요"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`)
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	fl := w.(http.Flusher)
-	chunks := []string{
-		`{"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"role":"assistant","content":"안녕"}}]}`,
-		`{"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"하세요"}}]}`,
-		`{"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
-		`{"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`,
-	}
-	for _, c := range chunks {
-		_, _ = io.WriteString(w, "data: "+c+"\n\n")
+	emit := func(raw string) {
+		if cp.chunkDelay > 0 {
+			time.Sleep(cp.chunkDelay)
+		}
+		_, _ = io.WriteString(w, raw)
 		fl.Flush()
 	}
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	fl.Flush()
+	if cp.brokenChunk {
+		emit("data: {broken \"model\": \"" + upstreamModel + "\"\n\n")
+	}
+	if cp.splitEvent {
+		// One JSON event across two data lines: legal SSE, joined with \n.
+		emit("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"" + upstreamModel + "\",\n" +
+			"data: \"choices\":[{\"index\":0,\"delta\":{\"content\":\"안녕\"}}]}\n\n")
+	} else {
+		emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"role":"assistant","content":"안녕"}}]}` + "\n\n")
+	}
+	emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"하세요"}}]}` + "\n\n")
+	emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n")
+	emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}` + "\n\n")
+	emit("data: [DONE]\n\n")
 }
 
 type harness struct {
@@ -153,7 +178,7 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		DefaultTpm:          1_000_000,
 		DefaultConcurrency:  8,
 		Upstreams: map[string]config.Upstream{
-			"mock": {Ref: "mock", BaseURL: up.URL, APIKey: upstreamCred},
+			"mock": {Ref: "mock", BaseURL: up.URL, APIKey: upstreamCred, CapField: "max_completion_tokens"},
 		},
 	}
 	if mutateCfg != nil {
@@ -348,6 +373,11 @@ func TestChatStream(t *testing.T) {
 	if !strings.Contains(text, "안녕") || !strings.Contains(text, "하세요") {
 		t.Fatal("content deltas lost")
 	}
+	// The student did not opt into include_usage, so the gateway-requested
+	// usage chunk is consumed for metering, never forwarded.
+	if strings.Contains(text, "prompt_tokens") {
+		t.Fatalf("usage chunk forwarded to a client that did not ask for it:\n%s", text)
+	}
 
 	sent, _ := h.mock.last()
 	var opts map[string]bool
@@ -469,7 +499,7 @@ func TestConcurrencyLimit(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.Keys[0].Limits.Concurrency = 1
 	}, nil)
-	h.mock.set(func(u *upstreamMock) { u.delay = 400 * time.Millisecond })
+	h.mock.set(func(u *mockOpts) { u.delay = 400 * time.Millisecond })
 
 	type result struct {
 		status int
@@ -537,7 +567,7 @@ func TestSnapshotReloadRevokesKey(t *testing.T) {
 
 func TestUpstreamErrorShaping(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	h.mock.set(func(u *upstreamMock) {
+	h.mock.set(func(u *mockOpts) {
 		u.status = 500
 		u.errBody = `{"error":"boom at https://internal-host:9999/secret-path"}`
 	})
@@ -549,7 +579,7 @@ func TestUpstreamErrorShaping(t *testing.T) {
 		t.Fatal("upstream error detail leaked to the client")
 	}
 
-	h.mock.set(func(u *upstreamMock) { u.status = 400; u.errBody = `{"error":{"message":"bad param"}}` })
+	h.mock.set(func(u *mockOpts) { u.status = 400; u.errBody = `{"error":{"message":"bad param"}}` })
 	status, body = h.chat(t, testToken, chatBody)
 	if status != 400 || errCode(t, body) != "upstream_rejected" {
 		t.Fatalf("got %d %s", status, body)
@@ -567,7 +597,7 @@ func TestUpstreamTimeout(t *testing.T) {
 	h := newHarness(t, nil, func(c *config.Config) {
 		c.UpstreamHeaderWait = 100 * time.Millisecond
 	})
-	h.mock.set(func(u *upstreamMock) { u.delay = 2 * time.Second })
+	h.mock.set(func(u *mockOpts) { u.delay = 2 * time.Second })
 	status, body := h.chat(t, testToken, chatBody)
 	if status != 504 || errCode(t, body) != "upstream_timeout" {
 		t.Fatalf("got %d %s", status, body)
@@ -608,5 +638,178 @@ func TestRequestBodyCap(t *testing.T) {
 	status, body := h.chat(t, testToken, big)
 	if status != 400 || errCode(t, body) != "request_too_large" {
 		t.Fatalf("got %d %s", status, body)
+	}
+}
+
+func TestStreamUsageChunkOnlyWhenRequested(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)
+	if status != 200 || !strings.Contains(string(body), `"prompt_tokens":7`) {
+		t.Fatalf("opted-in stream lost its usage chunk: %d %s", status, body)
+	}
+}
+
+func TestServerBusyDoesNotChargeRpm(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Rpm = 2 },
+		func(c *config.Config) { c.MaxInFlight = 1 })
+	h.mock.set(func(u *mockOpts) { u.delay = 500 * time.Millisecond })
+
+	done := make(chan int, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+		if err != nil {
+			done <- -1
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- -1
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		done <- resp.StatusCode
+	}()
+	time.Sleep(100 * time.Millisecond)
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 503 || errCode(t, body) != "server_busy" {
+		t.Fatalf("expected server_busy while saturated, got %d %s", status, body)
+	}
+	if s := <-done; s != 200 {
+		t.Fatalf("occupying request failed: %d", s)
+	}
+	h.mock.set(func(u *mockOpts) { u.delay = 0 })
+	// rpm is 2 and only the completed request was charged, so this passes.
+	// Before the reorder the busy refusal also charged a token and this
+	// request would be refused with rate_limit_requests.
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("busy refusal charged the rpm bucket: %d %s", status, body)
+	}
+}
+
+func TestNullMaxTokensTreatedAsAbsent(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_tokens":null}`)
+	if status != 200 {
+		t.Fatalf("null max_tokens refused: %d %s", status, body)
+	}
+	sent, _ := h.mock.last()
+	if _, has := sent["max_tokens"]; has {
+		t.Fatal("null max_tokens forwarded upstream")
+	}
+	var n int
+	if err := json.Unmarshal(sent["max_completion_tokens"], &n); err != nil || n != 4096 {
+		t.Fatalf("cap not injected after null: %s", sent["max_completion_tokens"])
+	}
+}
+
+func TestInvalidMaxTokensValue(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_tokens":"lots"}`)
+	if status != 400 || errCode(t, body) != "invalid_parameter_value" {
+		t.Fatalf("got %d %s", status, body)
+	}
+}
+
+func TestLowercaseBearerScheme(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("lowercase scheme refused: %d %s", resp.StatusCode, raw)
+	}
+}
+
+func TestCapFieldPerUpstream(t *testing.T) {
+	h := newHarness(t, nil, func(c *config.Config) {
+		u := c.Upstreams["mock"]
+		u.CapField = "max_tokens"
+		c.Upstreams["mock"] = u
+	})
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	sent, _ := h.mock.last()
+	var n int
+	if err := json.Unmarshal(sent["max_tokens"], &n); err != nil || n != 4096 {
+		t.Fatalf("legacy cap field not used: %s", sent["max_tokens"])
+	}
+}
+
+func TestSplitEventRewritten(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.splitEvent = true })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	text := string(body)
+	if status != 200 || strings.Contains(text, upstreamModel) {
+		t.Fatalf("split event leaked the upstream model:\n%s", text)
+	}
+	if !strings.Contains(text, `"model":"pnu-general"`) || !strings.Contains(text, "안녕") {
+		t.Fatalf("split event lost content:\n%s", text)
+	}
+}
+
+func TestUnparseableChunkDropped(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.brokenChunk = true })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	text := string(body)
+	if status != 200 || strings.Contains(text, upstreamModel) || strings.Contains(text, "{broken") {
+		t.Fatalf("unparseable chunk forwarded:\n%s", text)
+	}
+	if !strings.Contains(text, "data: [DONE]") {
+		t.Fatal("stream did not finish")
+	}
+}
+
+func TestNonStreamInvalidUpstreamJSON(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.rawResp = "<html>error page naming " + upstreamModel + "</html>" })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 502 || errCode(t, body) != "upstream_error" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	if bytes.Contains(body, []byte(upstreamModel)) {
+		t.Fatal("invalid upstream body forwarded")
+	}
+}
+
+func TestNonStreamWithoutUsageEstimates(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.noUsage = true })
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || !evs[0].Estimated || evs[0].OutputTokens == 0 || evs[0].InputTokens == 0 {
+		t.Fatalf("no-usage response not estimated: %+v", evs)
+	}
+}
+
+func TestStreamDeadlineReported(t *testing.T) {
+	h := newHarness(t, nil, func(c *config.Config) { c.RequestMaxDuration = 300 * time.Millisecond })
+	h.mock.set(func(u *mockOpts) { u.chunkDelay = 150 * time.Millisecond })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	text := string(body)
+	if status != 200 {
+		t.Fatalf("stream status %d", status)
+	}
+	if !strings.Contains(text, "request_deadline_exceeded") || !strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("deadline not reported to the client:\n%s", text)
+	}
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].Status != spool.StatusTimeout || evs[0].ErrorType != "request_deadline_exceeded" {
+		t.Fatalf("unexpected event: %+v", evs)
 	}
 }

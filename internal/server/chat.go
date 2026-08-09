@@ -73,12 +73,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		record()
 	}
 
-	doc, _, modelLookup := s.store.Current()
+	// One snapshot view per request: every check below reads this state, so a
+	// concurrent reload can never mix generations within a request.
+	doc, keyLookup, modelLookup := s.store.Current()
 	if !doc.ServiceEnabled {
 		refuse(errServiceDisabled, spool.StatusAuthRejected)
 		return
 	}
-	key, authErr := s.authenticate(r)
+	key, authErr := s.authenticate(r, keyLookup)
 	if authErr != nil {
 		refuse(*authErr, spool.StatusAuthRejected)
 		return
@@ -87,6 +89,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	if key.QuotaExhausted {
 		refuse(errQuotaExhausted, spool.StatusRateLimited)
+		return
+	}
+	// The gateway-wide cap is checked before any per-key charge: a refusal
+	// the student cannot influence must not spend their request budget.
+	select {
+	case s.inFlight <- struct{}{}:
+		defer func() { <-s.inFlight }()
+	default:
+		refuse(errServerBusy, spool.StatusRateLimited)
 		return
 	}
 	rpm, tpm, conc := s.keyLimits(key)
@@ -103,13 +114,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	select {
-	case s.inFlight <- struct{}{}:
-		defer func() { <-s.inFlight }()
-	default:
-		refuse(errServerBusy, spool.StatusRateLimited)
-		return
-	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.RequestBodyMaxBytes)
 	rawBody, err := io.ReadAll(r.Body)
@@ -153,9 +157,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
 		return
 	}
+	up, ok := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
+	if !ok {
+		s.log.Error("model references an unconfigured upstream", "model", publicModel, "upstreamRef", model.UpstreamRef)
+		refuse(errUpstream, spool.StatusUpstreamErr)
+		return
+	}
 
-	// Output length: an explicit request above the model cap is refused, no
-	// request at all gets the cap injected so the upstream enforces it.
+	// Output length: a JSON null is what SDKs send for "unset" and is treated
+	// as absent; an explicit value above the model cap is refused; no value at
+	// all gets the cap injected (field name per upstream — see config.CapField)
+	// so the upstream enforces it.
 	if model.MaxOutputTokens > 0 {
 		seen := false
 		for _, f := range []string{"max_completion_tokens", "max_tokens"} {
@@ -163,15 +175,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
-			seen = true
+			if string(bytes.TrimSpace(raw)) == "null" {
+				delete(params, f)
+				continue
+			}
 			var n int
-			if json.Unmarshal(raw, &n) != nil || n <= 0 || n > model.MaxOutputTokens {
+			if json.Unmarshal(raw, &n) != nil || n <= 0 {
+				refuse(errInvalidParamValue(f), spool.StatusBadRequest)
+				return
+			}
+			if n > model.MaxOutputTokens {
 				refuse(errOutputTooLong, spool.StatusBadRequest)
 				return
 			}
+			seen = true
 		}
 		if !seen {
-			params["max_completion_tokens"] = json.RawMessage(strconv.Itoa(model.MaxOutputTokens))
+			params[up.CapField] = json.RawMessage(strconv.Itoa(model.MaxOutputTokens))
 		}
 	}
 	// Input length: token counting needs the model's tokenizer, which the
@@ -183,16 +203,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	up, ok := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
-	if !ok {
-		s.log.Error("model references an unconfigured upstream", "model", publicModel, "upstreamRef", model.UpstreamRef)
-		refuse(errUpstream, spool.StatusUpstreamErr)
-		return
-	}
-
 	streaming := false
 	if raw, ok := params["stream"]; ok {
 		_ = json.Unmarshal(raw, &streaming)
+	}
+	// Usage must always come back from the upstream for metering, but the
+	// usage chunk is only forwarded when the student asked for it — clients
+	// that never opted in would break on a chunk with an empty choices array.
+	studentWantsUsage := false
+	if raw, ok := params["stream_options"]; ok {
+		var opts struct {
+			IncludeUsage bool `json:"include_usage"`
+		}
+		_ = json.Unmarshal(raw, &opts)
+		studentWantsUsage = opts.IncludeUsage
 	}
 	params["model"] = json.RawMessage(strconv.Quote(model.UpstreamModel))
 	if streaming {
@@ -204,9 +228,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
+	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
 	defer cancel()
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(upBody))
+	upReq, err := http.NewRequestWithContext(upCtx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(upBody))
 	if err != nil {
 		s.log.Error("building upstream request failed", "error", err)
 		refuse(errUpstream, spool.StatusUpstreamErr)
@@ -226,7 +250,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			ev.Status = spool.StatusCanceled
 			ev.ErrorType = "client_disconnected"
 			record()
-		case ctx.Err() != nil || isTimeout(err):
+		case upCtx.Err() != nil || isTimeout(err):
 			refuse(errUpstreamTimeout, spool.StatusTimeout)
 		default:
 			s.log.Error("upstream request failed", "error", err)
@@ -255,7 +279,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.finishNonStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw))
 		return
 	}
-	s.finishStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw))
+	s.finishStream(w, resp, streamArgs{
+		publicName:   model.PublicName,
+		keyID:        key.KeyID,
+		tpm:          tpm,
+		inputBytes:   len(messagesRaw),
+		forwardUsage: studentWantsUsage,
+		clientCtx:    r.Context(),
+		upCtx:        upCtx,
+	}, &ev, record)
 }
 
 // withIncludeUsage forces stream_options.include_usage on so streamed
@@ -276,30 +308,61 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
-		writeAPIError(w, errUpstream)
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = "upstream_read_failed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeAPIError(w, errUpstreamTimeout)
+			ev.Status = spool.StatusTimeout
+			ev.ErrorType = errUpstreamTimeout.code
+		} else {
+			writeAPIError(w, errUpstream)
+			ev.Status = spool.StatusUpstreamErr
+			ev.ErrorType = "upstream_read_failed"
+		}
 		record()
 		return
 	}
+	// A response that does not parse as JSON is not something the gateway can
+	// vouch for, and forwarding it verbatim would expose the upstream's model
+	// identifiers — answer an upstream error instead.
 	var m map[string]any
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
-	out := body
+	if dec.Decode(&m) != nil {
+		writeAPIError(w, errUpstream)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = "upstream_invalid_response"
+		record()
+		return
+	}
+	if _, has := m["model"]; has {
+		m["model"] = publicName
+	}
 	var u usage
 	haveUsage := false
-	if dec.Decode(&m) == nil {
-		if _, has := m["model"]; has {
-			m["model"] = publicName
+	if uraw, has := m["usage"]; has && uraw != nil {
+		if b, err := json.Marshal(uraw); err == nil && json.Unmarshal(b, &u) == nil {
+			haveUsage = true
 		}
-		if uraw, has := m["usage"]; has && uraw != nil {
-			if b, err := json.Marshal(uraw); err == nil && json.Unmarshal(b, &u) == nil {
-				haveUsage = true
+	}
+	// Fallback size for the estimate when the upstream reported no usage.
+	contentChars := 0
+	if !haveUsage {
+		if choices, _ := m["choices"].([]any); len(choices) > 0 {
+			if first, _ := choices[0].(map[string]any); first != nil {
+				if msg, _ := first["message"].(map[string]any); msg != nil {
+					if content, _ := msg["content"].(string); content != "" {
+						contentChars = len(content)
+					}
+				}
 			}
 		}
-		if b, err := json.Marshal(m); err == nil {
-			out = b
-		}
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		writeAPIError(w, errUpstream)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = "upstream_invalid_response"
+		record()
+		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := w.Write(out); err != nil {
@@ -308,12 +371,22 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 	} else {
 		ev.Status = spool.StatusOK
 	}
-	s.settleUsage(ev, u, haveUsage, inputBytes, 0)
+	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
 	s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
 	record()
 }
 
-func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int) {
+type streamArgs struct {
+	publicName   string
+	keyID        string
+	tpm          int
+	inputBytes   int
+	forwardUsage bool
+	clientCtx    context.Context
+	upCtx        context.Context
+}
+
+func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a streamArgs, ev *spool.Event, record func()) {
 	fl, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -321,78 +394,149 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, public
 	if fl != nil {
 		fl.Flush()
 	}
+	writeFailed := false
+	writeRaw := func(b []byte) bool {
+		if writeFailed {
+			return false
+		}
+		if _, err := w.Write(b); err != nil {
+			writeFailed = true
+			return false
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return true
+	}
 
-	br := bufio.NewReaderSize(resp.Body, 64<<10)
 	var u usage
 	haveUsage := false
 	contentChars := 0
-	writeFailed := false
+	dropped := 0
+
+	// SSE events are framed by blank lines and one event's data may span
+	// several `data:` lines, so payloads are assembled per event before
+	// parsing. An assembled payload that still does not parse is dropped, not
+	// forwarded: a verbatim chunk would leak the upstream model identifier.
+	var dataLines [][]byte
+	flushEvent := func() bool {
+		if len(dataLines) == 0 {
+			return true
+		}
+		payload := bytes.Join(dataLines, []byte("\n"))
+		dataLines = nil
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			return writeRaw([]byte("data: [DONE]\n\n"))
+		}
+		c, ok := rewriteChunk(payload, a.publicName)
+		if !ok {
+			dropped++
+			return true
+		}
+		if c.usage != nil {
+			u = *c.usage
+			haveUsage = true
+			if !a.forwardUsage {
+				if c.choicesEmpty {
+					// The gateway-requested usage chunk; the student did not
+					// opt in, so it is consumed for metering and not sent.
+					return true
+				}
+				c.out = c.stripUsage()
+			}
+		}
+		contentChars += c.contentChars
+		return writeRaw(append(append([]byte("data: "), c.out...), '\n', '\n'))
+	}
+
+	br := bufio.NewReaderSize(resp.Body, 64<<10)
 	var readErr error
 	for {
 		line, err := br.ReadBytes('\n')
-		if len(line) > 0 {
-			out := line
-			trimmed := bytes.TrimSpace(line)
-			if payload, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
-				payload = bytes.TrimSpace(payload)
-				if !bytes.Equal(payload, []byte("[DONE]")) {
-					if rewritten, chunkUsage, delta, ok := rewriteChunk(payload, publicName); ok {
-						out = append(append([]byte("data: "), rewritten...), '\n')
-						contentChars += delta
-						if chunkUsage != nil {
-							u = *chunkUsage
-							haveUsage = true
-						}
-					}
-				}
+		trimmed := bytes.TrimRight(line, "\r\n")
+		switch {
+		case len(trimmed) == 0 && len(line) > 0:
+			flushEvent()
+		case len(trimmed) == 0:
+		case trimmed[0] == ':':
+			// Comment lines are keepalives; forward as-is.
+			writeRaw(append(trimmed, '\n', '\n'))
+		default:
+			if after, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
+				dataLines = append(dataLines, bytes.TrimSpace(after))
 			}
-			if _, werr := w.Write(out); werr != nil {
-				writeFailed = true
-				break
-			}
-			if fl != nil {
-				fl.Flush()
-			}
+			// Other SSE fields (event:, id:, retry:) are not part of the
+			// surface and are dropped.
+		}
+		if writeFailed {
+			break
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				readErr = err
+			} else {
+				flushEvent()
 			}
 			break
 		}
 	}
+	if dropped > 0 {
+		s.log.Warn("dropped unparseable stream chunks", "keyId", a.keyID, "count", dropped)
+	}
 
 	switch {
-	case writeFailed:
+	case writeFailed || a.clientCtx.Err() != nil:
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
-	case errors.Is(readErr, context.Canceled):
-		// The upstream read is tied to the request context, so a student
-		// closing the connection surfaces here as a canceled read, not as a
-		// failed write.
-		ev.Status = spool.StatusCanceled
-		ev.ErrorType = "client_disconnected"
+	case errors.Is(readErr, context.DeadlineExceeded) || errors.Is(a.upCtx.Err(), context.DeadlineExceeded):
+		// The gateway's own duration cap, not an upstream fault. The client
+		// is told so before the stream closes.
+		ev.Status = spool.StatusTimeout
+		ev.ErrorType = "request_deadline_exceeded"
+		writeRaw([]byte(`data: {"error":{"message":"요청 전체 시간 상한을 초과해 스트림을 종료했습니다.","type":"upstream_error","code":"request_deadline_exceeded"}}` + "\n\n"))
+		writeRaw([]byte("data: [DONE]\n\n"))
 	case readErr != nil:
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_interrupted"
 	default:
 		ev.Status = spool.StatusOK
 	}
-	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
-	s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
+	s.settleUsage(ev, u, haveUsage, a.inputBytes, contentChars)
+	s.limiter.ChargeTokens(a.keyID, a.tpm, ev.InputTokens+ev.OutputTokens)
 	record()
 }
 
+// chunk is one parsed and rewritten SSE payload.
+type chunk struct {
+	out          []byte
+	parsed       map[string]any
+	usage        *usage
+	contentChars int
+	choicesEmpty bool
+}
+
+// stripUsage re-marshals the chunk without its usage field, for the case
+// where a content-bearing chunk carries usage the student did not ask for.
+func (c *chunk) stripUsage() []byte {
+	delete(c.parsed, "usage")
+	b, err := json.Marshal(c.parsed)
+	if err != nil {
+		return c.out
+	}
+	return b
+}
+
 // rewriteChunk swaps the model name in one SSE data payload and pulls token
-// usage out of the chunk that carries it. A payload that does not parse is
-// forwarded untouched (ok=false), never dropped.
-func rewriteChunk(payload []byte, publicName string) (out []byte, u *usage, contentChars int, ok bool) {
+// usage out of the chunk that carries it. ok=false means the payload did not
+// parse as JSON.
+func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	var m map[string]any
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
 	if dec.Decode(&m) != nil {
-		return nil, nil, 0, false
+		return chunk{}, false
 	}
+	c := chunk{parsed: m, choicesEmpty: true}
 	if _, has := m["model"]; has {
 		m["model"] = publicName
 	}
@@ -400,29 +544,30 @@ func rewriteChunk(payload []byte, publicName string) (out []byte, u *usage, cont
 		if b, err := json.Marshal(uraw); err == nil {
 			var parsed usage
 			if json.Unmarshal(b, &parsed) == nil {
-				u = &parsed
+				c.usage = &parsed
 			}
 		}
 	}
 	if choices, _ := m["choices"].([]any); len(choices) > 0 {
+		c.choicesEmpty = false
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {
-					contentChars = len(content)
+					c.contentChars = len(content)
 				}
 			}
 		}
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
-		return nil, nil, 0, false
+		return chunk{}, false
 	}
-	return b, u, contentChars, true
+	c.out = b
+	return c, true
 }
 
 // settleUsage fills the event's token counts: exact when the upstream
-// reported usage, a byte-based estimate flagged as such when the request
-// ended before the usage chunk arrived.
+// reported usage, a byte-based estimate flagged as such otherwise.
 func (s *Server) settleUsage(ev *spool.Event, u usage, haveUsage bool, inputBytes, contentChars int) {
 	if haveUsage {
 		ev.InputTokens = u.PromptTokens

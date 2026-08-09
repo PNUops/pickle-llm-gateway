@@ -68,6 +68,11 @@ func errUnsupportedParam(name string) apiError {
 		"지원하지 않는 파라미터입니다: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해주세요."}
 }
 
+func errInvalidParamValue(name string) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
+		"파라미터 값이 올바르지 않습니다: " + name}
+}
+
 func errMissingParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "missing_parameter",
 		"필수 파라미터가 없습니다: " + name}
