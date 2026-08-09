@@ -1,0 +1,55 @@
+[Unit]
+Description=Pickle campus LLM API gateway (OpenAI-compatible proxy)
+Documentation=https://github.com/pnuops/pickle-llm-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pickle-llmgw
+Group=pickle-llmgw
+# Listen address, snapshot/spool paths and upstream credentials. The daemon
+# fails closed when a required value is missing.
+EnvironmentFile=/etc/pickle/llm-gateway.env
+ExecStart=/opt/pickle/llm-gateway/bin/llm-gateway
+# SIGHUP re-reads the snapshot document immediately.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+# Holds the snapshot document and the usage spool.
+StateDirectory=pickle-llm-gateway
+StateDirectoryMode=0750
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+
+# Hardening. The gateway spawns no child processes and only speaks TCP.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RemoveIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+LimitNOFILE=1024
+TasksMax=64
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
