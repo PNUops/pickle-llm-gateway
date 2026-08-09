@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
@@ -96,8 +97,15 @@ func newToken() (string, error) {
 
 // insert adds the entry to the document, bumps the generation, and replaces
 // the file atomically so the polling gateway never reads a half-written
-// document.
+// document. The replacement keeps the original file's mode and owner: the
+// tool is typically run as root while the gateway reads as its service user,
+// and a root-owned replacement would silently freeze the gateway on its last
+// good state.
 func insert(path string, entry snapshot.Key) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -126,9 +134,15 @@ func insert(path string, entry snapshot.Key) error {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(0o640); err != nil {
+	if err := tmp.Chmod(fi.Mode().Perm()); err != nil {
 		tmp.Close()
 		return err
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if err := os.Chown(tmp.Name(), int(st.Uid), int(st.Gid)); err != nil {
+			tmp.Close()
+			return fmt.Errorf("keeping the snapshot owner: %w", err)
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err

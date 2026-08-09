@@ -38,9 +38,21 @@ func TestInsertBumpsGenerationAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	entry := snapshot.Key{KeyID: "k-new", TokenHash: snapshot.HashToken("pickle-x"), Status: snapshot.KeyActive}
 	if err := insert(path, entry); err != nil {
 		t.Fatal(err)
+	}
+	// The replacement must keep the original permissions: a mode reset would
+	// lock the gateway's service user out of its own snapshot.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("insert changed the snapshot mode to %v", fi.Mode().Perm())
 	}
 	out, err := os.ReadFile(path)
 	if err != nil {
