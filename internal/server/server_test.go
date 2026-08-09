@@ -312,8 +312,8 @@ func TestChatNonStream(t *testing.T) {
 	}
 	// The gateway injects the model's output cap when the request has none.
 	var maxTok int
-	if err := json.Unmarshal(sent["max_tokens"], &maxTok); err != nil || maxTok != 4096 {
-		t.Fatalf("upstream max_tokens = %s", sent["max_tokens"])
+	if err := json.Unmarshal(sent["max_completion_tokens"], &maxTok); err != nil || maxTok != 4096 {
+		t.Fatalf("upstream max_completion_tokens = %s", sent["max_completion_tokens"])
 	}
 
 	evs := h.spoolEvents(t)

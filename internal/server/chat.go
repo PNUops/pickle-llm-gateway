@@ -171,7 +171,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !seen {
-			params["max_tokens"] = json.RawMessage(strconv.Itoa(model.MaxOutputTokens))
+			params["max_completion_tokens"] = json.RawMessage(strconv.Itoa(model.MaxOutputTokens))
 		}
 	}
 	// Input length: token counting needs the model's tokenizer, which the
