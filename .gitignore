@@ -1,0 +1,21 @@
+# Build output
+/llm-gateway
+/dist/
+/bin/
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# Local runtime state (never committed)
+snapshot.json
+usage-*.jsonl
+
+# Local secrets (never committed)
+.env
+*.env
+*.pem
+*.key
+id_rsa*
+id_ed25519*
