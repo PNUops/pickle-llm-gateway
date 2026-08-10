@@ -56,6 +56,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	start := s.now()
 	ev := spool.Event{EventUUID: spool.NewEventUUID(), RequestedAt: start}
+	// The request id is the usage event's id, echoed on every response so a
+	// student can quote it in a support request (requirements §13) and so it
+	// ties their report to the metered event. OpenAI SDKs surface this header.
+	w.Header().Set("X-Request-Id", ev.EventUUID)
 	record := func() {
 		ev.LatencyMs = time.Since(start).Milliseconds()
 		if err := s.spool.Write(ev); err != nil {
@@ -76,6 +80,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// One snapshot view per request: every check below reads this state, so a
 	// concurrent reload can never mix generations within a request.
 	doc, keyLookup, modelLookup := s.store.Current()
+	ev.Generation = doc.Generation
 	if !doc.ServiceEnabled {
 		refuse(errServiceDisabled, spool.StatusAuthRejected)
 		return
@@ -153,7 +158,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev.PublicModelName = publicModel
-	if !key.Allows(publicModel) {
+	if !key.AllowsModel(model) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
 		return
 	}
@@ -506,7 +511,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	// can tell a truncated answer from a complete one, rather than guessing
 	// from a missing terminator.
 	emitStreamError := func(code, msg string) {
-		writeRaw([]byte(`data: {"error":{"message":"` + msg + `","type":"upstream_error","code":"` + code + `"}}` + "\n\n"))
+		writeRaw([]byte(`data: {"error":{"message":"` + msg + `","type":"server_error","code":"` + code + `"}}` + "\n\n"))
 		writeRaw([]byte("data: [DONE]\n\n"))
 	}
 	switch {

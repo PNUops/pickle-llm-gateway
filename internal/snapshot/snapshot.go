@@ -23,12 +23,31 @@ import (
 
 // Document is the full authorization state, replaced as a whole on every
 // load. Partial application is structurally impossible.
+//
+// The document is also the draft of the future api-to-gateway sync response,
+// so its compatibility rules are deliberate: the top level is strict (an
+// unknown top-level field fails the load, loudly), but unknown fields inside
+// models[] and keys[] are ignored. That asymmetry is what lets the api add a
+// per-key or per-model field later without a lockstep gateway upgrade — an old
+// gateway keeps enforcing what it understands instead of rejecting the whole
+// document and freezing authorization. FormatVersion is informational, for the
+// same forward-looking reason.
 type Document struct {
+	FormatVersion  int     `json:"formatVersion,omitempty"`
 	Generation     int64   `json:"generation"`
 	ServiceEnabled bool    `json:"serviceEnabled"`
 	Models         []Model `json:"models"`
 	Keys           []Key   `json:"keys"`
 }
+
+// Model visibility. RESTRICTED models are reachable only by a key that names
+// them explicitly in allowedModels; PUBLIC (the default) is reachable by any
+// key with an empty allow list. This is fail-safe on purpose: adding a new
+// model does not silently open it to every existing key.
+const (
+	ModelPublic     = "PUBLIC"
+	ModelRestricted = "RESTRICTED"
+)
 
 // Model maps one public model name to an upstream target. Students only ever
 // see PublicName; UpstreamRef selects a configured upstream block and
@@ -37,9 +56,13 @@ type Model struct {
 	PublicName      string `json:"publicName"`
 	UpstreamRef     string `json:"upstreamRef"`
 	UpstreamModel   string `json:"upstreamModel"`
+	Visibility      string `json:"visibility,omitempty"` // PUBLIC (default) | RESTRICTED
 	MaxInputTokens  int    `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"`
 }
+
+// Restricted reports whether the model is reachable only by keys that name it.
+func (m *Model) Restricted() bool { return m.Visibility == ModelRestricted }
 
 // Key statuses. Anything but ACTIVE refuses requests; the distinction only
 // changes the error message.
@@ -72,15 +95,14 @@ type Limits struct {
 	Concurrency int `json:"concurrency,omitempty"`
 }
 
-// Allows reports whether the key may use the given public model name. An
-// empty allow list means every served model, which is the hand-maintained
-// document's default.
-func (k *Key) Allows(publicName string) bool {
+// AllowsModel reports whether the key may use the model. An empty allow list
+// means every PUBLIC model; a RESTRICTED model requires an explicit listing.
+func (k *Key) AllowsModel(m *Model) bool {
 	if len(k.AllowedModels) == 0 {
-		return true
+		return !m.Restricted()
 	}
-	for _, m := range k.AllowedModels {
-		if m == publicName {
+	for _, name := range k.AllowedModels {
+		if name == m.PublicName {
 			return true
 		}
 	}
@@ -107,6 +129,11 @@ type Store struct {
 	// file when this changed.
 	lastModTime time.Time
 	lastSize    int64
+
+	// Consecutive reload failures since the last success, surfaced on the
+	// health endpoint: a document that keeps failing to load means the served
+	// state is silently going stale, which is otherwise invisible.
+	reloadFailures atomic.Int64
 
 	// Generation monotonicity across process restarts. The in-process guard in
 	// reload() cannot see generations from before this process started, so the
@@ -168,11 +195,16 @@ func (s *Store) Generation() int64 { return s.cur.Load().doc.Generation }
 // LoadedAt is when the current state was read.
 func (s *Store) LoadedAt() time.Time { return s.cur.Load().loadedAt }
 
+// ReloadFailures is the count of consecutive failed reloads since the last
+// success (0 when healthy). A rising count means the served state is stale.
+func (s *Store) ReloadFailures() int64 { return s.reloadFailures.Load() }
+
 // Refresh re-reads the document if the file changed since the last successful
 // load. Errors are logged, never propagated to request handling.
 func (s *Store) Refresh() {
 	fi, err := os.Stat(s.path)
 	if err != nil {
+		s.reloadFailures.Add(1)
 		s.log.Error("snapshot stat failed, keeping current state", "error", err)
 		return
 	}
@@ -180,8 +212,11 @@ func (s *Store) Refresh() {
 		return
 	}
 	if err := s.reload(); err != nil {
+		s.reloadFailures.Add(1)
 		s.log.Error("snapshot reload failed, keeping current state", "error", err)
+		return
 	}
+	s.reloadFailures.Store(0)
 }
 
 func (s *Store) reload() error {
@@ -256,11 +291,38 @@ func (s *Store) writeHighWater(gen int64) {
 }
 
 func build(raw []byte, known map[string]bool) (*state, error) {
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	var doc Document
-	if err := dec.Decode(&doc); err != nil {
+	// Top level is strict (unknown top-level field fails the load); models[]
+	// and keys[] are captured as raw messages and decoded leniently below, so
+	// an unknown field inside them is ignored rather than rejecting the whole
+	// document — the forward-compatibility split the api sync depends on.
+	var env struct {
+		FormatVersion  int               `json:"formatVersion"`
+		Generation     int64             `json:"generation"`
+		ServiceEnabled bool              `json:"serviceEnabled"`
+		Models         []json.RawMessage `json:"models"`
+		Keys           []json.RawMessage `json:"keys"`
+	}
+	envDec := json.NewDecoder(strings.NewReader(string(raw)))
+	envDec.DisallowUnknownFields()
+	if err := envDec.Decode(&env); err != nil {
 		return nil, err
+	}
+	doc := Document{
+		FormatVersion:  env.FormatVersion,
+		Generation:     env.Generation,
+		ServiceEnabled: env.ServiceEnabled,
+		Models:         make([]Model, len(env.Models)),
+		Keys:           make([]Key, len(env.Keys)),
+	}
+	for i, rawModel := range env.Models {
+		if err := json.Unmarshal(rawModel, &doc.Models[i]); err != nil {
+			return nil, fmt.Errorf("model %d: %w", i, err)
+		}
+	}
+	for i, rawKey := range env.Keys {
+		if err := json.Unmarshal(rawKey, &doc.Keys[i]); err != nil {
+			return nil, fmt.Errorf("key %d: %w", i, err)
+		}
 	}
 	st := &state{
 		doc:      doc,
@@ -272,6 +334,11 @@ func build(raw []byte, known map[string]bool) (*state, error) {
 		m := &doc.Models[i]
 		if m.PublicName == "" || m.UpstreamRef == "" || m.UpstreamModel == "" {
 			return nil, fmt.Errorf("model %d: publicName, upstreamRef and upstreamModel are all required", i)
+		}
+		switch m.Visibility {
+		case "", ModelPublic, ModelRestricted:
+		default:
+			return nil, fmt.Errorf("model %q: unknown visibility %q", m.PublicName, m.Visibility)
 		}
 		if known != nil && !known[strings.ToLower(m.UpstreamRef)] {
 			return nil, fmt.Errorf("model %q references upstream %q, which is not configured", m.PublicName, m.UpstreamRef)

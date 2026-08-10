@@ -75,6 +75,26 @@ func main() {
 		}
 	}()
 
+	// Usage-spool retention: prune once at startup and daily thereafter.
+	go func() {
+		prune := func() {
+			if err := sp.Prune(time.Now(), cfg.SpoolRetentionDays); err != nil {
+				log.Error("spool prune failed", "error", err)
+			}
+		}
+		prune()
+		t := time.NewTicker(24 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				prune()
+			}
+		}
+	}()
+
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- hs.ListenAndServe() }()
 	log.Info("llm-gateway listening", "addr", cfg.Listen, "generation", store.Generation())

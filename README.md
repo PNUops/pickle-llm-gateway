@@ -39,6 +39,15 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 문서가 되살아나도 거부합니다. 모델의 `upstreamRef`가 설정에 없는 업스트림을 가리키면
 그 문서는 적재 자체를 거부해, 오타가 요청 시점의 오류가 아니라 적재 시점에 드러납니다.
 
+문서의 최상위는 모르는 필드를 거부하지만 `models`와 `keys` 항목 안의 모르는 필드는
+무시합니다. 이후 관리 API가 항목에 필드를 하나 더해도 옛 게이트웨이가 문서를 통째로
+버리지 않고 아는 만큼 계속 집행하기 위해서입니다. 모델의 `visibility`가 `RESTRICTED`이면
+그 모델을 `allowedModels`에 명시한 키만 접근할 수 있고, 비어 있는 `allowedModels`는
+`PUBLIC` 모델만 허용합니다. 새 모델을 넣어도 기존 키에 자동으로 열리지 않습니다.
+
+각 응답은 `X-Request-Id` 헤더로 그 요청의 기록 식별자를 돌려주므로 문의에 인용할 수
+있습니다. `/healthz`는 세대·스냅샷 나이·리로드 정체 여부를 함께 반환합니다.
+
 현재는 로컬 파일을 폴링합니다. HTTP 동기화는 아직 제공하지 않습니다.
 
 요청 처리는 이렇게 흐릅니다. Authorization 헤더의 Key를 sha256으로 해시해 스냅샷에서
@@ -115,6 +124,7 @@ go run ./cmd/llm-gateway
 | `LLMGW_DEFAULT_TPM` | `20000` | Key에 한도가 없을 때의 분당 토큰 수 |
 | `LLMGW_DEFAULT_CONCURRENCY` | `2` | Key에 한도가 없을 때의 동시 요청 수 |
 | `LLMGW_ALLOW_GENERATION_RESET` | (off) | 스냅샷 세대가 기록된 최고값보다 낮아도 적재 허용(의도적 세대 초기화 시에만) |
+| `LLMGW_SPOOL_RETENTION_DAYS` | `90` | 사용량 기록 파일 보존일. 지난 날짜 파일은 매일 정리(0이면 정리 안 함) |
 
 </details>
 

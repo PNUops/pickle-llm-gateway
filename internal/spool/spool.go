@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,7 +30,11 @@ const (
 
 // Event is one request's accounting record.
 type Event struct {
-	EventUUID       string    `json:"eventUuid"`
+	EventUUID string `json:"eventUuid"`
+	// Generation is the snapshot generation in force for this request, so a
+	// later reader can tell which model mapping and limits applied — needed
+	// because the public model name is stable across upstream-model swaps.
+	Generation      int64     `json:"generation,omitempty"`
 	KeyID           string    `json:"keyId,omitempty"`
 	PublicModelName string    `json:"publicModelName,omitempty"`
 	Status          string    `json:"status"`
@@ -84,6 +89,43 @@ func (w *Writer) Write(ev Event) error {
 		return fmt.Errorf("spool: %w", err)
 	}
 	return nil
+}
+
+// Prune deletes spool files whose day is older than retentionDays before now.
+// It is best-effort: a file that cannot be parsed or removed is left in place
+// and the error is returned for logging, never fatal. Retention exists because
+// nothing else rotates the spool and the gateway LXC has a small root disk;
+// once the api ingests these events it will own the authoritative copy.
+func (w *Writer) Prune(now time.Time, retentionDays int) error {
+	if retentionDays <= 0 {
+		return nil
+	}
+	cutoff := now.UTC().AddDate(0, 0, -retentionDays)
+	entries, err := filepath.Glob(filepath.Join(w.dir, "usage-*.jsonl"))
+	if err != nil {
+		return fmt.Errorf("spool prune: %w", err)
+	}
+	w.mu.Lock()
+	current := w.day
+	w.mu.Unlock()
+	var firstErr error
+	for _, path := range entries {
+		base := filepath.Base(path)
+		day := strings.TrimSuffix(strings.TrimPrefix(base, "usage-"), ".jsonl")
+		if day == current {
+			continue
+		}
+		d, err := time.Parse("20060102", day)
+		if err != nil {
+			continue
+		}
+		if d.Before(cutoff) {
+			if err := os.Remove(path); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // Close releases the current file.

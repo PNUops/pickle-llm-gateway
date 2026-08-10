@@ -69,9 +69,9 @@ func TestEventCarriesOnlyAccountingFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed := map[string]bool{
-		"eventUuid": true, "keyId": true, "publicModelName": true, "status": true,
-		"errorType": true, "inputTokens": true, "outputTokens": true, "estimated": true,
-		"latencyMs": true, "ttftMs": true, "requestedAt": true,
+		"eventUuid": true, "generation": true, "keyId": true, "publicModelName": true,
+		"status": true, "errorType": true, "inputTokens": true, "outputTokens": true,
+		"estimated": true, "latencyMs": true, "ttftMs": true, "requestedAt": true,
 	}
 	for k := range m {
 		if !allowed[k] {
@@ -123,5 +123,46 @@ func TestWriteAppendsOneLinePerEvent(t *testing.T) {
 	}
 	if lines != 3 {
 		t.Fatalf("got %d lines, want 3", lines)
+	}
+}
+
+func TestPruneRemovesOldFilesKeepsRecentAndCurrent(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	// Write into "today" so it becomes the current open file.
+	if err := w.Write(Event{EventUUID: NewEventUUID(), Status: StatusOK, RequestedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	// Two older day-files, one just inside retention, one outside.
+	old := filepath.Join(dir, "usage-20260101.jsonl") // >90 days before
+	recent := filepath.Join(dir, "usage-20260720.jsonl")
+	for _, f := range []string{old, recent} {
+		if err := os.WriteFile(f, []byte("{}\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Prune(now, 90); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatal("old file was not pruned")
+	}
+	if _, err := os.Stat(recent); err != nil {
+		t.Fatal("in-retention file was pruned")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "usage-20260810.jsonl")); err != nil {
+		t.Fatal("current file was pruned")
+	}
+	// Retention 0 disables pruning.
+	if err := w.Prune(now, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(recent); err != nil {
+		t.Fatal("retention 0 must not prune")
 	}
 }
