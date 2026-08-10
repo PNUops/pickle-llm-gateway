@@ -44,6 +44,10 @@ type Config struct {
 	DefaultTpm         int
 	DefaultConcurrency int
 
+	// SpoolRetentionDays bounds the usage spool on the gateway's small disk.
+	// Old day-files are deleted once past it; 0 disables pruning.
+	SpoolRetentionDays int
+
 	// AllowGenerationReset lets the snapshot load a document whose generation
 	// is below the persisted high-water (an operator deliberately resetting the
 	// sequence). Off by default so a restored old snapshot fails closed.
@@ -82,6 +86,7 @@ func FromEnv() (*Config, error) {
 		DefaultRpm:         20,
 		DefaultTpm:         20000,
 		DefaultConcurrency: 2,
+		SpoolRetentionDays: 90,
 		Upstreams:          map[string]Upstream{},
 	}
 
@@ -111,6 +116,14 @@ func FromEnv() (*Config, error) {
 				continue
 			}
 			*opt.dst = n
+		}
+	}
+	if v := getenv("SPOOL_RETENTION_DAYS", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			errs = append(errs, envPrefix+"SPOOL_RETENTION_DAYS must be a non-negative integer")
+		} else {
+			cfg.SpoolRetentionDays = n
 		}
 	}
 	for _, opt := range []struct {
