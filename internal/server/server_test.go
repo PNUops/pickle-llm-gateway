@@ -259,6 +259,26 @@ func errCode(t *testing.T, body []byte) string {
 	return e.Error.Code
 }
 
+// chatStatus is a goroutine-safe variant of chat that returns the status code
+// (or -1 on transport error) without calling t.Fatal off the test goroutine.
+func (h *harness) chatStatus(token, body string) int {
+	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		return -1
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
 func (h *harness) spoolEvents(t *testing.T) []spool.Event {
 	t.Helper()
 	files, err := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
@@ -518,28 +538,18 @@ func TestConcurrencyLimit(t *testing.T) {
 	}, nil)
 	h.mock.set(func(u *mockOpts) { u.delay = 400 * time.Millisecond })
 
-	type result struct {
-		status int
-		code   string
-	}
-	results := make(chan result, 2)
+	// Status codes only, collected off the test goroutine (no t.Fatal there).
+	results := make(chan int, 2)
 	for range 2 {
-		go func() {
-			status, body := h.chat(t, testToken, chatBody)
-			code := ""
-			if status != 200 {
-				code = errCode(t, body)
-			}
-			results <- result{status, code}
-		}()
+		go func() { results <- h.chatStatus(testToken, chatBody) }()
 		time.Sleep(50 * time.Millisecond)
 	}
 	a, b := <-results, <-results
-	if a.status > b.status {
+	if a > b {
 		a, b = b, a
 	}
-	if a.status != 200 || b.status != 429 || b.code != "rate_limit_concurrency" {
-		t.Fatalf("got %+v and %+v", a, b)
+	if a != 200 || b != 429 {
+		t.Fatalf("got %d and %d, want 200 and 429", a, b)
 	}
 }
 
@@ -898,5 +908,155 @@ func TestStreamInterruptAnnouncesError(t *testing.T) {
 	evs := h.spoolEvents(t)
 	if len(evs) != 1 || evs[0].Status != spool.StatusUpstreamErr {
 		t.Fatalf("interruption not recorded: %+v", evs)
+	}
+}
+
+func TestRestrictedModelHiddenAndDenied(t *testing.T) {
+	// A RESTRICTED model is invisible and unusable to a key with an empty
+	// allow list; a key that names it may use it.
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models = append(d.Models, snapshot.Model{
+			PublicName: "pnu-internal", UpstreamRef: "mock", UpstreamModel: "secret",
+			Visibility: snapshot.ModelRestricted})
+		d.Keys = append(d.Keys, snapshot.Key{
+			KeyID: "k-priv", TokenHash: snapshot.HashToken("pickle-priv"), Status: snapshot.KeyActive,
+			AllowedModels: []string{"pnu-general", "pnu-internal"}})
+	}, nil)
+
+	// Open key: list excludes the restricted model, chat is denied, retrieve 404.
+	req, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, _ := http.DefaultClient.Do(req)
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if bytes.Contains(raw, []byte("pnu-internal")) {
+		t.Fatal("restricted model listed to an open key")
+	}
+	if status, body := h.chat(t, testToken, `{"model":"pnu-internal","messages":[]}`); status != 403 || errCode(t, body) != "model_not_allowed" {
+		t.Fatalf("open key reached a restricted model: %d %s", status, body)
+	}
+	// Privileged key: allowed.
+	if status, _ := h.chat(t, "pickle-priv", chatBody); status != 200 {
+		t.Fatalf("privileged key denied a public model: %d", status)
+	}
+	if status, body := h.chat(t, "pickle-priv", `{"model":"pnu-internal","messages":[{"role":"user","content":"hi"}]}`); status != 200 {
+		t.Fatalf("privileged key denied its restricted model: %d %s", status, body)
+	}
+}
+
+func TestForwardCompatNestedUnknownField(t *testing.T) {
+	// An unknown field inside keys[] must be ignored (forward compatibility for
+	// the future api sync), while an unknown TOP-LEVEL field still fails.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.json")
+	hash := snapshot.HashToken(testToken)
+	good := `{"formatVersion":1,"generation":1,"serviceEnabled":true,` +
+		`"models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m","futureModelField":true}],` +
+		`"keys":[{"keyId":"k","tokenHash":"` + hash + `","status":"ACTIVE","limits":{},"workspaceId":"ws-7"}]}`
+	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snapshot.Open(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}}); err != nil {
+		t.Fatalf("nested unknown field rejected: %v", err)
+	}
+	bad := `{"generation":1,"serviceEnabled":true,"models":[],"keys":[],"unknownTopLevel":1}`
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snapshot.Open(path, slog.New(slog.DiscardHandler), snapshot.Options{}); err == nil {
+		t.Fatal("unknown top-level field accepted")
+	}
+}
+
+func TestHealthzDepthAndRequestID(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	resp, err := http.Get(h.gw.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var hz map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&hz); err != nil {
+		t.Fatal(err)
+	}
+	if hz["status"] != "ok" {
+		t.Fatalf("healthz status: %v", hz)
+	}
+	for _, k := range []string{"generation", "snapshotAgeSeconds", "snapshotReloadStuck"} {
+		if _, ok := hz[k]; !ok {
+			t.Fatalf("healthz missing %q: %v", k, hz)
+		}
+	}
+
+	// Every chat response carries X-Request-Id matching the metered event.
+	req, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	cr, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rid := cr.Header.Get("X-Request-Id")
+	cr.Body.Close()
+	if rid == "" {
+		t.Fatal("no X-Request-Id header")
+	}
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].EventUUID != rid {
+		t.Fatalf("X-Request-Id %q does not match spooled event %+v", rid, evs)
+	}
+	if evs[0].Generation != 1 {
+		t.Fatalf("event generation not recorded: %+v", evs[0])
+	}
+}
+
+func TestModelRetrieve(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	req, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/pnu-general", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m["id"] != "pnu-general" || m["object"] != "model" {
+		t.Fatalf("unexpected retrieve: %v", m)
+	}
+	if c, _ := m["created"].(float64); c == 0 {
+		t.Fatal("created is 0 (renders as 1970)")
+	}
+	// Unknown model id → 404.
+	req2, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/pnu-none", nil)
+	req2.Header.Set("Authorization", "Bearer "+testToken)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Fatalf("unknown model retrieve status %d", resp2.StatusCode)
+	}
+}
+
+func TestErrorTypesAreOpenAISet(t *testing.T) {
+	valid := map[string]bool{
+		"invalid_request_error": true, "authentication_error": true,
+		"permission_error": true, "rate_limit_error": true, "server_error": true,
+	}
+	h := newHarness(t, nil, nil)
+	// Trigger a server-side error (unconfigured upstream via 5xx passthrough).
+	h.mock.set(func(u *mockOpts) { u.status = 500; u.errBody = "boom" })
+	_, body := h.chat(t, testToken, chatBody)
+	var e struct {
+		Error struct{ Type string } `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		t.Fatal(err)
+	}
+	if !valid[e.Error.Type] {
+		t.Fatalf("error type %q is outside the OpenAI set", e.Error.Type)
 	}
 }

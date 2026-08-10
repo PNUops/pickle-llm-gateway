@@ -54,6 +54,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/models/", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound)
@@ -61,13 +62,27 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// handleHealthz reports enough to see the failure the design guards against: a
+// snapshot that has gone stale because reloads keep failing. It stays a
+// liveness probe — it never calls the upstream (that would meter per probe).
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeAPIError(w, errMethod)
 		return
 	}
+	failures := s.store.ReloadFailures()
+	body := map[string]any{
+		"status":              "ok",
+		"generation":          s.store.Generation(),
+		"snapshotAgeSeconds":  int64(s.now().Sub(s.store.LoadedAt()).Seconds()),
+		"snapshotReloadStuck": failures > 0,
+	}
+	if failures > 0 {
+		body["status"] = "degraded"
+		body["reloadFailures"] = failures
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_, _ = w.Write([]byte(`{"status":"ok","generation":` + itoa64(s.store.Generation()) + `}` + "\n"))
+	writeJSON(w, body)
 }
 
 // authenticate resolves the bearer token to a key entry, refusing anything
@@ -100,12 +115,28 @@ func (s *Server) authenticate(r *http.Request, lookup func(string) *snapshot.Key
 	return key, nil
 }
 
+type modelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// modelsCreatedEpoch is a stable non-zero `created` value for the models
+// surface. The real models have no meaningful creation timestamp and 0 renders
+// as 1970 in clients, so a fixed recent epoch (2026-01-01 UTC) is used.
+const modelsCreatedEpoch = 1767225600
+
+func entryFor(m *snapshot.Model) modelEntry {
+	return modelEntry{ID: m.PublicName, Object: "model", Created: modelsCreatedEpoch, OwnedBy: "pnu-cloud"}
+}
+
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeAPIError(w, errMethod)
 		return
 	}
-	doc, keyLookup, _ := s.store.Current()
+	doc, keyLookup, modelLookup := s.store.Current()
 	if !doc.ServiceEnabled {
 		writeAPIError(w, errServiceDisabled)
 		return
@@ -115,21 +146,31 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, *authErr)
 		return
 	}
-	type modelEntry struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+
+	// GET /v1/models/{id}: single-model retrieve, which several SDK helpers
+	// call. A missing or not-allowed id is a 404, never a disclosure of a
+	// restricted model's existence.
+	if id := strings.TrimPrefix(r.URL.Path, "/v1/models/"); id != "" && id != r.URL.Path {
+		m := modelLookup(id)
+		if m == nil || !key.AllowsModel(m) {
+			writeAPIError(w, errModelNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writeJSON(w, entryFor(m))
+		return
 	}
+
 	list := struct {
 		Object string       `json:"object"`
 		Data   []modelEntry `json:"data"`
 	}{Object: "list", Data: []modelEntry{}}
-	for _, m := range doc.Models {
-		if !key.Allows(m.PublicName) {
+	for i := range doc.Models {
+		m := &doc.Models[i]
+		if !key.AllowsModel(m) {
 			continue
 		}
-		list.Data = append(list.Data, modelEntry{ID: m.PublicName, Object: "model", OwnedBy: "pnu-cloud"})
+		list.Data = append(list.Data, entryFor(m))
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writeJSON(w, list)

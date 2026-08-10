@@ -29,7 +29,7 @@ var (
 		"이용이 정지된 상태입니다. 관리자에게 문의해주세요."}
 	errQuotaExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "quota_exhausted",
 		"사용량 한도를 모두 사용했습니다. 한도는 기간이 지나면 초기화되며, 증액이 필요하면 콘솔에서 신청해주세요."}
-	errServiceDisabled = apiError{http.StatusServiceUnavailable, "service_unavailable", "service_disabled",
+	errServiceDisabled = apiError{http.StatusServiceUnavailable, "server_error", "service_disabled",
 		"LLM API 서비스가 점검 중입니다. 잠시 후 다시 시도해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
 		"요청한 모델이 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
@@ -41,7 +41,7 @@ var (
 		"분당 토큰 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateConcurrency = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_concurrency",
 		"동시 요청 수 한도를 초과했습니다. 진행 중인 요청이 끝난 뒤 다시 시도해주세요."}
-	errServerBusy = apiError{http.StatusServiceUnavailable, "service_unavailable", "server_busy",
+	errServerBusy = apiError{http.StatusServiceUnavailable, "server_error", "server_busy",
 		"요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요."}
 	errRequestTooLarge = apiError{http.StatusBadRequest, "invalid_request_error", "request_too_large",
 		"요청 본문이 허용 크기를 초과했습니다."}
@@ -53,9 +53,9 @@ var (
 		"요청 본문이 올바른 JSON이 아닙니다."}
 	errUpstreamRejected = apiError{http.StatusBadRequest, "invalid_request_error", "upstream_rejected",
 		"모델 서버가 요청을 거부했습니다. 요청 파라미터를 확인해주세요."}
-	errUpstream = apiError{http.StatusBadGateway, "upstream_error", "upstream_error",
+	errUpstream = apiError{http.StatusBadGateway, "server_error", "upstream_error",
 		"모델 서버 호출에 실패했습니다. 잠시 후 다시 시도해주세요."}
-	errUpstreamTimeout = apiError{http.StatusGatewayTimeout, "upstream_error", "upstream_timeout",
+	errUpstreamTimeout = apiError{http.StatusGatewayTimeout, "server_error", "upstream_timeout",
 		"모델 서버 응답이 제한 시간을 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
 		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions입니다."}
