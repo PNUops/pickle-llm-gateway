@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -64,6 +65,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", ev.EventUUID)
 	record := func() {
 		ev.LatencyMs = time.Since(start).Milliseconds()
+		s.metrics.observe(ev)
 		if err := s.spool.Write(ev); err != nil {
 			s.log.Error("usage spool write failed", "error", err)
 		}
@@ -108,19 +110,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rpm, tpm, conc := s.keyLimits(key)
-	release, reason := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
-	switch reason {
-	case limits.Rpm:
-		refuse(errRateRequests, spool.StatusRateLimited)
-		return
-	case limits.Tpm:
-		refuse(errRateTokens, spool.StatusRateLimited)
-		return
-	case limits.Concurrency:
-		refuse(errRateConcurrency, spool.StatusRateLimited)
+	adm := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
+	if adm.Reason != limits.OK {
+		// Tell the client when to come back rather than leaving it to guess;
+		// SDK retry helpers read this header.
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(adm.RetryAfter.Seconds()))))
+		switch adm.Reason {
+		case limits.Rpm:
+			refuse(errRateRequests, spool.StatusRateLimited)
+		case limits.Tpm:
+			refuse(errRateTokens, spool.StatusRateLimited)
+		default:
+			refuse(errRateConcurrency, spool.StatusRateLimited)
+		}
 		return
 	}
-	defer release()
+	defer adm.Release()
+	w.Header().Set("X-RateLimit-Limit-Requests", strconv.Itoa(rpm))
+	w.Header().Set("X-RateLimit-Remaining-Requests", strconv.Itoa(adm.RemainingRequests))
 
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.RequestBodyMaxBytes)
 	rawBody, err := io.ReadAll(r.Body)
@@ -164,13 +171,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
 		return
 	}
-	up, ok := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
-	if !ok {
-		s.log.Error("model references an unconfigured upstream", "model", publicModel, "upstreamRef", model.UpstreamRef)
-		refuse(errUpstream, spool.StatusUpstreamErr)
-		return
-	}
-
 	// Output length. A JSON null is what SDKs send for "unset" and is treated
 	// as absent; an explicit value above the model cap is refused. Whatever the
 	// student sent (on either OpenAI field) is normalized onto the upstream's
@@ -178,6 +178,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// on the field the upstream actually honors — forwarding the student's
 	// field verbatim would let a legacy `max_tokens`-only server ignore a
 	// `max_completion_tokens` request and blow past the cap.
+	outputCap := 0
 	if model.MaxOutputTokens > 0 {
 		effectiveCap := model.MaxOutputTokens
 		for _, f := range []string{"max_completion_tokens", "max_tokens"} {
@@ -202,7 +203,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				effectiveCap = n
 			}
 		}
-		params[up.CapField] = json.RawMessage(strconv.Itoa(effectiveCap))
+		outputCap = effectiveCap
 	}
 	// Input length: token counting needs the model's tokenizer, which the
 	// gateway does not have. This guard only refuses what cannot possibly
@@ -232,58 +233,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if streaming {
 		params["stream_options"] = withIncludeUsage(params["stream_options"])
 	}
-	upBody, err := json.Marshal(params)
-	if err != nil {
-		refuse(errBadJSON, spool.StatusBadRequest)
-		return
-	}
 
 	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
 	defer cancel()
-	upReq, err := http.NewRequestWithContext(upCtx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(upBody))
-	if err != nil {
-		s.log.Error("building upstream request failed", "error", err)
-		refuse(errUpstream, spool.StatusUpstreamErr)
-		return
-	}
-	upReq.Header.Set("Content-Type", "application/json")
-	if up.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+up.APIKey)
-	}
 
-	resp, err := s.client.Do(upReq)
+	// Try the model's upstream, then its fallback if it has one. Nothing has
+	// been written to the client yet, so switching upstreams here is invisible
+	// to the student; once the response starts, it is not.
+	resp, up, attemptErr := s.callUpstream(upCtx, model, params, outputCap)
 	ev.TtftMs = time.Since(start).Milliseconds()
-	if err != nil {
+	if attemptErr != nil {
 		switch {
 		case r.Context().Err() != nil:
 			// The student went away; nothing can be written back.
 			ev.Status = spool.StatusCanceled
 			ev.ErrorType = "client_disconnected"
 			record()
-		case upCtx.Err() != nil || isTimeout(err):
+		case upCtx.Err() != nil || attemptErr.timeout:
 			refuse(errUpstreamTimeout, spool.StatusTimeout)
+		case attemptErr.refusal != nil:
+			refuse(*attemptErr.refusal, spool.StatusUpstreamErr)
 		default:
-			s.log.Error("upstream request failed", "error", err)
+			s.log.Error("upstream request failed", "keyId", key.KeyID,
+				"model", publicModel, "error", attemptErr.err)
 			refuse(errUpstream, spool.StatusUpstreamErr)
 		}
 		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		s.log.Warn("upstream refused request", "status", resp.StatusCode, "keyId", key.KeyID,
-			"model", publicModel, "detail", string(detail))
-		switch resp.StatusCode {
-		case http.StatusBadRequest:
-			refuse(errUpstreamRejected, spool.StatusUpstreamErr)
-		case http.StatusTooManyRequests:
-			refuse(errServerBusy, spool.StatusUpstreamErr)
-		default:
-			refuse(errUpstream, spool.StatusUpstreamErr)
-		}
-		return
-	}
+	_ = up
 
 	// Body capture: only for a key that opted in, and only when the delivery
 	// channel exists — captured text is never written to this host's disk, so
@@ -407,6 +385,9 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
 	s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
 	s.bodies.Offer(capture)
+	if capture != nil {
+		s.metrics.bodiesCaptured.Add(1)
+	}
 	record()
 }
 
@@ -569,6 +550,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	if a.capture != nil {
 		a.capture.Response, a.capture.Truncated = capString(answer.String())
 		s.bodies.Offer(a.capture)
+		s.metrics.bodiesCaptured.Add(1)
 	}
 	record()
 }

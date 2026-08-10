@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +41,7 @@ type mockOpts struct {
 	heartbeat   bool          // stream: emit a non-JSON keepalive (data: ping) first
 	abortMid    bool          // stream: hijack and close after one chunk, no [DONE]
 	chunkDelay  time.Duration // stream: pause before each chunk
+	failNext    int           // fail this many next calls with a 502, then serve
 }
 
 type upstreamMock struct {
@@ -73,6 +75,13 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 
 	if cp.delay > 0 {
 		time.Sleep(cp.delay)
+	}
+	if cp.failNext > 0 {
+		u.mu.Lock()
+		u.opts.failNext--
+		u.mu.Unlock()
+		w.WriteHeader(http.StatusBadGateway)
+		return
 	}
 	if cp.status != 0 && cp.status != http.StatusOK {
 		w.WriteHeader(cp.status)
@@ -1205,5 +1214,158 @@ func TestNoCaptureWithoutChannel(t *testing.T) {
 		if bytes.Contains(raw, []byte("MARKER-PROMPT-CONTENT")) {
 			t.Fatal("text was recorded with no delivery channel configured")
 		}
+	}
+}
+
+func TestRetryAfterAndRateLimitHeaders(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Rpm = 1 }, nil)
+
+	req, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("first request: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-RateLimit-Limit-Requests") != "1" {
+		t.Fatalf("no rate-limit ceiling header: %q", resp.Header.Get("X-RateLimit-Limit-Requests"))
+	}
+	if resp.Header.Get("X-RateLimit-Remaining-Requests") != "0" {
+		t.Fatalf("remaining header wrong: %q", resp.Header.Get("X-RateLimit-Remaining-Requests"))
+	}
+
+	// The refused follow-up must say when to come back.
+	req2, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	req2.Header.Set("Authorization", "Bearer "+testToken)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 429 {
+		t.Fatalf("second request: %d", resp2.StatusCode)
+	}
+	after := resp2.Header.Get("Retry-After")
+	if after == "" {
+		t.Fatal("429 carried no Retry-After")
+	}
+	if n, err := strconv.Atoi(after); err != nil || n <= 0 || n > 120 {
+		t.Fatalf("implausible Retry-After: %q", after)
+	}
+}
+
+func TestUpstreamRetryThenSuccess(t *testing.T) {
+	h := newHarness(t, nil, func(c *config.Config) { c.UpstreamRetries = 1 })
+	// Fail once, then serve normally: the student never sees the failure.
+	h.mock.set(func(u *mockOpts) { u.failNext = 1 })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("a retryable failure was not retried: %d %s", status, body)
+	}
+}
+
+func TestUpstreamFallback(t *testing.T) {
+	var fallbackHits int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fallbackHits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"fb","object":"chat.completion","model":"other","choices":[{"index":0,"message":{"role":"assistant","content":"fallback"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer fb.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models[0].FallbackRef = "backup"
+	}, func(c *config.Config) {
+		c.UpstreamRetries = 0
+		c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+	})
+	// The primary is down for good; the fallback answers.
+	h.mock.set(func(u *mockOpts) { u.status = http.StatusBadGateway })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("fallback did not take over: %d %s", status, body)
+	}
+	mu.Lock()
+	hits := fallbackHits
+	mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("fallback hit %d times", hits)
+	}
+	// The public model name still holds on the fallback's answer.
+	if !bytes.Contains(body, []byte(`"model":"pnu-general"`)) {
+		t.Fatalf("fallback answer leaked its own model name: %s", body)
+	}
+}
+
+func TestUpstreamRefusalIsNotRetriedOrFailedOver(t *testing.T) {
+	var fallbackHits int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fallbackHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fb.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) { d.Models[0].FallbackRef = "backup" },
+		func(c *config.Config) {
+			c.UpstreamRetries = 2
+			c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+		})
+	// A 400 is the request's own fault: repeating it anywhere is pointless.
+	h.mock.set(func(u *mockOpts) { u.status = http.StatusBadRequest; u.errBody = `{"error":"bad"}` })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 400 || errCode(t, body) != "upstream_rejected" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	mu.Lock()
+	hits := fallbackHits
+	mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("a refusal was failed over to the fallback %d times", hits)
+	}
+}
+
+func TestAdminMetrics(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatal("request failed")
+	}
+	admin := httptest.NewServer(h.srv.AdminHandler())
+	defer admin.Close()
+
+	resp, err := http.Get(admin.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m struct {
+		InFlight     int              `json:"inFlight"`
+		ByStatus     map[string]int64 `json:"requestsByStatus"`
+		InputTokens  int64            `json:"inputTokens"`
+		OutputTokens int64            `json:"outputTokens"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ByStatus["OK"] != 1 || m.InputTokens != 7 || m.OutputTokens != 5 {
+		t.Fatalf("metrics did not observe the request: %+v", m)
+	}
+
+	// The student-facing route must not carry the metrics surface.
+	pub, err := http.Get(h.gw.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Body.Close()
+	if pub.StatusCode != 404 {
+		t.Fatalf("metrics reachable on the public listener: %d", pub.StatusCode)
 	}
 }

@@ -24,6 +24,8 @@ type Server struct {
 	limiter  *limits.Limiter
 	spool    *spool.Writer
 	bodies   *bodies.Sink
+	health   *upstreamHealth
+	metrics  *counters
 	log      *slog.Logger
 	client   *http.Client
 	inFlight chan struct{}
@@ -47,6 +49,8 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 			},
 		},
 		inFlight: make(chan struct{}, cfg.MaxInFlight),
+		health:   newUpstreamHealth(nil),
+		metrics:  &counters{},
 		now:      time.Now,
 	}
 }

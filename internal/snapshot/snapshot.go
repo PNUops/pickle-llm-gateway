@@ -54,9 +54,12 @@ const (
 // see PublicName; UpstreamRef selects a configured upstream block and
 // UpstreamModel is the identifier sent to it.
 type Model struct {
-	PublicName      string `json:"publicName"`
-	UpstreamRef     string `json:"upstreamRef"`
-	UpstreamModel   string `json:"upstreamModel"`
+	PublicName    string `json:"publicName"`
+	UpstreamRef   string `json:"upstreamRef"`
+	UpstreamModel string `json:"upstreamModel"`
+	// FallbackRef names a second upstream to try when the first one fails
+	// before any of the response has reached the client. Optional.
+	FallbackRef     string `json:"fallbackRef,omitempty"`
 	Visibility      string `json:"visibility,omitempty"` // PUBLIC (default) | RESTRICTED
 	MaxInputTokens  int    `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"`

@@ -17,17 +17,21 @@ func newTestLimiter() (*Limiter, *clock) {
 func TestRpmExhaustionAndRefill(t *testing.T) {
 	l, c := newTestLimiter()
 	for i := range 2 {
-		rel, reason := l.Acquire("k", 2, 1000, 10)
+		d := l.Acquire("k", 2, 1000, 10)
+
+		rel, reason := d.Release, d.Reason
 		if reason != OK {
 			t.Fatalf("request %d refused: %v", i, reason)
 		}
 		rel()
 	}
-	if _, reason := l.Acquire("k", 2, 1000, 10); reason != Rpm {
+	if reason := l.Acquire("k", 2, 1000, 10).Reason; reason != Rpm {
 		t.Fatalf("third request within the minute: got %v, want Rpm", reason)
 	}
 	c.advance(30 * time.Second) // refills one request at 2/min
-	rel, reason := l.Acquire("k", 2, 1000, 10)
+	d := l.Acquire("k", 2, 1000, 10)
+
+	rel, reason := d.Release, d.Reason
 	if reason != OK {
 		t.Fatalf("after refill: got %v", reason)
 	}
@@ -36,15 +40,19 @@ func TestRpmExhaustionAndRefill(t *testing.T) {
 
 func TestConcurrencyLimit(t *testing.T) {
 	l, _ := newTestLimiter()
-	rel1, reason := l.Acquire("k", 100, 1000, 1)
+	d1 := l.Acquire("k", 100, 1000, 1)
+
+	rel1, reason := d1.Release, d1.Reason
 	if reason != OK {
 		t.Fatal(reason)
 	}
-	if _, reason := l.Acquire("k", 100, 1000, 1); reason != Concurrency {
+	if reason := l.Acquire("k", 100, 1000, 1).Reason; reason != Concurrency {
 		t.Fatalf("got %v, want Concurrency", reason)
 	}
 	rel1()
-	rel2, reason := l.Acquire("k", 100, 1000, 1)
+	d2 := l.Acquire("k", 100, 1000, 1)
+
+	rel2, reason := d2.Release, d2.Reason
 	if reason != OK {
 		t.Fatalf("after release: got %v", reason)
 	}
@@ -52,11 +60,13 @@ func TestConcurrencyLimit(t *testing.T) {
 	// A release function must be safe to call twice without freeing a slot
 	// it no longer holds.
 	rel1()
-	rel3, reason := l.Acquire("k", 100, 1000, 1)
+	d3 := l.Acquire("k", 100, 1000, 1)
+
+	rel3, reason := d3.Release, d3.Reason
 	if reason != OK {
 		t.Fatal(reason)
 	}
-	if _, reason := l.Acquire("k", 100, 1000, 1); reason != Concurrency {
+	if reason := l.Acquire("k", 100, 1000, 1).Reason; reason != Concurrency {
 		t.Fatal("double release freed an extra concurrency slot")
 	}
 	rel3()
@@ -64,7 +74,9 @@ func TestConcurrencyLimit(t *testing.T) {
 
 func TestTpmDebtBlocksUntilRefill(t *testing.T) {
 	l, c := newTestLimiter()
-	rel, reason := l.Acquire("k", 100, 600, 10)
+	d := l.Acquire("k", 100, 600, 10)
+
+	rel, reason := d.Release, d.Reason
 	if reason != OK {
 		t.Fatal(reason)
 	}
@@ -72,15 +84,16 @@ func TestTpmDebtBlocksUntilRefill(t *testing.T) {
 	// The response turned out to be huge: charge far beyond the bucket
 	// (level 600 - 2400 = -1800).
 	l.ChargeTokens("k", 600, 2400)
-	if _, reason := l.Acquire("k", 100, 600, 10); reason != Tpm {
+	if reason := l.Acquire("k", 100, 600, 10).Reason; reason != Tpm {
 		t.Fatalf("got %v, want Tpm", reason)
 	}
 	c.advance(2 * time.Minute) // 1200 tokens refill; still 600 in debt
-	if _, reason := l.Acquire("k", 100, 600, 10); reason != Tpm {
+	if reason := l.Acquire("k", 100, 600, 10).Reason; reason != Tpm {
 		t.Fatalf("still in debt: got %v, want Tpm", reason)
 	}
 	c.advance(3 * time.Minute)
-	rel, reason = l.Acquire("k", 100, 600, 10)
+	d = l.Acquire("k", 100, 600, 10)
+	rel, reason = d.Release, d.Reason
 	if reason != OK {
 		t.Fatalf("after debt refilled: got %v", reason)
 	}
@@ -89,13 +102,13 @@ func TestTpmDebtBlocksUntilRefill(t *testing.T) {
 
 func TestKeysAreIndependent(t *testing.T) {
 	l, _ := newTestLimiter()
-	if _, reason := l.Acquire("a", 1, 1000, 10); reason != OK {
+	if reason := l.Acquire("a", 1, 1000, 10).Reason; reason != OK {
 		t.Fatal(reason)
 	}
-	if _, reason := l.Acquire("a", 1, 1000, 10); reason != Rpm {
+	if reason := l.Acquire("a", 1, 1000, 10).Reason; reason != Rpm {
 		t.Fatal("key a should be out of requests")
 	}
-	if _, reason := l.Acquire("b", 1, 1000, 10); reason != OK {
+	if reason := l.Acquire("b", 1, 1000, 10).Reason; reason != OK {
 		t.Fatal("key b must not share key a's bucket")
 	}
 }

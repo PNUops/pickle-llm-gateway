@@ -139,6 +139,24 @@ func main() {
 		}
 	}()
 
+	// Operator surface on its own listener, so metrics can never be reached
+	// through the student-facing route.
+	var adminSrv *http.Server
+	if cfg.AdminListen != "" {
+		adminSrv = &http.Server{
+			Addr:              cfg.AdminListen,
+			Handler:           srv.AdminHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       15 * time.Second,
+		}
+		go func() {
+			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("admin listener failed", "error", err)
+			}
+		}()
+		log.Info("admin listener up", "addr", cfg.AdminListen)
+	}
+
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- hs.ListenAndServe() }()
 	log.Info("llm-gateway listening", "addr", cfg.Listen, "generation", store.Generation())
@@ -160,6 +178,9 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	_ = hs.Shutdown(shutdownCtx)
+	if adminSrv != nil {
+		_ = adminSrv.Shutdown(shutdownCtx)
+	}
 	if err := sp.Close(); err != nil {
 		log.Error("spool close failed", "error", err)
 	}

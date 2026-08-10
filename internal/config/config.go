@@ -35,7 +35,11 @@ const (
 
 // Config is everything the daemon needs to run.
 type Config struct {
-	Listen       string // address for the public-facing HTTP listener
+	Listen string // address for the public-facing HTTP listener
+	// AdminListen serves metrics and health on a separate address. Empty
+	// disables it. Bind it to loopback or the infra bridge only — it is not
+	// behind the public route and must never become reachable from it.
+	AdminListen  string
 	SnapshotPath string // authorization document (or, on http, its local cache)
 	SpoolDir     string // usage event spool directory
 
@@ -52,6 +56,10 @@ type Config struct {
 	UpstreamHeaderWait   time.Duration // how long to wait for upstream response headers
 	RequestMaxDuration   time.Duration // hard cap on one request, streaming included
 	MaxInFlight          int           // gateway-wide concurrent request cap
+	// UpstreamRetries is how many extra attempts one upstream gets after a
+	// transient failure, before the model's fallback (if any) is tried. Only
+	// ever applied before any of the response has reached the client.
+	UpstreamRetries int
 
 	// Fallback limits for keys whose snapshot entry sets none.
 	DefaultRpm         int
@@ -103,6 +111,7 @@ func FromEnv() (*Config, error) {
 		Listen:               getenv("LISTEN", ""),
 		SnapshotPath:         getenv("SNAPSHOT_PATH", ""),
 		SpoolDir:             getenv("SPOOL_DIR", ""),
+		AdminListen:          getenv("ADMIN_LISTEN", ""),
 		SnapshotSource:       getenv("SNAPSHOT_SOURCE", SourceFile),
 		ControlBaseURL:       strings.TrimRight(getenv("CONTROL_BASE_URL", ""), "/"),
 		ControlToken:         getenv("CONTROL_TOKEN", ""),
@@ -116,6 +125,7 @@ func FromEnv() (*Config, error) {
 		// default stays well under the unit's MemoryMax. Raise it (and the
 		// LXC memory + MemoryMax together) for a larger host.
 		MaxInFlight:        16,
+		UpstreamRetries:    1,
 		DefaultRpm:         20,
 		DefaultTpm:         20000,
 		DefaultConcurrency: 2,
@@ -165,6 +175,14 @@ func FromEnv() (*Config, error) {
 				continue
 			}
 			*opt.dst = n
+		}
+	}
+	if v := getenv("UPSTREAM_RETRIES", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			errs = append(errs, envPrefix+"UPSTREAM_RETRIES must be a non-negative integer")
+		} else {
+			cfg.UpstreamRetries = n
 		}
 	}
 	if v := getenv("SPOOL_RETENTION_DAYS", ""); v != "" {
