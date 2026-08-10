@@ -84,6 +84,11 @@ type Key struct {
 	AllowedModels  []string   `json:"allowedModels,omitempty"`
 	Limits         Limits     `json:"limits"`
 	QuotaExhausted bool       `json:"quotaExhausted,omitempty"`
+	// RecordBodies opts this key into prompt and response capture. It is the
+	// key owner's choice, expressed in the control plane and carried here; the
+	// default is off, so a key says nothing about bodies unless someone asked
+	// for it. Capture never writes to the usage spool — see internal/bodies.
+	RecordBodies bool `json:"recordBodies,omitempty"`
 }
 
 // Limits are the short-window limits the gateway enforces locally. A zero

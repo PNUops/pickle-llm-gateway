@@ -69,6 +69,14 @@ type Config struct {
 	UsageBatchSize    int
 	UsagePushInterval time.Duration
 
+	// BodyCapture opens the prompt/response capture channel. Off by default,
+	// and even on, a key records nothing unless its snapshot entry opted in.
+	// Captured text never touches this host's disk, so the channel has to
+	// exist before anything is captured at all.
+	BodyCapture   bool
+	BodyQueueSize int
+	BodyBatchSize int
+
 	// AllowGenerationReset lets the snapshot load a document whose generation
 	// is below the persisted high-water (an operator deliberately resetting the
 	// sequence). Off by default so a restored old snapshot fails closed.
@@ -114,6 +122,8 @@ func FromEnv() (*Config, error) {
 		SpoolRetentionDays: 90,
 		UsageBatchSize:     500,
 		UsagePushInterval:  30 * time.Second,
+		BodyQueueSize:      256,
+		BodyBatchSize:      20,
 		Upstreams:          map[string]Upstream{},
 	}
 
@@ -192,6 +202,11 @@ func FromEnv() (*Config, error) {
 		// Shipping needs somewhere to ship to, whichever way the document
 		// arrives — an operator may push usage while still editing the
 		// document by hand.
+		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
+		need("CONTROL_TOKEN", cfg.ControlToken)
+	}
+	if v := getenv("BODY_CAPTURE", ""); v == "on" || v == "1" || strings.EqualFold(v, "true") {
+		cfg.BodyCapture = true
 		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
 		need("CONTROL_TOKEN", cfg.ControlToken)
 	}

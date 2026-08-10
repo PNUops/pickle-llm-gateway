@@ -15,7 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
@@ -283,11 +285,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Body capture: only for a key that opted in, and only when the delivery
+	// channel exists — captured text is never written to this host's disk, so
+	// with no channel there is nothing to capture into.
+	var capture *bodies.Record
+	if s.bodies.Enabled() && key.RecordBodies {
+		capture = &bodies.Record{
+			EventUUID:   ev.EventUUID,
+			KeyID:       key.KeyID,
+			RequestedAt: start,
+			Request:     append(json.RawMessage(nil), messagesRaw...),
+		}
+	}
+
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw))
+		s.finishNonStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw), capture)
 		return
 	}
 	s.finishStream(w, resp, streamArgs{
+		capture:      capture,
 		publicName:   model.PublicName,
 		keyID:        key.KeyID,
 		tpm:          tpm,
@@ -313,7 +329,7 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 	return out
 }
 
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int) {
+func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -356,18 +372,22 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 			haveUsage = true
 		}
 	}
-	// Fallback size for the estimate when the upstream reported no usage.
-	contentChars := 0
-	if !haveUsage {
-		if choices, _ := m["choices"].([]any); len(choices) > 0 {
-			if first, _ := choices[0].(map[string]any); first != nil {
-				if msg, _ := first["message"].(map[string]any); msg != nil {
-					if content, _ := msg["content"].(string); content != "" {
-						contentChars = len(content)
-					}
-				}
+	// The assistant text is needed for the no-usage size estimate, and again
+	// for capture when the key opted in.
+	answer := ""
+	if choices, _ := m["choices"].([]any); len(choices) > 0 {
+		if first, _ := choices[0].(map[string]any); first != nil {
+			if msg, _ := first["message"].(map[string]any); msg != nil {
+				answer, _ = msg["content"].(string)
 			}
 		}
+	}
+	contentChars := 0
+	if !haveUsage {
+		contentChars = len(answer)
+	}
+	if capture != nil {
+		capture.Response, capture.Truncated = capString(answer)
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -386,6 +406,7 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 	}
 	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
 	s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
+	s.bodies.Offer(capture)
 	record()
 }
 
@@ -395,6 +416,7 @@ type streamArgs struct {
 	tpm          int
 	inputBytes   int
 	forwardUsage bool
+	capture      *bodies.Record // nil unless the key opted into body capture
 	clientCtx    context.Context
 	upCtx        context.Context
 }
@@ -426,6 +448,8 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	haveUsage := false
 	contentChars := 0
 	dropped := 0
+	// Assembled assistant text, only when the key opted into capture.
+	var answer strings.Builder
 
 	// SSE events are framed by blank lines and one event's data may span
 	// several `data:` lines, so payloads are assembled per event before
@@ -468,6 +492,9 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			}
 		}
 		contentChars += c.contentChars
+		if a.capture != nil && c.content != "" && answer.Len() < bodies.ResponseCapBytes {
+			answer.WriteString(c.content)
+		}
 		return writeRaw(append(append([]byte("data: "), c.out...), '\n', '\n'))
 	}
 
@@ -539,7 +566,25 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	}
 	s.settleUsage(ev, u, haveUsage, a.inputBytes, contentChars)
 	s.limiter.ChargeTokens(a.keyID, a.tpm, ev.InputTokens+ev.OutputTokens)
+	if a.capture != nil {
+		a.capture.Response, a.capture.Truncated = capString(answer.String())
+		s.bodies.Offer(a.capture)
+	}
 	record()
+}
+
+// capString bounds one captured answer. A cut record says so rather than
+// looking like a short answer.
+func capString(s string) (string, bool) {
+	if len(s) <= bodies.ResponseCapBytes {
+		return s, false
+	}
+	// Cut on a rune boundary so the stored text stays valid UTF-8.
+	cut := bodies.ResponseCapBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
 }
 
 // chunk is one parsed and rewritten SSE payload.
@@ -547,6 +592,7 @@ type chunk struct {
 	out          []byte
 	parsed       map[string]any
 	usage        *usage
+	content      string // this chunk's assistant text, for capture
 	contentChars int
 	choicesEmpty bool
 }
@@ -589,6 +635,7 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {
+					c.content = content
 					c.contentChars = len(content)
 				}
 			}

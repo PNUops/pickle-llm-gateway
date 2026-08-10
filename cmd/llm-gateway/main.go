@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
 	"github.com/pnuops/pickle-llm-gateway/internal/reporter"
@@ -96,6 +97,18 @@ func main() {
 			}
 		}
 	}()
+
+	// Body capture rides its own channel, and only exists when there is a
+	// control plane to deliver to: captured text is never written to this
+	// host's disk, so without delivery there is nowhere for it to go and
+	// nothing is captured. Individual keys still have to opt in.
+	if cfg.BodyCapture {
+		sink := bodies.New(cfg.ControlBaseURL, cfg.ControlToken,
+			cfg.BodyQueueSize, cfg.BodyBatchSize, cfg.ControlTimeout, log)
+		srv.SetBodySink(sink)
+		go sink.Run(ctx)
+		log.Info("body capture channel enabled (per-key opt-in still required)")
+	}
 
 	// Usage reporting: walk the spool and ship batches to the control plane.
 	// The spool is written regardless, so enabling this later ships what
