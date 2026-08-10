@@ -129,13 +129,23 @@ func TestRefreshKeepsStateOnBrokenFile(t *testing.T) {
 	}
 }
 
-func TestKeyAllows(t *testing.T) {
+func TestKeyAllowsModel(t *testing.T) {
+	pub := &Model{PublicName: "pnu-general"}
+	restricted := &Model{PublicName: "pnu-internal", Visibility: ModelRestricted}
+	other := &Model{PublicName: "pnu-code"}
+
 	open := Key{}
-	if !open.Allows("anything") {
-		t.Fatal("empty allow list must allow every model")
+	if !open.AllowsModel(pub) {
+		t.Fatal("empty allow list must allow a public model")
 	}
-	limited := Key{AllowedModels: []string{"pnu-general"}}
-	if !limited.Allows("pnu-general") || limited.Allows("pnu-code") {
+	if open.AllowsModel(restricted) {
+		t.Fatal("empty allow list must NOT allow a restricted model")
+	}
+	limited := Key{AllowedModels: []string{"pnu-general", "pnu-internal"}}
+	if !limited.AllowsModel(pub) || !limited.AllowsModel(restricted) {
+		t.Fatal("explicit allow list must allow named models, restricted included")
+	}
+	if limited.AllowsModel(other) {
 		t.Fatal("allow list not honored")
 	}
 }
