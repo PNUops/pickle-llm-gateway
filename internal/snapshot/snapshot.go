@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -96,22 +98,57 @@ type state struct {
 // Store serves the current state and refreshes it in the background. Readers
 // never block on a reload.
 type Store struct {
-	cur  atomic.Pointer[state]
-	path string
-	log  *slog.Logger
+	cur   atomic.Pointer[state]
+	path  string
+	log   *slog.Logger
+	known map[string]bool // configured upstream refs (lowercase); nil = skip the check
 
 	// file identity of the last successful load; a reload only parses the
 	// file when this changed.
 	lastModTime time.Time
 	lastSize    int64
+
+	// Generation monotonicity across process restarts. The in-process guard in
+	// reload() cannot see generations from before this process started, so the
+	// highest generation ever served is persisted in a sidecar file; a document
+	// on disk whose generation is below it is a rollback (a restored old backup)
+	// and is refused at startup too — otherwise a restart would serve a snapshot
+	// the running gateway had correctly rejected, silently reviving revoked keys.
+	highWaterPath string
+	highWater     int64
+	allowGenReset bool
+}
+
+// Options configure a Store beyond the document path.
+type Options struct {
+	// KnownUpstreams is the set of upstream refs the gateway has configured
+	// (any case); a model naming an upstream outside it is rejected at load,
+	// so a typo surfaces as a refused snapshot rather than per-request 502s.
+	// Nil disables the check (tests that do not exercise upstream wiring).
+	KnownUpstreams []string
+	// AllowGenerationReset lets a document with a generation below the recorded
+	// high-water load anyway (an operator deliberately resetting the sequence).
+	AllowGenerationReset bool
 }
 
 // Open loads the document once and fails if it is missing or invalid: a
 // gateway must not start with nothing to authorize against. Later reload
 // failures keep the last good state instead, bounding staleness rather than
 // dropping traffic.
-func Open(path string, log *slog.Logger) (*Store, error) {
-	s := &Store{path: path, log: log}
+func Open(path string, log *slog.Logger, opts Options) (*Store, error) {
+	s := &Store{
+		path:          path,
+		log:           log,
+		highWaterPath: path + ".highwater",
+		allowGenReset: opts.AllowGenerationReset,
+	}
+	if opts.KnownUpstreams != nil {
+		s.known = make(map[string]bool, len(opts.KnownUpstreams))
+		for _, r := range opts.KnownUpstreams {
+			s.known[strings.ToLower(r)] = true
+		}
+	}
+	s.highWater = s.readHighWater()
 	if err := s.reload(); err != nil {
 		return nil, err
 	}
@@ -156,24 +193,69 @@ func (s *Store) reload() error {
 	if err != nil {
 		return fmt.Errorf("snapshot: %w", err)
 	}
-	st, err := build(raw)
+	st, err := build(raw, s.known)
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", s.path, err)
 	}
-	prev := s.cur.Load()
-	if prev != nil && st.doc.Generation < prev.doc.Generation {
-		// A generation moving backwards means the file was replaced with an
-		// older document; serving it would silently undo a revocation.
-		return fmt.Errorf("snapshot generation went backwards: %d -> %d", prev.doc.Generation, st.doc.Generation)
+	// The floor a new document must not drop below is the higher of the
+	// in-process generation and the persisted high-water — the first catches a
+	// rollback while running, the second catches one across a restart.
+	floor := s.highWater
+	if prev := s.cur.Load(); prev != nil && prev.doc.Generation > floor {
+		floor = prev.doc.Generation
+	}
+	if st.doc.Generation < floor && !s.allowGenReset {
+		return fmt.Errorf("snapshot generation went backwards: %d < %d (a rollback; set LLMGW_ALLOW_GENERATION_RESET to override)", st.doc.Generation, floor)
 	}
 	s.cur.Store(st)
 	s.lastModTime = fi.ModTime()
 	s.lastSize = fi.Size()
+	if st.doc.Generation > s.highWater {
+		s.highWater = st.doc.Generation
+		s.writeHighWater(st.doc.Generation)
+	}
 	s.log.Info("snapshot loaded", "generation", st.doc.Generation, "models", len(st.doc.Models), "keys", len(st.doc.Keys), "serviceEnabled", st.doc.ServiceEnabled)
 	return nil
 }
 
-func build(raw []byte) (*state, error) {
+// readHighWater returns the persisted highest generation, or 0 if none.
+func (s *Store) readHighWater() int64 {
+	raw, err := os.ReadFile(s.highWaterPath)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// writeHighWater persists the high-water atomically. A failure is logged, not
+// fatal: the in-process guard still holds for this run, and the next
+// successful load rewrites it.
+func (s *Store) writeHighWater(gen int64) {
+	tmp, err := os.CreateTemp(filepath.Dir(s.highWaterPath), ".highwater-*")
+	if err != nil {
+		s.log.Error("high-water write failed", "error", err)
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := fmt.Fprintf(tmp, "%d\n", gen); err != nil {
+		tmp.Close()
+		s.log.Error("high-water write failed", "error", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		s.log.Error("high-water write failed", "error", err)
+		return
+	}
+	if err := os.Rename(tmp.Name(), s.highWaterPath); err != nil {
+		s.log.Error("high-water write failed", "error", err)
+	}
+}
+
+func build(raw []byte, known map[string]bool) (*state, error) {
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	var doc Document
@@ -190,6 +272,9 @@ func build(raw []byte) (*state, error) {
 		m := &doc.Models[i]
 		if m.PublicName == "" || m.UpstreamRef == "" || m.UpstreamModel == "" {
 			return nil, fmt.Errorf("model %d: publicName, upstreamRef and upstreamModel are all required", i)
+		}
+		if known != nil && !known[strings.ToLower(m.UpstreamRef)] {
+			return nil, fmt.Errorf("model %q references upstream %q, which is not configured", m.PublicName, m.UpstreamRef)
 		}
 		if _, dup := st.byPublic[m.PublicName]; dup {
 			return nil, fmt.Errorf("duplicate public model name %q", m.PublicName)

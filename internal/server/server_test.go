@@ -34,7 +34,9 @@ type mockOpts struct {
 	rawResp     string        // non-stream: raw body override (may be invalid JSON)
 	noUsage     bool          // non-stream: omit the usage field
 	splitEvent  bool          // stream: split the first event across two data lines
-	brokenChunk bool          // stream: emit an unparseable data payload first
+	brokenChunk bool          // stream: emit a truncated JSON object payload first
+	heartbeat   bool          // stream: emit a non-JSON keepalive (data: ping) first
+	abortMid    bool          // stream: hijack and close after one chunk, no [DONE]
 	chunkDelay  time.Duration // stream: pause before each chunk
 }
 
@@ -100,8 +102,23 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, raw)
 		fl.Flush()
 	}
+	if cp.abortMid {
+		// One good chunk, then close the raw connection with no [DONE] — the
+		// gateway's stream read fails with a non-EOF error.
+		emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"안녕"}}]}` + "\n\n")
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}
+		return
+	}
+	if cp.heartbeat {
+		emit("data: ping\n\n")
+	}
 	if cp.brokenChunk {
-		emit("data: {broken \"model\": \"" + upstreamModel + "\"\n\n")
+		emit("data: {\"id\":\"c1\",\"model\":\"" + upstreamModel + "\",\"choi\n\n")
 	}
 	if cp.splitEvent {
 		// One JSON event across two data lines: legal SSE, joined with \n.
@@ -158,7 +175,7 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 	}
 	h.writeSnapshot(t, doc)
 
-	store, err := snapshot.Open(h.snapPath, slog.New(slog.DiscardHandler))
+	store, err := snapshot.Open(h.snapPath, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -811,5 +828,75 @@ func TestStreamDeadlineReported(t *testing.T) {
 	evs := h.spoolEvents(t)
 	if len(evs) != 1 || evs[0].Status != spool.StatusTimeout || evs[0].ErrorType != "request_deadline_exceeded" {
 		t.Fatalf("unexpected event: %+v", evs)
+	}
+}
+
+func TestCapFieldTranslation(t *testing.T) {
+	// Upstream honors only the legacy field; a student sending the modern one
+	// must have it translated so the cap actually applies.
+	h := newHarness(t, nil, func(c *config.Config) {
+		u := c.Upstreams["mock"]
+		u.CapField = "max_tokens"
+		c.Upstreams["mock"] = u
+	})
+	if status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_completion_tokens":100}`); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	sent, _ := h.mock.last()
+	if _, has := sent["max_completion_tokens"]; has {
+		t.Fatal("modern field forwarded verbatim to a legacy upstream")
+	}
+	var n int
+	if err := json.Unmarshal(sent["max_tokens"], &n); err != nil || n != 100 {
+		t.Fatalf("cap not translated onto max_tokens: %s", sent["max_tokens"])
+	}
+}
+
+func TestHeartbeatForwardedContentNotDropped(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.heartbeat = true })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	text := string(body)
+	if status != 200 || !strings.Contains(text, "data: ping") {
+		t.Fatalf("heartbeat not forwarded:\n%s", text)
+	}
+	// A non-JSON keepalive is harmless, so the request stays OK.
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].Status != spool.StatusOK {
+		t.Fatalf("heartbeat marked the request non-OK: %+v", evs)
+	}
+}
+
+func TestDroppedChunkMarksDegraded(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.brokenChunk = true })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	text := string(body)
+	if status != 200 || strings.Contains(text, upstreamModel) {
+		t.Fatalf("truncated chunk leaked the model or wrong status:\n%s", text)
+	}
+	// The dropped content means the answer is incomplete: not a clean OK.
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].Status != spool.StatusUpstreamErr || evs[0].ErrorType != "upstream_chunk_unreadable" {
+		t.Fatalf("dropped chunk not recorded as degraded: %+v", evs)
+	}
+}
+
+func TestStreamInterruptAnnouncesError(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.abortMid = true })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	text := string(body)
+	if status != 200 {
+		t.Fatalf("stream status %d", status)
+	}
+	// The client must be able to tell a truncated answer from a complete one:
+	// an error event plus a terminal [DONE].
+	if !strings.Contains(text, "upstream_stream_interrupted") || !strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("interruption not announced to the client:\n%s", text)
+	}
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].Status != spool.StatusUpstreamErr {
+		t.Fatalf("interruption not recorded: %+v", evs)
 	}
 }

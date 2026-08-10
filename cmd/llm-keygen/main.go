@@ -102,6 +102,21 @@ func newToken() (string, error) {
 // and a root-owned replacement would silently freeze the gateway on its last
 // good state.
 func insert(path string, entry snapshot.Key) error {
+	// Serialize the read-modify-write against a concurrent keygen or a hand
+	// edit: without the lock, two writers each read the pre-edit document and
+	// the second rename silently discards the first's change — a lost key, or a
+	// revocation undone. flock on a sidecar (not the document itself, which is
+	// replaced by rename) is advisory but every writer here takes it.
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("acquiring the snapshot lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("locking the snapshot: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
 	fi, err := os.Stat(path)
 	if err != nil {
 		return err
