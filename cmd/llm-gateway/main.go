@@ -45,6 +45,10 @@ func main() {
 	store, err := snapshot.Open(ctx, source, cfg.SnapshotPath, log, snapshot.Options{
 		KnownUpstreams:       cfg.UpstreamRefs(),
 		AllowGenerationReset: cfg.AllowGenerationReset,
+		// A hand-maintained file is held to the letter so a typo cannot pass;
+		// a document from the control plane may carry members a newer api
+		// added, and refusing it would stop revocations arriving.
+		TolerateUnknownTopLevel: cfg.SnapshotSource == config.SourceHTTP,
 	})
 	if err != nil {
 		log.Error("startup failed", "error", err)
@@ -113,16 +117,27 @@ func main() {
 	// Usage reporting: walk the spool and ship batches to the control plane.
 	// The spool is written regardless, so enabling this later ships what
 	// already accumulated.
+	var shipped func(day string) bool
 	if cfg.UsagePush {
 		rep := reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
 			cfg.UsageBatchSize, cfg.ControlTimeout, log)
 		go rep.Run(ctx, cfg.UsagePushInterval)
+		// Retention must not delete a day the reporter never confirmed: with
+		// shipping on, an unreported day file is the only copy of that usage.
+		shipped = func(day string) bool {
+			offsets, err := rep.ShippedThrough()
+			if err != nil {
+				return false // unknown: keep the file
+			}
+			_, ok := offsets[day]
+			return ok
+		}
 	}
 
 	// Usage-spool retention: prune once at startup and daily thereafter.
 	go func() {
 		prune := func() {
-			if err := sp.Prune(time.Now(), cfg.SpoolRetentionDays); err != nil {
+			if err := sp.Prune(time.Now(), cfg.SpoolRetentionDays, shipped); err != nil {
 				log.Error("spool prune failed", "error", err)
 			}
 		}

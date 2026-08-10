@@ -21,7 +21,11 @@ import (
 type attemptError struct {
 	err     error
 	timeout bool
-	refusal *apiError
+	// throttled marks an upstream that asked us to slow down (429). It is not
+	// retried on the same upstream, and the student sees "busy" rather than a
+	// generic upstream failure.
+	throttled bool
+	refusal   *apiError
 }
 
 // upstreamHealth tracks consecutive failures per upstream so a dead one stops
@@ -135,6 +139,18 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 			if ctx.Err() != nil {
 				return nil, up, ae
 			}
+			if ae.throttled {
+				// Same upstream, immediately again, is exactly what it asked
+				// us not to do. Move on to the fallback if there is one.
+				break
+			}
+			if ae.timeout {
+				// A completion is not idempotent and the upstream may well be
+				// generating right now — it accepted the POST and is simply
+				// slow. Repeating it bills a second generation and doubles the
+				// student's wait for an answer they will not get twice.
+				break
+			}
 			if s.health.recordFailure(ref) {
 				s.log.Warn("upstream put in cooldown after repeated failures",
 					"upstreamRef", ref, "coolFor", coolFor.String())
@@ -193,6 +209,12 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte) (
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		// The request itself is wrong; no other upstream will like it better.
 		return nil, &attemptError{refusal: &errUpstreamRejected}
+	case http.StatusTooManyRequests:
+		// The upstream is throttling us. Retrying immediately makes it worse,
+		// and the student should be told the service is busy rather than that
+		// something broke. A fallback upstream is still worth trying, so this
+		// is a throttle, not a refusal.
+		return nil, &attemptError{err: errUpstreamThrottled, throttled: true}
 	case http.StatusUnauthorized, http.StatusForbidden:
 		// Our credential, not the student's problem — and not something a
 		// retry fixes. Fall through to another upstream if one exists.

@@ -24,6 +24,11 @@ type Source interface {
 	// changed=false means "nothing new"; raw is then meaningless. An error
 	// leaves the caller on its last good state.
 	Load(ctx context.Context, served int64) (raw []byte, changed bool, err error)
+	// Accept is called once the caller has validated and applied the document
+	// Load returned. A source must not treat a document as delivered until
+	// then: one that is offered and rejected has to keep being offered, or the
+	// rejection stops being visible.
+	Accept()
 	// Name identifies the source in logs and on the health endpoint.
 	Name() string
 }
@@ -35,9 +40,11 @@ type Source interface {
 // writers replace the file by rename, so a changed file is always a new inode
 // with a new mtime.
 type FileSource struct {
-	path        string
-	lastModTime time.Time
-	lastSize    int64
+	path           string
+	lastModTime    time.Time
+	lastSize       int64
+	pendingModTime time.Time
+	pendingSize    int64
 }
 
 // NewFileSource reads the document from path.
@@ -59,9 +66,20 @@ func (s *FileSource) Load(_ context.Context, served int64) ([]byte, bool, error)
 	if err != nil {
 		return nil, false, fmt.Errorf("snapshot file: %w", err)
 	}
-	s.lastModTime = fi.ModTime()
-	s.lastSize = fi.Size()
+	// The identity is remembered by Accept, not here: a document that the
+	// caller then rejects (unparseable, or a generation rollback) must keep
+	// being offered, so the failure keeps being counted and the health surface
+	// keeps saying the served state is stale. Stamping it here would make the
+	// next poll report "unchanged", which reads as healthy.
+	s.pendingModTime = fi.ModTime()
+	s.pendingSize = fi.Size()
 	return raw, true, nil
+}
+
+// Accept records that the caller took the last offered document.
+func (s *FileSource) Accept() {
+	s.lastModTime = s.pendingModTime
+	s.lastSize = s.pendingSize
 }
 
 // --- control-plane source ----------------------------------------------------
@@ -89,6 +107,11 @@ type HTTPSource struct {
 	url       string
 	token     string
 	cachePath string
+	// pending holds the document Load returned but the caller has not yet
+	// accepted. Caching it before validation would let a document the Store
+	// refuses (a rollback, an unconfigured upstream) become what a later
+	// restart loads — and then the gateway would refuse to start at all.
+	pending []byte
 	// inFlight reports the gateway's current concurrent requests; nil until
 	// the server is wired, and never load-bearing.
 	inFlight  func() int
@@ -109,13 +132,23 @@ func NewHTTPSource(baseURL, token, cachePath string, timeout time.Duration) *HTT
 // SetInFlight supplies the in-flight gauge reported on each poll.
 func (s *HTTPSource) SetInFlight(f func() int) { s.inFlight = f }
 
+// Accept caches the document the caller just applied, so a restart while the
+// control plane is unreachable comes up on a document that was known good.
+func (s *HTTPSource) Accept() {
+	if s.pending == nil {
+		return
+	}
+	s.writeCache(s.pending)
+	s.pending = nil
+}
+
 func (s *HTTPSource) Name() string { return "control-plane" }
 
 func (s *HTTPSource) Load(ctx context.Context, served int64) ([]byte, bool, error) {
 	raw, changed, err := s.fetch(ctx, served)
 	if err == nil {
 		if changed {
-			s.writeCache(raw)
+			s.pending = raw
 		}
 		s.delivered = true
 		return raw, changed, nil
@@ -126,6 +159,9 @@ func (s *HTTPSource) Load(ctx context.Context, served int64) ([]byte, bool, erro
 	if !s.delivered {
 		if cached, cerr := os.ReadFile(s.cachePath); cerr == nil {
 			s.delivered = true
+			// Already on disk: re-writing it on Accept would be a no-op, and
+			// leaving pending nil keeps it that way.
+			s.pending = nil
 			return cached, true, nil
 		}
 	}

@@ -187,11 +187,6 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 	}
 	h.writeSnapshot(t, doc)
 
-	store, err := snapshot.OpenFile(h.snapPath, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.store = store
 	sp, err := spool.Open(h.spoolDir)
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +208,15 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 	if mutateCfg != nil {
 		mutateCfg(cfg)
 	}
+	// Open the store with the upstreams the server actually has, exactly as
+	// main does — otherwise a test that adds a fallback upstream would see the
+	// document refused for naming an upstream the store was not told about.
+	store, err := snapshot.OpenFile(h.snapPath, slog.New(slog.DiscardHandler),
+		snapshot.Options{KnownUpstreams: cfg.UpstreamRefs()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.store = store
 	srv := New(cfg, store, limits.New(nil), sp, slog.New(slog.DiscardHandler))
 	h.srv = srv
 	h.gw = httptest.NewServer(srv.Handler())
@@ -1367,5 +1371,63 @@ func TestAdminMetrics(t *testing.T) {
 	defer pub.Body.Close()
 	if pub.StatusCode != 404 {
 		t.Fatalf("metrics reachable on the public listener: %d", pub.StatusCode)
+	}
+}
+
+// A completion that timed out waiting for headers may well be generating right
+// now. Repeating it bills a second answer nobody reads.
+func TestTimeoutIsNotRetried(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	h := newHarness(t, nil, func(c *config.Config) {
+		c.UpstreamRetries = 2
+		c.UpstreamHeaderWait = 80 * time.Millisecond
+		c.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: slow.URL, CapField: "max_completion_tokens"}
+	})
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 504 || errCode(t, body) != "upstream_timeout" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("a timed-out completion was sent %d times", got)
+	}
+}
+
+// A throttling upstream must not be hammered, and the student should be told
+// the service is busy rather than that something broke.
+func TestUpstreamThrottleIsNotRetriedAndSaysBusy(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	h := newHarness(t, nil, func(c *config.Config) { c.UpstreamRetries = 2 })
+	throttling := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer throttling.Close()
+	h.srv.cfg.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: throttling.URL, CapField: "max_completion_tokens"}
+
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 503 || errCode(t, body) != "server_busy" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("a throttling upstream was called %d times", got)
 	}
 }

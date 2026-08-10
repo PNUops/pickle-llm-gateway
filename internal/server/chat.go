@@ -253,6 +253,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			refuse(errUpstreamTimeout, spool.StatusTimeout)
 		case attemptErr.refusal != nil:
 			refuse(*attemptErr.refusal, spool.StatusUpstreamErr)
+		case attemptErr.throttled:
+			// Every upstream is throttling us: the service really is busy.
+			refuse(errServerBusy, spool.StatusUpstreamErr)
 		default:
 			s.log.Error("upstream request failed", "keyId", key.KeyID,
 				"model", publicModel, "error", attemptErr.err)

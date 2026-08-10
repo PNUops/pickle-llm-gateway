@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,12 +26,27 @@ import (
 	"github.com/pnuops/pickle-llm-gateway/internal/version"
 )
 
-// checkpoint records how far the spool has been shipped: the day file and the
-// byte offset within it. Day files are named for a UTC date, so ordering them
-// lexically orders them in time.
+// checkpoint records how far each day file has been shipped. It is a map, not
+// a single cursor, because a request that starts before UTC midnight and ends
+// after it appends to *yesterday's* file after today's has already been
+// shipped: a single "we are past that day" cursor would skip those events
+// forever. Offsets only ever move forward, so re-reading a day costs nothing.
 type checkpoint struct {
-	Day    string `json:"day"`
-	Offset int64  `json:"offset"`
+	Offsets map[string]int64 `json:"offsets"`
+}
+
+func (c *checkpoint) offsetOf(day string) int64 {
+	if c.Offsets == nil {
+		return 0
+	}
+	return c.Offsets[day]
+}
+
+func (c *checkpoint) set(day string, offset int64) {
+	if c.Offsets == nil {
+		c.Offsets = map[string]int64{}
+	}
+	c.Offsets[day] = offset
 }
 
 // Reporter walks the spool and posts batches. One instance, one goroutine.
@@ -103,20 +119,29 @@ func (r *Reporter) Flush(ctx context.Context) (int, error) {
 	total := 0
 	for _, path := range files {
 		day := dayOf(path)
-		if day == "" || day < r.ckpt.Day {
+		if day == "" {
+			// Not a spool file this package wrote. Ignoring it keeps one
+			// stray name from stalling every real file behind it.
 			continue
 		}
-		offset := int64(0)
-		if day == r.ckpt.Day {
-			offset = r.ckpt.Offset
-		}
-		sent, err := r.shipFile(ctx, path, day, offset)
+		sent, err := r.shipFile(ctx, path, day, r.ckpt.offsetOf(day))
 		total += sent
 		if err != nil {
 			return total, err
 		}
 	}
 	return total, nil
+}
+
+// ShippedThrough reports the day files that have been fully or partly shipped,
+// so retention can refuse to delete what was never reported.
+func (r *Reporter) ShippedThrough() (map[string]int64, error) {
+	if err := r.loadCheckpoint(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(r.ckpt.Offsets))
+	maps.Copy(out, r.ckpt.Offsets)
+	return out, nil
 }
 
 // shipFile posts the complete lines of one day file from offset onward.
@@ -148,7 +173,7 @@ func (r *Reporter) shipFile(ctx context.Context, path, day string, offset int64)
 		}
 		sent += len(batch)
 		batch = batch[:0]
-		r.ckpt = checkpoint{Day: day, Offset: batchEnd}
+		r.ckpt.set(day, batchEnd)
 		return r.saveCheckpoint()
 	}
 
@@ -259,11 +284,17 @@ func (r *Reporter) saveCheckpoint() error {
 	return nil
 }
 
-// dayOf extracts the YYYYMMDD part of a spool file name.
+// dayOf extracts the YYYYMMDD part of a spool file name, and returns "" for
+// anything that is not one — including a name that matches the glob but is not
+// a date, such as a hand-made copy.
 func dayOf(path string) string {
 	base := filepath.Base(path)
 	if !strings.HasPrefix(base, "usage-") || !strings.HasSuffix(base, ".jsonl") {
 		return ""
 	}
-	return strings.TrimSuffix(strings.TrimPrefix(base, "usage-"), ".jsonl")
+	day := strings.TrimSuffix(strings.TrimPrefix(base, "usage-"), ".jsonl")
+	if _, err := time.Parse("20060102", day); err != nil {
+		return ""
+	}
+	return day
 }

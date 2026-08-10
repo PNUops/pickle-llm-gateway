@@ -146,7 +146,7 @@ func TestPruneRemovesOldFilesKeepsRecentAndCurrent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := w.Prune(now, 90); err != nil {
+	if err := w.Prune(now, 90, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
@@ -159,10 +159,39 @@ func TestPruneRemovesOldFilesKeepsRecentAndCurrent(t *testing.T) {
 		t.Fatal("current file was pruned")
 	}
 	// Retention 0 disables pruning.
-	if err := w.Prune(now, 0); err != nil {
+	if err := w.Prune(now, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(recent); err != nil {
 		t.Fatal("retention 0 must not prune")
+	}
+}
+
+// Retention must not delete a day the reporter never confirmed: with shipping
+// on, an unreported file is the only copy of that usage.
+func TestPruneKeepsUnshippedDays(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	shipped := filepath.Join(dir, "usage-20260101.jsonl")
+	unshipped := filepath.Join(dir, "usage-20260102.jsonl")
+	for _, f := range []string{shipped, unshipped} {
+		if err := os.WriteFile(f, []byte("{}\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keep := func(day string) bool { return day == "20260101" }
+	if err := w.Prune(now, 90, keep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(shipped); !os.IsNotExist(err) {
+		t.Fatal("a shipped, past-retention file was kept")
+	}
+	if _, err := os.Stat(unshipped); err != nil {
+		t.Fatal("an unshipped file was deleted past retention")
 	}
 }

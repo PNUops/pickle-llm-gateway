@@ -164,6 +164,8 @@ func FromEnv() (*Config, error) {
 		dst  *int
 	}{
 		{"MAX_IN_FLIGHT", &cfg.MaxInFlight},
+		{"BODY_QUEUE_SIZE", &cfg.BodyQueueSize},
+		{"BODY_BATCH_SIZE", &cfg.BodyBatchSize},
 		{"DEFAULT_RPM", &cfg.DefaultRpm},
 		{"DEFAULT_TPM", &cfg.DefaultTpm},
 		{"DEFAULT_CONCURRENCY", &cfg.DefaultConcurrency},
@@ -259,6 +261,13 @@ func FromEnv() (*Config, error) {
 	return cfg, nil
 }
 
+// reservedUpstreamSettings are names under the UPSTREAM_ prefix that configure
+// upstream handling as a whole rather than declaring one.
+var reservedUpstreamSettings = map[string]bool{
+	"RETRIES":     true,
+	"HEADER_WAIT": true,
+}
+
 // upstreamsFromEnv collects LLMGW_UPSTREAM_<REF>_BASE_URL / _API_KEY pairs.
 // <REF> is matched case-insensitively against the snapshot's upstreamRef.
 func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
@@ -271,6 +280,13 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			continue
 		}
 		rest := strings.TrimPrefix(name, p)
+		// Settings that are about upstreams in general, not about one named
+		// upstream, share this prefix. Without this they parse as an upstream
+		// declaration and fail the whole startup — which is exactly what
+		// LLMGW_UPSTREAM_RETRIES did.
+		if reservedUpstreamSettings[rest] {
+			continue
+		}
 		var ref, field string
 		switch {
 		case strings.HasSuffix(rest, "_BASE_URL"):
