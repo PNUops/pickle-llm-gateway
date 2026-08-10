@@ -104,3 +104,46 @@ func TestCapFieldParsing(t *testing.T) {
 		t.Fatal("unknown cap field accepted")
 	}
 }
+
+// Every knob the README documents must actually be read; a documented default
+// that cannot be changed is worse than an undocumented one.
+func TestDocumentedBodyKnobsAreRead(t *testing.T) {
+	setRequired(t)
+	t.Setenv("LLMGW_BODY_QUEUE_SIZE", "4096")
+	t.Setenv("LLMGW_BODY_BATCH_SIZE", "7")
+	t.Setenv("LLMGW_UPSTREAM_RETRIES", "0")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BodyQueueSize != 4096 || cfg.BodyBatchSize != 7 {
+		t.Fatalf("body knobs ignored: queue=%d batch=%d", cfg.BodyQueueSize, cfg.BodyBatchSize)
+	}
+	if cfg.UpstreamRetries != 0 {
+		t.Fatalf("retries not settable to 0: %d", cfg.UpstreamRetries)
+	}
+}
+
+// Settings that are about upstreams in general share the UPSTREAM_ prefix with
+// per-upstream declarations. Parsing them as a declaration failed startup.
+func TestGeneralUpstreamSettingsAreNotParsedAsDeclarations(t *testing.T) {
+	setRequired(t)
+	t.Setenv("LLMGW_UPSTREAM_RETRIES", "3")
+	t.Setenv("LLMGW_UPSTREAM_HEADER_WAIT", "45s")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("a general upstream setting broke startup: %v", err)
+	}
+	if cfg.UpstreamRetries != 3 || cfg.UpstreamHeaderWait != 45*time.Second {
+		t.Fatalf("not applied: retries=%d wait=%v", cfg.UpstreamRetries, cfg.UpstreamHeaderWait)
+	}
+	if _, stray := cfg.Upstreams["retries"]; stray {
+		t.Fatal("a general setting became an upstream")
+	}
+	// A real typo in a per-upstream name must still fail.
+	setRequired(t)
+	t.Setenv("LLMGW_UPSTREAM_OPENAI_BASEURL", "https://x.example")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a misspelled upstream field was accepted")
+	}
+}
