@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/version"
@@ -60,7 +61,15 @@ type Reporter struct {
 	ckptPath   string
 	ckpt       checkpoint
 	loadedCkpt bool
+
+	// shipFailures counts batches the control plane refused permanently and
+	// this reporter therefore skipped. Those events are gone: reported so the
+	// loss is a number somewhere rather than only a log line.
+	shipFailures atomic.Int64
 }
+
+// ShipFailures is how many batches were dropped after a permanent refusal.
+func (r *Reporter) ShipFailures() int64 { return r.shipFailures.Load() }
 
 // New builds a reporter over the spool directory.
 func New(spoolDir, baseURL, token string, batchSize int, timeout time.Duration, log *slog.Logger) *Reporter {
@@ -169,9 +178,21 @@ func (r *Reporter) shipFile(ctx context.Context, path, day string, offset int64)
 			return nil
 		}
 		if err := r.post(ctx, batch); err != nil {
-			return err
+			if !permanent(err) {
+				return err
+			}
+			// The control plane understood the batch and refused it. Retrying
+			// changes nothing, and stopping here would park the checkpoint in
+			// front of it forever: every later event — every later day —
+			// would queue behind one bad batch until retention deleted the
+			// lot. Skipping loses this batch and keeps the channel moving,
+			// which is the lesser loss, so it is counted and logged loudly.
+			r.shipFailures.Add(1)
+			r.log.Error("control plane refused a usage batch permanently, skipping it",
+				"day", day, "events", len(batch), "error", err)
+		} else {
+			sent += len(batch)
 		}
-		sent += len(batch)
 		batch = batch[:0]
 		r.ckpt.set(day, batchEnd)
 		return r.saveCheckpoint()
@@ -212,6 +233,29 @@ type ingestRequest struct {
 	Events       []json.RawMessage `json:"events"`
 }
 
+// postError carries the status a refusal came with, so the caller can tell a
+// control plane that is down from one that has decided.
+type postError struct {
+	status int
+	msg    string
+}
+
+func (e *postError) Error() string { return e.msg }
+
+// permanent reports whether retrying this error could ever succeed. A 4xx is
+// the control plane saying the batch itself is the problem — except 408 and
+// 429, which are timing, not judgement.
+func permanent(err error) bool {
+	var pe *postError
+	if !errors.As(err, &pe) {
+		return false
+	}
+	if pe.status == http.StatusRequestTimeout || pe.status == http.StatusTooManyRequests {
+		return false
+	}
+	return pe.status >= 400 && pe.status < 500
+}
+
 func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
 	body, err := json.Marshal(ingestRequest{AgentVersion: version.String(), Events: events})
 	if err != nil {
@@ -230,7 +274,10 @@ func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("reporter: control plane returned HTTP %d", resp.StatusCode)
+		return &postError{
+			status: resp.StatusCode,
+			msg:    fmt.Sprintf("reporter: control plane returned HTTP %d", resp.StatusCode),
+		}
 	}
 	return nil
 }

@@ -316,3 +316,59 @@ func TestShippedThroughReportsDays(t *testing.T) {
 		t.Fatalf("a day that never shipped was reported: %v", days)
 	}
 }
+
+// A batch the control plane refuses permanently must not become a permanent
+// blockage. The checkpoint sits in front of it, so stopping there would hold
+// every later event — and every later day — behind one bad batch until
+// retention deleted the lot.
+func TestPermanentRefusalSkipsTheBatchAndKeepsGoing(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	writeEvents(t, dir, "20260810", "a", "b")
+	writeEvents(t, dir, "20260811", "c")
+
+	r := New(dir, url, "tok", 2, 5*time.Second, discard())
+	is.setStatus(http.StatusBadRequest)
+	if _, err := r.Flush(context.Background()); err != nil {
+		t.Fatalf("a permanent refusal was reported as a retryable failure: %v", err)
+	}
+	if got := r.ShipFailures(); got != 2 {
+		t.Fatalf("shipFailures = %d, want the two refused batches counted", got)
+	}
+
+	// The refused events are gone, but the channel moved on: what comes next
+	// is delivered rather than queued behind them forever.
+	is.setStatus(http.StatusOK)
+	writeEvents(t, dir, "20260811", "d")
+	sent, err := r.Flush(context.Background())
+	if err != nil || sent != 1 {
+		t.Fatalf("sent=%d err=%v, want the later event delivered", sent, err)
+	}
+	got, _ := is.snapshot()
+	if len(got) != 1 || got[0] != "d" {
+		t.Fatalf("delivered %v, want only the event written after the refusal", got)
+	}
+}
+
+// A refusal that means "not now" must still be retried, or a restarting api
+// would cost every event in flight at that moment.
+func TestTransientRefusalIsRetried(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusRequestTimeout, http.StatusBadGateway} {
+		dir := t.TempDir()
+		is, url := newIngest(t)
+		writeEvents(t, dir, "20260810", "a")
+		r := New(dir, url, "tok", 500, 5*time.Second, discard())
+		is.setStatus(status)
+		if _, err := r.Flush(context.Background()); err == nil {
+			t.Fatalf("HTTP %d was treated as a permanent refusal", status)
+		}
+		if got := r.ShipFailures(); got != 0 {
+			t.Fatalf("HTTP %d counted as a dropped batch", status)
+		}
+		is.setStatus(http.StatusOK)
+		sent, err := r.Flush(context.Background())
+		if err != nil || sent != 1 {
+			t.Fatalf("HTTP %d: retry sent=%d err=%v", status, sent, err)
+		}
+	}
+}
