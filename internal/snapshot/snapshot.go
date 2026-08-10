@@ -237,6 +237,13 @@ func (s *Store) reload(ctx context.Context) error {
 		return err
 	}
 	if !changed {
+		// Nothing new is success — unless there is nothing to serve yet. A
+		// control plane that answers "unchanged" to a caller with no state
+		// (a fresh gateway against a control plane at the same generation)
+		// would otherwise leave the store empty and every read nil.
+		if s.cur.Load() == nil {
+			return fmt.Errorf("snapshot from %s: no document to serve (source reported no change on the first load)", s.source.Name())
+		}
 		return nil
 	}
 	st, err := build(raw, s.known)
@@ -254,6 +261,10 @@ func (s *Store) reload(ctx context.Context) error {
 		return fmt.Errorf("snapshot generation went backwards: %d < %d (a rollback; set LLMGW_ALLOW_GENERATION_RESET to override)", st.doc.Generation, floor)
 	}
 	s.cur.Store(st)
+	// The document is applied; only now may the source treat it as delivered
+	// (remember the file identity, write the restart cache). Doing it earlier
+	// caches documents this guard rejected and hides the rejection.
+	s.source.Accept()
 	if st.doc.Generation > s.highWater {
 		s.highWater = st.doc.Generation
 		s.writeHighWater(st.doc.Generation)
@@ -352,6 +363,11 @@ func build(raw []byte, known map[string]bool) (*state, error) {
 		}
 		if known != nil && !known[strings.ToLower(m.UpstreamRef)] {
 			return nil, fmt.Errorf("model %q references upstream %q, which is not configured", m.PublicName, m.UpstreamRef)
+		}
+		// The fallback is checked the same way. Skipping it would mean a typo
+		// there stays invisible until the outage the fallback exists for.
+		if known != nil && m.FallbackRef != "" && !known[strings.ToLower(m.FallbackRef)] {
+			return nil, fmt.Errorf("model %q names fallback upstream %q, which is not configured", m.PublicName, m.FallbackRef)
 		}
 		if _, dup := st.byPublic[m.PublicName]; dup {
 			return nil, fmt.Errorf("duplicate public model name %q", m.PublicName)
