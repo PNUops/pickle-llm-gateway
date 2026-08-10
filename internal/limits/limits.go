@@ -76,11 +76,25 @@ func New(now func() time.Time) *Limiter {
 	}
 }
 
+// Decision is the outcome of one admission attempt.
+type Decision struct {
+	// Release must be called when an admitted request finishes; nil on refusal.
+	Release func()
+	Reason  Reason
+	// RetryAfter is how long the caller should wait before trying again. Only
+	// meaningful on a refusal, and always a whole number of seconds when
+	// rendered into the header, so it never advertises a wait shorter than it
+	// really is.
+	RetryAfter time.Duration
+	// RemainingRequests is the rpm budget left after this admission, for the
+	// rate-limit header. -1 when the request was refused.
+	RemainingRequests int
+}
+
 // Acquire admits or refuses one request for the key. On admission it charges
-// one request against the rpm bucket, takes a concurrency slot, and returns a
-// release function that must be called when the request finishes. rpm, tpm
+// one request against the rpm bucket and takes a concurrency slot. rpm, tpm
 // and conc are the key's resolved limits (already defaulted by the caller).
-func (l *Limiter) Acquire(keyID string, rpm, tpm, conc int) (release func(), reason Reason) {
+func (l *Limiter) Acquire(keyID string, rpm, tpm, conc int) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
@@ -96,31 +110,50 @@ func (l *Limiter) Acquire(keyID string, rpm, tpm, conc int) (release func(), rea
 	st.tpm.refill(now, tpm)
 
 	if st.inFlight >= conc {
-		return nil, Concurrency
+		// A slot frees when some in-flight request finishes, which no clock
+		// predicts; a second is a courteous floor rather than a promise.
+		return Decision{Reason: Concurrency, RetryAfter: time.Second, RemainingRequests: -1}
 	}
 	if st.rpm.level < 1 {
-		return nil, Rpm
+		return Decision{Reason: Rpm, RetryAfter: refillWait(st.rpm.level, 1, rpm), RemainingRequests: -1}
 	}
 	// The tpm bucket is charged after the fact, so admission only requires it
 	// to be out of debt.
 	if st.tpm.level < 0 {
-		return nil, Tpm
+		return Decision{Reason: Tpm, RetryAfter: refillWait(st.tpm.level, 0, tpm), RemainingRequests: -1}
 	}
 
 	st.rpm.level--
 	st.inFlight++
 	released := false
-	return func() {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		if released {
-			return
-		}
-		released = true
-		if st.inFlight > 0 {
-			st.inFlight--
-		}
-	}, OK
+	return Decision{
+		Release: func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			if released {
+				return
+			}
+			released = true
+			if st.inFlight > 0 {
+				st.inFlight--
+			}
+		},
+		Reason:            OK,
+		RemainingRequests: int(st.rpm.level),
+	}
+}
+
+// refillWait is how long a bucket at level needs to reach target at perMinute.
+func refillWait(level, target float64, perMinute int) time.Duration {
+	if perMinute <= 0 || level >= target {
+		return time.Second
+	}
+	minutes := (target - level) / float64(perMinute)
+	d := time.Duration(minutes * float64(time.Minute))
+	if d < time.Second {
+		return time.Second
+	}
+	return d
 }
 
 // ChargeTokens records actual token usage against the key's tpm bucket once

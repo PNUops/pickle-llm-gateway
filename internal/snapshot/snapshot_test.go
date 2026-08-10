@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -42,7 +43,7 @@ func TestOpenAndLookup(t *testing.T) {
 	hash := HashToken("pickle-secret")
 	writeDoc(t, path, sprintf(validDoc, hash), time.Now())
 
-	s, err := Open(path, discard(), Options{})
+	s, err := OpenFile(path, discard(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestOpenRejectsInvalidDocuments(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "snapshot.json")
 			writeDoc(t, path, body, time.Now())
-			if _, err := Open(path, discard(), Options{}); err == nil {
+			if _, err := OpenFile(path, discard(), Options{}); err == nil {
 				t.Fatal("Open accepted an invalid document")
 			}
 		})
@@ -89,14 +90,14 @@ func TestRefreshPicksUpChangesAndRefusesRollback(t *testing.T) {
 	base := time.Now().Add(-2 * time.Hour)
 	writeDoc(t, path, sprintf(validDoc, hash), base)
 
-	s, err := Open(path, discard(), Options{})
+	s, err := OpenFile(path, discard(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	next := `{"generation":2,"serviceEnabled":false,"models":[],"keys":[]}`
 	writeDoc(t, path, next, base.Add(time.Hour))
-	s.Refresh()
+	s.Refresh(context.Background())
 	if got := s.Generation(); got != 2 {
 		t.Fatalf("generation after refresh = %d, want 2", got)
 	}
@@ -104,7 +105,7 @@ func TestRefreshPicksUpChangesAndRefusesRollback(t *testing.T) {
 	// An older document must not replace a newer one: that would silently
 	// undo a revocation.
 	writeDoc(t, path, sprintf(validDoc, hash), base.Add(90*time.Minute))
-	s.Refresh()
+	s.Refresh(context.Background())
 	if got := s.Generation(); got != 2 {
 		t.Fatalf("generation went backwards to %d", got)
 	}
@@ -118,12 +119,12 @@ func TestRefreshKeepsStateOnBrokenFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
 	writeDoc(t, path, sprintf(validDoc, HashToken("k")), time.Now().Add(-time.Hour))
-	s, err := Open(path, discard(), Options{})
+	s, err := OpenFile(path, discard(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeDoc(t, path, "{broken", time.Now())
-	s.Refresh()
+	s.Refresh(context.Background())
 	if got := s.Generation(); got != 1 {
 		t.Fatalf("generation = %d, want the last good state", got)
 	}
@@ -158,13 +159,13 @@ func TestBuildRejectsUnknownUpstream(t *testing.T) {
 	body := `{"generation":1,"serviceEnabled":true,"models":[{"publicName":"pnu-general","upstreamRef":"opnai","upstreamModel":"m"}],"keys":[]}`
 	writeDoc(t, path, body, time.Now())
 	// With a known-upstreams set that does not contain the typo, load fails.
-	if _, err := Open(path, discard(), Options{KnownUpstreams: []string{"openai"}}); err == nil {
+	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"openai"}}); err == nil {
 		t.Fatal("Open accepted a model referencing an unconfigured upstream")
 	}
 	// Correct ref (case-insensitive) loads.
 	body2 := `{"generation":1,"serviceEnabled":true,"models":[{"publicName":"pnu-general","upstreamRef":"OpenAI","upstreamModel":"m"}],"keys":[]}`
 	writeDoc(t, path, body2, time.Now())
-	if _, err := Open(path, discard(), Options{KnownUpstreams: []string{"openai"}}); err != nil {
+	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"openai"}}); err != nil {
 		t.Fatalf("Open rejected a valid upstream ref: %v", err)
 	}
 }
@@ -174,7 +175,7 @@ func TestHighWaterRefusesRollbackAcrossRestart(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.json")
 	// First process serves generation 5, which persists the high-water.
 	writeDoc(t, path, `{"generation":5,"serviceEnabled":true,"models":[],"keys":[]}`, time.Now().Add(-time.Hour))
-	s1, err := Open(path, discard(), Options{})
+	s1, err := OpenFile(path, discard(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,11 +188,11 @@ func TestHighWaterRefusesRollbackAcrossRestart(t *testing.T) {
 
 	// A restart (new Store on the same path) finds an older document restored.
 	writeDoc(t, path, `{"generation":3,"serviceEnabled":true,"models":[],"keys":[]}`, time.Now())
-	if _, err := Open(path, discard(), Options{}); err == nil {
+	if _, err := OpenFile(path, discard(), Options{}); err == nil {
 		t.Fatal("Open served a rolled-back snapshot after restart")
 	}
 	// The override lets it through.
-	if _, err := Open(path, discard(), Options{AllowGenerationReset: true}); err != nil {
+	if _, err := OpenFile(path, discard(), Options{AllowGenerationReset: true}); err != nil {
 		t.Fatalf("override did not permit the reset: %v", err)
 	}
 }

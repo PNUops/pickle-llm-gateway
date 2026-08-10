@@ -1,0 +1,203 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pnuops/pickle-llm-gateway/internal/config"
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
+)
+
+// attemptError carries why every upstream attempt failed. refusal is set when
+// the failure is the request's own fault and must be passed through rather
+// than retried anywhere.
+type attemptError struct {
+	err     error
+	timeout bool
+	refusal *apiError
+}
+
+// upstreamHealth tracks consecutive failures per upstream so a dead one stops
+// being tried first. It is advisory: an upstream in cooldown is skipped only
+// while something else can serve the request.
+type upstreamHealth struct {
+	mu        sync.Mutex
+	failures  map[string]int
+	coolUntil map[string]time.Time
+	now       func() time.Time
+}
+
+func newUpstreamHealth(now func() time.Time) *upstreamHealth {
+	if now == nil {
+		now = time.Now
+	}
+	return &upstreamHealth{
+		failures:  map[string]int{},
+		coolUntil: map[string]time.Time{},
+		now:       now,
+	}
+}
+
+// coolingFailures is how many consecutive failures put an upstream aside, and
+// coolFor is how long. Small numbers on purpose: the point is to stop hammering
+// something that is plainly down, not to build a circuit breaker.
+const (
+	coolingFailures = 3
+	coolFor         = 30 * time.Second
+)
+
+func (h *upstreamHealth) cooling(ref string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	until, ok := h.coolUntil[ref]
+	return ok && h.now().Before(until)
+}
+
+func (h *upstreamHealth) recordFailure(ref string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.failures[ref]++
+	if h.failures[ref] >= coolingFailures {
+		h.coolUntil[ref] = h.now().Add(coolFor)
+		h.failures[ref] = 0
+		return true
+	}
+	return false
+}
+
+func (h *upstreamHealth) recordSuccess(ref string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.failures, ref)
+	delete(h.coolUntil, ref)
+}
+
+// callUpstream sends the request to the model's upstream, retrying a transient
+// failure and falling back to the model's secondary upstream if it has one.
+// This can only be done before anything reaches the client, which is why it
+// lives entirely ahead of the response-writing paths.
+func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
+	params map[string]json.RawMessage, outputCap int) (*http.Response, config.Upstream, *attemptError) {
+
+	refs := []string{model.UpstreamRef}
+	if model.FallbackRef != "" && !strings.EqualFold(model.FallbackRef, model.UpstreamRef) {
+		refs = append(refs, model.FallbackRef)
+	}
+	// Prefer an upstream that is not in cooldown, keeping the original order
+	// among equals. With one option left there is nothing to prefer.
+	if len(refs) > 1 {
+		ordered := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			if !s.health.cooling(ref) {
+				ordered = append(ordered, ref)
+			}
+		}
+		for _, ref := range refs {
+			if s.health.cooling(ref) {
+				ordered = append(ordered, ref)
+			}
+		}
+		refs = ordered
+	}
+
+	var last *attemptError
+	for _, ref := range refs {
+		up, ok := s.cfg.Upstreams[strings.ToLower(ref)]
+		if !ok {
+			s.log.Error("model references an unconfigured upstream",
+				"model", model.PublicName, "upstreamRef", ref)
+			last = &attemptError{err: errUnconfiguredUpstream}
+			continue
+		}
+		body, err := s.bodyFor(params, up, outputCap)
+		if err != nil {
+			return nil, up, &attemptError{err: err}
+		}
+		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
+			resp, ae := s.attempt(ctx, up, body)
+			if ae == nil {
+				s.health.recordSuccess(ref)
+				return resp, up, nil
+			}
+			last = ae
+			if ae.refusal != nil {
+				// The upstream understood and refused: another upstream would
+				// refuse the same request, and a retry would only repeat it.
+				return nil, up, ae
+			}
+			if ctx.Err() != nil {
+				return nil, up, ae
+			}
+			if s.health.recordFailure(ref) {
+				s.log.Warn("upstream put in cooldown after repeated failures",
+					"upstreamRef", ref, "coolFor", coolFor.String())
+			}
+			s.metrics.upstreamRetries.Add(1)
+		}
+		if len(refs) > 1 {
+			s.metrics.upstreamFallbacks.Add(1)
+			s.log.Warn("falling back to the model's secondary upstream",
+				"model", model.PublicName, "from", ref)
+		}
+	}
+	if last == nil {
+		last = &attemptError{err: errUnconfiguredUpstream}
+	}
+	return nil, config.Upstream{}, last
+}
+
+// bodyFor renders the request for one upstream, injecting the output cap on
+// the field that upstream honors.
+func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, outputCap int) ([]byte, error) {
+	if outputCap <= 0 {
+		return json.Marshal(params)
+	}
+	out := make(map[string]json.RawMessage, len(params)+1)
+	for k, v := range params {
+		out[k] = v
+	}
+	out[up.CapField] = json.RawMessage(strconv.Itoa(outputCap))
+	return json.Marshal(out)
+}
+
+// attempt performs one upstream call. A nil error means resp is a 200 whose
+// body the caller now owns.
+func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte) (*http.Response, *attemptError) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, &attemptError{err: err}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if up.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+up.APIKey)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, &attemptError{err: err, timeout: isTimeout(err)}
+	}
+	if resp.StatusCode == http.StatusOK {
+		return resp, nil
+	}
+	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	s.log.Warn("upstream refused request", "status", resp.StatusCode,
+		"upstreamRef", up.Ref, "detail", string(detail))
+	switch resp.StatusCode {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		// The request itself is wrong; no other upstream will like it better.
+		return nil, &attemptError{refusal: &errUpstreamRejected}
+	case http.StatusUnauthorized, http.StatusForbidden:
+		// Our credential, not the student's problem — and not something a
+		// retry fixes. Fall through to another upstream if one exists.
+		return nil, &attemptError{err: errUpstreamAuth}
+	default:
+		return nil, &attemptError{err: errUpstreamStatus}
+	}
+}

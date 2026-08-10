@@ -14,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
+	"github.com/pnuops/pickle-llm-gateway/internal/reporter"
 	"github.com/pnuops/pickle-llm-gateway/internal/server"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
@@ -29,7 +31,18 @@ func main() {
 		log.Error("startup failed", "error", err)
 		os.Exit(1)
 	}
-	store, err := snapshot.Open(cfg.SnapshotPath, log, snapshot.Options{
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var source snapshot.Source
+	var controlSource *snapshot.HTTPSource
+	if cfg.SnapshotSource == config.SourceHTTP {
+		controlSource = snapshot.NewHTTPSource(cfg.ControlBaseURL, cfg.ControlToken, cfg.SnapshotPath, cfg.ControlTimeout)
+		source = controlSource
+	} else {
+		source = snapshot.NewFileSource(cfg.SnapshotPath)
+	}
+	store, err := snapshot.Open(ctx, source, cfg.SnapshotPath, log, snapshot.Options{
 		KnownUpstreams:       cfg.UpstreamRefs(),
 		AllowGenerationReset: cfg.AllowGenerationReset,
 	})
@@ -43,6 +56,11 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
+	if controlSource != nil {
+		// The control plane sees the gateway's live load on every poll; the
+		// gauge is a claim, never something the server acts on.
+		controlSource.SetInFlight(srv.InFlight)
+	}
 
 	hs := &http.Server{
 		Addr:              cfg.Listen,
@@ -55,25 +73,51 @@ func main() {
 		ReadTimeout: 30 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 
 	go func() {
 		t := time.NewTicker(cfg.SnapshotPollInterval)
 		defer t.Stop()
+		refresh := func() {
+			// Bound one poll so a hung control plane cannot stall the loop past
+			// the next tick.
+			pollCtx, cancel := context.WithTimeout(ctx, cfg.ControlTimeout)
+			defer cancel()
+			store.Refresh(pollCtx)
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				store.Refresh()
+				refresh()
 			case <-hup:
-				store.Refresh()
+				refresh()
 			}
 		}
 	}()
+
+	// Body capture rides its own channel, and only exists when there is a
+	// control plane to deliver to: captured text is never written to this
+	// host's disk, so without delivery there is nowhere for it to go and
+	// nothing is captured. Individual keys still have to opt in.
+	if cfg.BodyCapture {
+		sink := bodies.New(cfg.ControlBaseURL, cfg.ControlToken,
+			cfg.BodyQueueSize, cfg.BodyBatchSize, cfg.ControlTimeout, log)
+		srv.SetBodySink(sink)
+		go sink.Run(ctx)
+		log.Info("body capture channel enabled (per-key opt-in still required)")
+	}
+
+	// Usage reporting: walk the spool and ship batches to the control plane.
+	// The spool is written regardless, so enabling this later ships what
+	// already accumulated.
+	if cfg.UsagePush {
+		rep := reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
+			cfg.UsageBatchSize, cfg.ControlTimeout, log)
+		go rep.Run(ctx, cfg.UsagePushInterval)
+	}
 
 	// Usage-spool retention: prune once at startup and daily thereafter.
 	go func() {
@@ -94,6 +138,24 @@ func main() {
 			}
 		}
 	}()
+
+	// Operator surface on its own listener, so metrics can never be reached
+	// through the student-facing route.
+	var adminSrv *http.Server
+	if cfg.AdminListen != "" {
+		adminSrv = &http.Server{
+			Addr:              cfg.AdminListen,
+			Handler:           srv.AdminHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       15 * time.Second,
+		}
+		go func() {
+			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("admin listener failed", "error", err)
+			}
+		}()
+		log.Info("admin listener up", "addr", cfg.AdminListen)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- hs.ListenAndServe() }()
@@ -116,6 +178,9 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	_ = hs.Shutdown(shutdownCtx)
+	if adminSrv != nil {
+		_ = adminSrv.Shutdown(shutdownCtx)
+	}
 	if err := sp.Close(); err != nil {
 		log.Error("spool close failed", "error", err)
 	}

@@ -7,6 +7,7 @@
 package snapshot
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -53,9 +54,12 @@ const (
 // see PublicName; UpstreamRef selects a configured upstream block and
 // UpstreamModel is the identifier sent to it.
 type Model struct {
-	PublicName      string `json:"publicName"`
-	UpstreamRef     string `json:"upstreamRef"`
-	UpstreamModel   string `json:"upstreamModel"`
+	PublicName    string `json:"publicName"`
+	UpstreamRef   string `json:"upstreamRef"`
+	UpstreamModel string `json:"upstreamModel"`
+	// FallbackRef names a second upstream to try when the first one fails
+	// before any of the response has reached the client. Optional.
+	FallbackRef     string `json:"fallbackRef,omitempty"`
 	Visibility      string `json:"visibility,omitempty"` // PUBLIC (default) | RESTRICTED
 	MaxInputTokens  int    `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"`
@@ -83,6 +87,11 @@ type Key struct {
 	AllowedModels  []string   `json:"allowedModels,omitempty"`
 	Limits         Limits     `json:"limits"`
 	QuotaExhausted bool       `json:"quotaExhausted,omitempty"`
+	// RecordBodies opts this key into prompt and response capture. It is the
+	// key owner's choice, expressed in the control plane and carried here; the
+	// default is off, so a key says nothing about bodies unless someone asked
+	// for it. Capture never writes to the usage spool — see internal/bodies.
+	RecordBodies bool `json:"recordBodies,omitempty"`
 }
 
 // Limits are the short-window limits the gateway enforces locally. A zero
@@ -120,15 +129,10 @@ type state struct {
 // Store serves the current state and refreshes it in the background. Readers
 // never block on a reload.
 type Store struct {
-	cur   atomic.Pointer[state]
-	path  string
-	log   *slog.Logger
-	known map[string]bool // configured upstream refs (lowercase); nil = skip the check
-
-	// file identity of the last successful load; a reload only parses the
-	// file when this changed.
-	lastModTime time.Time
-	lastSize    int64
+	cur    atomic.Pointer[state]
+	source Source
+	log    *slog.Logger
+	known  map[string]bool // configured upstream refs (lowercase); nil = skip the check
 
 	// Consecutive reload failures since the last success, surfaced on the
 	// health endpoint: a document that keeps failing to load means the served
@@ -162,11 +166,15 @@ type Options struct {
 // gateway must not start with nothing to authorize against. Later reload
 // failures keep the last good state instead, bounding staleness rather than
 // dropping traffic.
-func Open(path string, log *slog.Logger, opts Options) (*Store, error) {
+//
+// statePath is where the high-water sidecar lives; for the file source it is
+// the document's own path, and for the control-plane source it is the local
+// cache path, so the guard survives a restart either way.
+func Open(ctx context.Context, source Source, statePath string, log *slog.Logger, opts Options) (*Store, error) {
 	s := &Store{
-		path:          path,
+		source:        source,
 		log:           log,
-		highWaterPath: path + ".highwater",
+		highWaterPath: statePath + ".highwater",
 		allowGenReset: opts.AllowGenerationReset,
 	}
 	if opts.KnownUpstreams != nil {
@@ -176,10 +184,16 @@ func Open(path string, log *slog.Logger, opts Options) (*Store, error) {
 		}
 	}
 	s.highWater = s.readHighWater()
-	if err := s.reload(); err != nil {
+	if err := s.reload(ctx); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenFile is the file-source convenience used by tests and by the default
+// deployment mode.
+func OpenFile(path string, log *slog.Logger, opts Options) (*Store, error) {
+	return Open(context.Background(), NewFileSource(path), path, log, opts)
 }
 
 // Current returns the state for one request. The pointer is immutable; a
@@ -199,38 +213,35 @@ func (s *Store) LoadedAt() time.Time { return s.cur.Load().loadedAt }
 // success (0 when healthy). A rising count means the served state is stale.
 func (s *Store) ReloadFailures() int64 { return s.reloadFailures.Load() }
 
-// Refresh re-reads the document if the file changed since the last successful
-// load. Errors are logged, never propagated to request handling.
-func (s *Store) Refresh() {
-	fi, err := os.Stat(s.path)
-	if err != nil {
+// Refresh asks the source for a newer document. Errors are logged, never
+// propagated to request handling: the last good state keeps serving and the
+// failure count surfaces on the health endpoint.
+func (s *Store) Refresh(ctx context.Context) {
+	if err := s.reload(ctx); err != nil {
 		s.reloadFailures.Add(1)
-		s.log.Error("snapshot stat failed, keeping current state", "error", err)
-		return
-	}
-	if fi.ModTime().Equal(s.lastModTime) && fi.Size() == s.lastSize {
-		return
-	}
-	if err := s.reload(); err != nil {
-		s.reloadFailures.Add(1)
-		s.log.Error("snapshot reload failed, keeping current state", "error", err)
+		s.log.Error("snapshot refresh failed, keeping current state", "source", s.source.Name(), "error", err)
 		return
 	}
 	s.reloadFailures.Store(0)
 }
 
-func (s *Store) reload() error {
-	fi, err := os.Stat(s.path)
-	if err != nil {
-		return fmt.Errorf("snapshot: %w", err)
+// reload fetches and, if the source had something new, validates and swaps it.
+// A source reporting no change is a success with nothing to do.
+func (s *Store) reload(ctx context.Context) error {
+	served := int64(0)
+	if prev := s.cur.Load(); prev != nil {
+		served = prev.doc.Generation
 	}
-	raw, err := os.ReadFile(s.path)
+	raw, changed, err := s.source.Load(ctx, served)
 	if err != nil {
-		return fmt.Errorf("snapshot: %w", err)
+		return err
+	}
+	if !changed {
+		return nil
 	}
 	st, err := build(raw, s.known)
 	if err != nil {
-		return fmt.Errorf("snapshot %s: %w", s.path, err)
+		return fmt.Errorf("snapshot from %s: %w", s.source.Name(), err)
 	}
 	// The floor a new document must not drop below is the higher of the
 	// in-process generation and the persisted high-water — the first catches a
@@ -243,13 +254,12 @@ func (s *Store) reload() error {
 		return fmt.Errorf("snapshot generation went backwards: %d < %d (a rollback; set LLMGW_ALLOW_GENERATION_RESET to override)", st.doc.Generation, floor)
 	}
 	s.cur.Store(st)
-	s.lastModTime = fi.ModTime()
-	s.lastSize = fi.Size()
 	if st.doc.Generation > s.highWater {
 		s.highWater = st.doc.Generation
 		s.writeHighWater(st.doc.Generation)
 	}
-	s.log.Info("snapshot loaded", "generation", st.doc.Generation, "models", len(st.doc.Models), "keys", len(st.doc.Keys), "serviceEnabled", st.doc.ServiceEnabled)
+	s.log.Info("snapshot loaded", "source", s.source.Name(), "generation", st.doc.Generation,
+		"models", len(st.doc.Models), "keys", len(st.doc.Keys), "serviceEnabled", st.doc.ServiceEnabled)
 	return nil
 }
 

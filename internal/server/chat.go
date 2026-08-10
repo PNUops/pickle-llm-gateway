@@ -11,11 +11,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
@@ -62,6 +65,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", ev.EventUUID)
 	record := func() {
 		ev.LatencyMs = time.Since(start).Milliseconds()
+		s.metrics.observe(ev)
 		if err := s.spool.Write(ev); err != nil {
 			s.log.Error("usage spool write failed", "error", err)
 		}
@@ -106,19 +110,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rpm, tpm, conc := s.keyLimits(key)
-	release, reason := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
-	switch reason {
-	case limits.Rpm:
-		refuse(errRateRequests, spool.StatusRateLimited)
-		return
-	case limits.Tpm:
-		refuse(errRateTokens, spool.StatusRateLimited)
-		return
-	case limits.Concurrency:
-		refuse(errRateConcurrency, spool.StatusRateLimited)
+	adm := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
+	if adm.Reason != limits.OK {
+		// Tell the client when to come back rather than leaving it to guess;
+		// SDK retry helpers read this header.
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(adm.RetryAfter.Seconds()))))
+		switch adm.Reason {
+		case limits.Rpm:
+			refuse(errRateRequests, spool.StatusRateLimited)
+		case limits.Tpm:
+			refuse(errRateTokens, spool.StatusRateLimited)
+		default:
+			refuse(errRateConcurrency, spool.StatusRateLimited)
+		}
 		return
 	}
-	defer release()
+	defer adm.Release()
+	w.Header().Set("X-RateLimit-Limit-Requests", strconv.Itoa(rpm))
+	w.Header().Set("X-RateLimit-Remaining-Requests", strconv.Itoa(adm.RemainingRequests))
 
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.RequestBodyMaxBytes)
 	rawBody, err := io.ReadAll(r.Body)
@@ -162,13 +171,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
 		return
 	}
-	up, ok := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
-	if !ok {
-		s.log.Error("model references an unconfigured upstream", "model", publicModel, "upstreamRef", model.UpstreamRef)
-		refuse(errUpstream, spool.StatusUpstreamErr)
-		return
-	}
-
 	// Output length. A JSON null is what SDKs send for "unset" and is treated
 	// as absent; an explicit value above the model cap is refused. Whatever the
 	// student sent (on either OpenAI field) is normalized onto the upstream's
@@ -176,6 +178,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// on the field the upstream actually honors — forwarding the student's
 	// field verbatim would let a legacy `max_tokens`-only server ignore a
 	// `max_completion_tokens` request and blow past the cap.
+	outputCap := 0
 	if model.MaxOutputTokens > 0 {
 		effectiveCap := model.MaxOutputTokens
 		for _, f := range []string{"max_completion_tokens", "max_tokens"} {
@@ -200,7 +203,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				effectiveCap = n
 			}
 		}
-		params[up.CapField] = json.RawMessage(strconv.Itoa(effectiveCap))
+		outputCap = effectiveCap
 	}
 	// Input length: token counting needs the model's tokenizer, which the
 	// gateway does not have. This guard only refuses what cannot possibly
@@ -230,64 +233,55 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if streaming {
 		params["stream_options"] = withIncludeUsage(params["stream_options"])
 	}
-	upBody, err := json.Marshal(params)
-	if err != nil {
-		refuse(errBadJSON, spool.StatusBadRequest)
-		return
-	}
 
 	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
 	defer cancel()
-	upReq, err := http.NewRequestWithContext(upCtx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(upBody))
-	if err != nil {
-		s.log.Error("building upstream request failed", "error", err)
-		refuse(errUpstream, spool.StatusUpstreamErr)
-		return
-	}
-	upReq.Header.Set("Content-Type", "application/json")
-	if up.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+up.APIKey)
-	}
 
-	resp, err := s.client.Do(upReq)
+	// Try the model's upstream, then its fallback if it has one. Nothing has
+	// been written to the client yet, so switching upstreams here is invisible
+	// to the student; once the response starts, it is not.
+	resp, up, attemptErr := s.callUpstream(upCtx, model, params, outputCap)
 	ev.TtftMs = time.Since(start).Milliseconds()
-	if err != nil {
+	if attemptErr != nil {
 		switch {
 		case r.Context().Err() != nil:
 			// The student went away; nothing can be written back.
 			ev.Status = spool.StatusCanceled
 			ev.ErrorType = "client_disconnected"
 			record()
-		case upCtx.Err() != nil || isTimeout(err):
+		case upCtx.Err() != nil || attemptErr.timeout:
 			refuse(errUpstreamTimeout, spool.StatusTimeout)
+		case attemptErr.refusal != nil:
+			refuse(*attemptErr.refusal, spool.StatusUpstreamErr)
 		default:
-			s.log.Error("upstream request failed", "error", err)
+			s.log.Error("upstream request failed", "keyId", key.KeyID,
+				"model", publicModel, "error", attemptErr.err)
 			refuse(errUpstream, spool.StatusUpstreamErr)
 		}
 		return
 	}
 	defer resp.Body.Close()
+	_ = up
 
-	if resp.StatusCode != http.StatusOK {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		s.log.Warn("upstream refused request", "status", resp.StatusCode, "keyId", key.KeyID,
-			"model", publicModel, "detail", string(detail))
-		switch resp.StatusCode {
-		case http.StatusBadRequest:
-			refuse(errUpstreamRejected, spool.StatusUpstreamErr)
-		case http.StatusTooManyRequests:
-			refuse(errServerBusy, spool.StatusUpstreamErr)
-		default:
-			refuse(errUpstream, spool.StatusUpstreamErr)
+	// Body capture: only for a key that opted in, and only when the delivery
+	// channel exists — captured text is never written to this host's disk, so
+	// with no channel there is nothing to capture into.
+	var capture *bodies.Record
+	if s.bodies.Enabled() && key.RecordBodies {
+		capture = &bodies.Record{
+			EventUUID:   ev.EventUUID,
+			KeyID:       key.KeyID,
+			RequestedAt: start,
+			Request:     append(json.RawMessage(nil), messagesRaw...),
 		}
-		return
 	}
 
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw))
+		s.finishNonStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw), capture)
 		return
 	}
 	s.finishStream(w, resp, streamArgs{
+		capture:      capture,
 		publicName:   model.PublicName,
 		keyID:        key.KeyID,
 		tpm:          tpm,
@@ -313,7 +307,7 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 	return out
 }
 
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int) {
+func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -356,18 +350,22 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 			haveUsage = true
 		}
 	}
-	// Fallback size for the estimate when the upstream reported no usage.
-	contentChars := 0
-	if !haveUsage {
-		if choices, _ := m["choices"].([]any); len(choices) > 0 {
-			if first, _ := choices[0].(map[string]any); first != nil {
-				if msg, _ := first["message"].(map[string]any); msg != nil {
-					if content, _ := msg["content"].(string); content != "" {
-						contentChars = len(content)
-					}
-				}
+	// The assistant text is needed for the no-usage size estimate, and again
+	// for capture when the key opted in.
+	answer := ""
+	if choices, _ := m["choices"].([]any); len(choices) > 0 {
+		if first, _ := choices[0].(map[string]any); first != nil {
+			if msg, _ := first["message"].(map[string]any); msg != nil {
+				answer, _ = msg["content"].(string)
 			}
 		}
+	}
+	contentChars := 0
+	if !haveUsage {
+		contentChars = len(answer)
+	}
+	if capture != nil {
+		capture.Response, capture.Truncated = capString(answer)
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -386,6 +384,10 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 	}
 	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
 	s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
+	s.bodies.Offer(capture)
+	if capture != nil {
+		s.metrics.bodiesCaptured.Add(1)
+	}
 	record()
 }
 
@@ -395,6 +397,7 @@ type streamArgs struct {
 	tpm          int
 	inputBytes   int
 	forwardUsage bool
+	capture      *bodies.Record // nil unless the key opted into body capture
 	clientCtx    context.Context
 	upCtx        context.Context
 }
@@ -426,6 +429,8 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	haveUsage := false
 	contentChars := 0
 	dropped := 0
+	// Assembled assistant text, only when the key opted into capture.
+	var answer strings.Builder
 
 	// SSE events are framed by blank lines and one event's data may span
 	// several `data:` lines, so payloads are assembled per event before
@@ -468,6 +473,9 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			}
 		}
 		contentChars += c.contentChars
+		if a.capture != nil && c.content != "" && answer.Len() < bodies.ResponseCapBytes {
+			answer.WriteString(c.content)
+		}
 		return writeRaw(append(append([]byte("data: "), c.out...), '\n', '\n'))
 	}
 
@@ -539,7 +547,26 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	}
 	s.settleUsage(ev, u, haveUsage, a.inputBytes, contentChars)
 	s.limiter.ChargeTokens(a.keyID, a.tpm, ev.InputTokens+ev.OutputTokens)
+	if a.capture != nil {
+		a.capture.Response, a.capture.Truncated = capString(answer.String())
+		s.bodies.Offer(a.capture)
+		s.metrics.bodiesCaptured.Add(1)
+	}
 	record()
+}
+
+// capString bounds one captured answer. A cut record says so rather than
+// looking like a short answer.
+func capString(s string) (string, bool) {
+	if len(s) <= bodies.ResponseCapBytes {
+		return s, false
+	}
+	// Cut on a rune boundary so the stored text stays valid UTF-8.
+	cut := bodies.ResponseCapBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
 }
 
 // chunk is one parsed and rewritten SSE payload.
@@ -547,6 +574,7 @@ type chunk struct {
 	out          []byte
 	parsed       map[string]any
 	usage        *usage
+	content      string // this chunk's assistant text, for capture
 	contentChars int
 	choicesEmpty bool
 }
@@ -589,6 +617,7 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {
+					c.content = content
 					c.contentChars = len(content)
 				}
 			}

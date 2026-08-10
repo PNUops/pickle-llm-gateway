@@ -1,0 +1,269 @@
+// Package reporter ships spooled usage events to the control plane. The spool
+// is the outbox: the request path writes there and never waits for the
+// network, and this package walks it from a persisted checkpoint. Delivery is
+// at-least-once — a batch that succeeded but whose checkpoint write did not
+// land is simply sent again, and the control plane deduplicates on the
+// event's uuid.
+package reporter
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/pnuops/pickle-llm-gateway/internal/version"
+)
+
+// checkpoint records how far the spool has been shipped: the day file and the
+// byte offset within it. Day files are named for a UTC date, so ordering them
+// lexically orders them in time.
+type checkpoint struct {
+	Day    string `json:"day"`
+	Offset int64  `json:"offset"`
+}
+
+// Reporter walks the spool and posts batches. One instance, one goroutine.
+type Reporter struct {
+	dir        string
+	url        string
+	token      string
+	batchSize  int
+	client     *http.Client
+	log        *slog.Logger
+	ckptPath   string
+	ckpt       checkpoint
+	loadedCkpt bool
+}
+
+// New builds a reporter over the spool directory.
+func New(spoolDir, baseURL, token string, batchSize int, timeout time.Duration, log *slog.Logger) *Reporter {
+	return &Reporter{
+		dir:       spoolDir,
+		url:       baseURL + "/internal/llm/usage",
+		token:     token,
+		batchSize: batchSize,
+		client:    &http.Client{Timeout: timeout},
+		log:       log,
+		ckptPath:  filepath.Join(spoolDir, ".shipped"),
+	}
+}
+
+// Run ships on an interval until the context ends, backing off when the
+// control plane is unavailable. A failure never touches the request path: the
+// spool keeps growing and the next pass picks up where this one stopped.
+func (r *Reporter) Run(ctx context.Context, interval time.Duration) {
+	backoff := interval
+	const maxBackoff = 5 * time.Minute
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		sent, err := r.Flush(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			backoff = min(backoff*2, maxBackoff)
+			r.log.Error("usage report failed, will retry", "error", err, "retryIn", backoff.String())
+			continue
+		}
+		backoff = interval
+		if sent > 0 {
+			r.log.Info("usage reported", "events", sent)
+		}
+	}
+}
+
+// Flush ships everything currently spooled, in batches, and returns how many
+// events went out. It stops at the first failure so the checkpoint never runs
+// ahead of what the control plane accepted.
+func (r *Reporter) Flush(ctx context.Context) (int, error) {
+	if err := r.loadCheckpoint(); err != nil {
+		return 0, err
+	}
+	files, err := filepath.Glob(filepath.Join(r.dir, "usage-*.jsonl"))
+	if err != nil {
+		return 0, fmt.Errorf("reporter: %w", err)
+	}
+	sort.Strings(files)
+
+	total := 0
+	for _, path := range files {
+		day := dayOf(path)
+		if day == "" || day < r.ckpt.Day {
+			continue
+		}
+		offset := int64(0)
+		if day == r.ckpt.Day {
+			offset = r.ckpt.Offset
+		}
+		sent, err := r.shipFile(ctx, path, day, offset)
+		total += sent
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+// shipFile posts the complete lines of one day file from offset onward.
+func (r *Reporter) shipFile(ctx context.Context, path, day string, offset int64) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil // pruned between the glob and here
+		}
+		return 0, fmt.Errorf("reporter: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("reporter: %w", err)
+	}
+
+	br := bufio.NewReaderSize(f, 64<<10)
+	sent := 0
+	batch := make([]json.RawMessage, 0, r.batchSize)
+	pos := offset
+	batchEnd := offset
+
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := r.post(ctx, batch); err != nil {
+			return err
+		}
+		sent += len(batch)
+		batch = batch[:0]
+		r.ckpt = checkpoint{Day: day, Offset: batchEnd}
+		return r.saveCheckpoint()
+	}
+
+	for {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			// A trailing fragment is a write in progress: leave the offset
+			// before it so the next pass reads the whole line.
+			break
+		}
+		pos += int64(len(line))
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			batchEnd = pos
+			continue
+		}
+		batch = append(batch, json.RawMessage(trimmed))
+		batchEnd = pos
+		if len(batch) >= r.batchSize {
+			if err := flushBatch(); err != nil {
+				return sent, err
+			}
+		}
+	}
+	if err := flushBatch(); err != nil {
+		return sent, err
+	}
+	return sent, nil
+}
+
+// ingestRequest is the wire shape of one batch. Events are forwarded verbatim
+// as they were spooled, so the reporter never has to know the event schema —
+// a field added by the request path ships without touching this package.
+type ingestRequest struct {
+	AgentVersion string            `json:"agentVersion,omitempty"`
+	Events       []json.RawMessage `json:"events"`
+}
+
+func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
+	body, err := json.Marshal(ingestRequest{AgentVersion: version.String(), Events: events})
+	if err != nil {
+		return fmt.Errorf("reporter: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("reporter: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+r.token)
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("reporter: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("reporter: control plane returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (r *Reporter) loadCheckpoint() error {
+	if r.loadedCkpt {
+		return nil
+	}
+	raw, err := os.ReadFile(r.ckptPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			r.loadedCkpt = true
+			return nil // nothing shipped yet
+		}
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	// A corrupt checkpoint would otherwise stall shipping forever; starting
+	// over is safe because delivery is deduplicated on the event uuid.
+	if err := json.Unmarshal(raw, &r.ckpt); err != nil {
+		r.log.Error("unreadable ship checkpoint, restarting from the beginning", "error", err)
+		r.ckpt = checkpoint{}
+	}
+	r.loadedCkpt = true
+	return nil
+}
+
+func (r *Reporter) saveCheckpoint() error {
+	raw, err := json.Marshal(r.ckpt)
+	if err != nil {
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	tmp, err := os.CreateTemp(r.dir, ".shipped-*")
+	if err != nil {
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	if err := tmp.Chmod(0o640); err != nil {
+		tmp.Close()
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), r.ckptPath); err != nil {
+		return fmt.Errorf("reporter checkpoint: %w", err)
+	}
+	return nil
+}
+
+// dayOf extracts the YYYYMMDD part of a spool file name.
+func dayOf(path string) string {
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "usage-") || !strings.HasSuffix(base, ".jsonl") {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, "usage-"), ".jsonl")
+}

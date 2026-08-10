@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
@@ -22,6 +23,9 @@ type Server struct {
 	store    *snapshot.Store
 	limiter  *limits.Limiter
 	spool    *spool.Writer
+	bodies   *bodies.Sink
+	health   *upstreamHealth
+	metrics  *counters
 	log      *slog.Logger
 	client   *http.Client
 	inFlight chan struct{}
@@ -45,9 +49,22 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 			},
 		},
 		inFlight: make(chan struct{}, cfg.MaxInFlight),
+		health:   newUpstreamHealth(nil),
+		metrics:  &counters{},
 		now:      time.Now,
 	}
 }
+
+// InFlight reports how many requests are occupying a gateway-wide slot right
+// now. It is a gauge for the control-plane handshake and the health surface;
+// nothing acts on it.
+func (s *Server) InFlight() int { return len(s.inFlight) }
+
+// SetBodySink enables prompt/response capture for keys that opted in. Without
+// a sink no capture happens at all, whatever the snapshot says — the channel
+// has to exist before anything is collected, which is what keeps captured text
+// off this host's disk.
+func (s *Server) SetBodySink(sink *bodies.Sink) { s.bodies = sink }
 
 // Handler builds the route table.
 func (s *Server) Handler() http.Handler {

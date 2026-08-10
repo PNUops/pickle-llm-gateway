@@ -6,6 +6,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 )
 
@@ -61,6 +62,14 @@ var (
 		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
+)
+
+// Internal sentinels for upstream failure reasons. They never reach a client;
+// the client sees the shaped envelope above.
+var (
+	errUnconfiguredUpstream = errors.New("model references an unconfigured upstream")
+	errUpstreamAuth         = errors.New("upstream rejected our credential")
+	errUpstreamStatus       = errors.New("upstream returned an error status")
 )
 
 func errUnsupportedParam(name string) apiError {

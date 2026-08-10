@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,11 +11,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
@@ -38,6 +41,7 @@ type mockOpts struct {
 	heartbeat   bool          // stream: emit a non-JSON keepalive (data: ping) first
 	abortMid    bool          // stream: hijack and close after one chunk, no [DONE]
 	chunkDelay  time.Duration // stream: pause before each chunk
+	failNext    int           // fail this many next calls with a 502, then serve
 }
 
 type upstreamMock struct {
@@ -71,6 +75,13 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 
 	if cp.delay > 0 {
 		time.Sleep(cp.delay)
+	}
+	if cp.failNext > 0 {
+		u.mu.Lock()
+		u.opts.failNext--
+		u.mu.Unlock()
+		w.WriteHeader(http.StatusBadGateway)
+		return
 	}
 	if cp.status != 0 && cp.status != http.StatusOK {
 		w.WriteHeader(cp.status)
@@ -135,6 +146,7 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 
 type harness struct {
 	gw       *httptest.Server
+	srv      *Server
 	mock     *upstreamMock
 	spoolDir string
 	snapPath string
@@ -175,7 +187,7 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 	}
 	h.writeSnapshot(t, doc)
 
-	store, err := snapshot.Open(h.snapPath, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
+	store, err := snapshot.OpenFile(h.snapPath, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +214,7 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		mutateCfg(cfg)
 	}
 	srv := New(cfg, store, limits.New(nil), sp, slog.New(slog.DiscardHandler))
+	h.srv = srv
 	h.gw = httptest.NewServer(srv.Handler())
 	t.Cleanup(h.gw.Close)
 	return h
@@ -585,7 +598,7 @@ func TestSnapshotReloadRevokesKey(t *testing.T) {
 	doc.Generation = 2
 	doc.Keys[0].Status = snapshot.KeyRevoked
 	h.writeSnapshot(t, doc)
-	h.store.Refresh()
+	h.store.Refresh(context.Background())
 	status, body := h.chat(t, testToken, chatBody)
 	if status != 401 || errCode(t, body) != "api_key_revoked" {
 		t.Fatalf("got %d %s", status, body)
@@ -956,14 +969,14 @@ func TestForwardCompatNestedUnknownField(t *testing.T) {
 	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := snapshot.Open(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}}); err != nil {
+	if _, err := snapshot.OpenFile(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}}); err != nil {
 		t.Fatalf("nested unknown field rejected: %v", err)
 	}
 	bad := `{"generation":1,"serviceEnabled":true,"models":[],"keys":[],"unknownTopLevel":1}`
 	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := snapshot.Open(path, slog.New(slog.DiscardHandler), snapshot.Options{}); err == nil {
+	if _, err := snapshot.OpenFile(path, slog.New(slog.DiscardHandler), snapshot.Options{}); err == nil {
 		t.Fatal("unknown top-level field accepted")
 	}
 }
@@ -1058,5 +1071,301 @@ func TestErrorTypesAreOpenAISet(t *testing.T) {
 	}
 	if !valid[e.Error.Type] {
 		t.Fatalf("error type %q is outside the OpenAI set", e.Error.Type)
+	}
+}
+
+// bodySink spins a sink pointed at a recording server, so a test can assert
+// both what was captured and — more importantly — what was not.
+type capturedBodies struct {
+	mu      sync.Mutex
+	records []bodies.Record
+}
+
+func (c *capturedBodies) handler(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Records []bodies.Record `json:"records"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	c.mu.Lock()
+	c.records = append(c.records, in.Records...)
+	c.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (c *capturedBodies) all() []bodies.Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]bodies.Record(nil), c.records...)
+}
+
+// withBodyCapture attaches a live capture channel to the harness.
+func (h *harness) withBodyCapture(t *testing.T) *capturedBodies {
+	t.Helper()
+	cb := &capturedBodies{}
+	srv := httptest.NewServer(http.HandlerFunc(cb.handler))
+	t.Cleanup(srv.Close)
+	sink := bodies.New(srv.URL, "tok", 64, 1, 5*time.Second, slog.New(slog.DiscardHandler))
+	h.srv.SetBodySink(sink)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go sink.Run(ctx)
+	return cb
+}
+
+func waitForRecords(t *testing.T, cb *capturedBodies, want int) []bodies.Record {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := cb.all(); len(got) >= want {
+			return got
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cb.all()
+}
+
+func TestBodyCaptureOnlyForOptedInKeys(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Keys[0].RecordBodies = true
+		d.Keys = append(d.Keys, snapshot.Key{
+			KeyID: "k-plain", TokenHash: snapshot.HashToken("pickle-plain"),
+			Status: snapshot.KeyActive})
+	}, nil)
+	cb := h.withBodyCapture(t)
+
+	// The opted-out key must produce no record at all.
+	if status, _ := h.chat(t, "pickle-plain", chatBody); status != 200 {
+		t.Fatal("opted-out request failed")
+	}
+	// The opted-in key produces exactly one, carrying both sides.
+	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatal("opted-in request failed")
+	}
+	got := waitForRecords(t, cb, 1)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly the opted-in record, got %d: %+v", len(got), got)
+	}
+	if got[0].KeyID != "k-test" {
+		t.Fatalf("captured the wrong key: %+v", got[0])
+	}
+	if !bytes.Contains(got[0].Request, []byte("MARKER-PROMPT-CONTENT")) {
+		t.Fatalf("prompt not captured: %s", got[0].Request)
+	}
+	if got[0].Response != "안녕하세요" {
+		t.Fatalf("answer not captured: %q", got[0].Response)
+	}
+	if got[0].EventUUID == "" {
+		t.Fatal("record carries no event id to join on")
+	}
+}
+
+func TestBodyCaptureStreamAssembles(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].RecordBodies = true }, nil)
+	cb := h.withBodyCapture(t)
+	if status, _ := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`); status != 200 {
+		t.Fatal("stream failed")
+	}
+	got := waitForRecords(t, cb, 1)
+	if len(got) != 1 || got[0].Response != "안녕하세요" {
+		t.Fatalf("streamed answer not assembled: %+v", got)
+	}
+}
+
+// The spool is the accounting record and must never carry text, opt-in or not.
+// This is the guarantee the whole separation rests on.
+func TestSpoolNeverCarriesBodiesEvenWhenCapturing(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].RecordBodies = true }, nil)
+	cb := h.withBodyCapture(t)
+	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatal("request failed")
+	}
+	waitForRecords(t, cb, 1)
+
+	files, _ := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
+	if len(files) == 0 {
+		t.Fatal("no spool file written")
+	}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Content itself, and the field names a body record would arrive under
+		// (as JSON keys, so `requestedAt` is not mistaken for a leak).
+		for _, needle := range []string{"MARKER-PROMPT-CONTENT", "안녕하세요", `"messages"`, `"request"`, `"response"`} {
+			if bytes.Contains(raw, []byte(needle)) {
+				t.Fatalf("spool leaked %q: %s", needle, raw)
+			}
+		}
+	}
+}
+
+// Without a sink, an opted-in key still captures nothing: the delivery channel
+// is what makes capture possible, so a gateway with no control plane collects
+// no text anywhere.
+func TestNoCaptureWithoutChannel(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].RecordBodies = true }, nil)
+	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatal("request failed")
+	}
+	files, _ := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
+	for _, f := range files {
+		raw, _ := os.ReadFile(f)
+		if bytes.Contains(raw, []byte("MARKER-PROMPT-CONTENT")) {
+			t.Fatal("text was recorded with no delivery channel configured")
+		}
+	}
+}
+
+func TestRetryAfterAndRateLimitHeaders(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Rpm = 1 }, nil)
+
+	req, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("first request: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-RateLimit-Limit-Requests") != "1" {
+		t.Fatalf("no rate-limit ceiling header: %q", resp.Header.Get("X-RateLimit-Limit-Requests"))
+	}
+	if resp.Header.Get("X-RateLimit-Remaining-Requests") != "0" {
+		t.Fatalf("remaining header wrong: %q", resp.Header.Get("X-RateLimit-Remaining-Requests"))
+	}
+
+	// The refused follow-up must say when to come back.
+	req2, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	req2.Header.Set("Authorization", "Bearer "+testToken)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 429 {
+		t.Fatalf("second request: %d", resp2.StatusCode)
+	}
+	after := resp2.Header.Get("Retry-After")
+	if after == "" {
+		t.Fatal("429 carried no Retry-After")
+	}
+	if n, err := strconv.Atoi(after); err != nil || n <= 0 || n > 120 {
+		t.Fatalf("implausible Retry-After: %q", after)
+	}
+}
+
+func TestUpstreamRetryThenSuccess(t *testing.T) {
+	h := newHarness(t, nil, func(c *config.Config) { c.UpstreamRetries = 1 })
+	// Fail once, then serve normally: the student never sees the failure.
+	h.mock.set(func(u *mockOpts) { u.failNext = 1 })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("a retryable failure was not retried: %d %s", status, body)
+	}
+}
+
+func TestUpstreamFallback(t *testing.T) {
+	var fallbackHits int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fallbackHits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"fb","object":"chat.completion","model":"other","choices":[{"index":0,"message":{"role":"assistant","content":"fallback"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer fb.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models[0].FallbackRef = "backup"
+	}, func(c *config.Config) {
+		c.UpstreamRetries = 0
+		c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+	})
+	// The primary is down for good; the fallback answers.
+	h.mock.set(func(u *mockOpts) { u.status = http.StatusBadGateway })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("fallback did not take over: %d %s", status, body)
+	}
+	mu.Lock()
+	hits := fallbackHits
+	mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("fallback hit %d times", hits)
+	}
+	// The public model name still holds on the fallback's answer.
+	if !bytes.Contains(body, []byte(`"model":"pnu-general"`)) {
+		t.Fatalf("fallback answer leaked its own model name: %s", body)
+	}
+}
+
+func TestUpstreamRefusalIsNotRetriedOrFailedOver(t *testing.T) {
+	var fallbackHits int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fallbackHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fb.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) { d.Models[0].FallbackRef = "backup" },
+		func(c *config.Config) {
+			c.UpstreamRetries = 2
+			c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+		})
+	// A 400 is the request's own fault: repeating it anywhere is pointless.
+	h.mock.set(func(u *mockOpts) { u.status = http.StatusBadRequest; u.errBody = `{"error":"bad"}` })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 400 || errCode(t, body) != "upstream_rejected" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	mu.Lock()
+	hits := fallbackHits
+	mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("a refusal was failed over to the fallback %d times", hits)
+	}
+}
+
+func TestAdminMetrics(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatal("request failed")
+	}
+	admin := httptest.NewServer(h.srv.AdminHandler())
+	defer admin.Close()
+
+	resp, err := http.Get(admin.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m struct {
+		InFlight     int              `json:"inFlight"`
+		ByStatus     map[string]int64 `json:"requestsByStatus"`
+		InputTokens  int64            `json:"inputTokens"`
+		OutputTokens int64            `json:"outputTokens"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ByStatus["OK"] != 1 || m.InputTokens != 7 || m.OutputTokens != 5 {
+		t.Fatalf("metrics did not observe the request: %+v", m)
+	}
+
+	// The student-facing route must not carry the metrics surface.
+	pub, err := http.Get(h.gw.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Body.Close()
+	if pub.StatusCode != 404 {
+		t.Fatalf("metrics reachable on the public listener: %d", pub.StatusCode)
 	}
 }

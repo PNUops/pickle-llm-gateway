@@ -27,17 +27,39 @@ type Upstream struct {
 	CapField string
 }
 
+// SnapshotSource names where the authorization document comes from.
+const (
+	SourceFile = "file" // a local document an operator maintains
+	SourceHTTP = "http" // the control plane (pickle-api) serves it
+)
+
 // Config is everything the daemon needs to run.
 type Config struct {
-	Listen       string // address for the public-facing HTTP listener
-	SnapshotPath string // authorization state document
+	Listen string // address for the public-facing HTTP listener
+	// AdminListen serves metrics and health on a separate address. Empty
+	// disables it. Bind it to loopback or the infra bridge only — it is not
+	// behind the public route and must never become reachable from it.
+	AdminListen  string
+	SnapshotPath string // authorization document (or, on http, its local cache)
 	SpoolDir     string // usage event spool directory
+
+	// SnapshotSource selects the document transport. The default stays "file"
+	// so enabling the control plane is a deliberate act, not a consequence of
+	// upgrading the binary.
+	SnapshotSource string
+	ControlBaseURL string        // control-plane root, e.g. http://172.30.1.20:8080
+	ControlToken   string        // bearer for the internal link
+	ControlTimeout time.Duration // per-poll deadline
 
 	SnapshotPollInterval time.Duration
 	RequestBodyMaxBytes  int64
 	UpstreamHeaderWait   time.Duration // how long to wait for upstream response headers
 	RequestMaxDuration   time.Duration // hard cap on one request, streaming included
 	MaxInFlight          int           // gateway-wide concurrent request cap
+	// UpstreamRetries is how many extra attempts one upstream gets after a
+	// transient failure, before the model's fallback (if any) is tried. Only
+	// ever applied before any of the response has reached the client.
+	UpstreamRetries int
 
 	// Fallback limits for keys whose snapshot entry sets none.
 	DefaultRpm         int
@@ -47,6 +69,21 @@ type Config struct {
 	// SpoolRetentionDays bounds the usage spool on the gateway's small disk.
 	// Old day-files are deleted once past it; 0 disables pruning.
 	SpoolRetentionDays int
+
+	// UsagePush ships spooled usage events to the control plane. Off by
+	// default: the spool is written either way, so turning this on later loses
+	// nothing that happened before.
+	UsagePush         bool
+	UsageBatchSize    int
+	UsagePushInterval time.Duration
+
+	// BodyCapture opens the prompt/response capture channel. Off by default,
+	// and even on, a key records nothing unless its snapshot entry opted in.
+	// Captured text never touches this host's disk, so the channel has to
+	// exist before anything is captured at all.
+	BodyCapture   bool
+	BodyQueueSize int
+	BodyBatchSize int
 
 	// AllowGenerationReset lets the snapshot load a document whose generation
 	// is below the persisted high-water (an operator deliberately resetting the
@@ -74,6 +111,11 @@ func FromEnv() (*Config, error) {
 		Listen:               getenv("LISTEN", ""),
 		SnapshotPath:         getenv("SNAPSHOT_PATH", ""),
 		SpoolDir:             getenv("SPOOL_DIR", ""),
+		AdminListen:          getenv("ADMIN_LISTEN", ""),
+		SnapshotSource:       getenv("SNAPSHOT_SOURCE", SourceFile),
+		ControlBaseURL:       strings.TrimRight(getenv("CONTROL_BASE_URL", ""), "/"),
+		ControlToken:         getenv("CONTROL_TOKEN", ""),
+		ControlTimeout:       10 * time.Second,
 		SnapshotPollInterval: 5 * time.Second,
 		RequestBodyMaxBytes:  2 << 20,
 		UpstreamHeaderWait:   60 * time.Second,
@@ -83,10 +125,15 @@ func FromEnv() (*Config, error) {
 		// default stays well under the unit's MemoryMax. Raise it (and the
 		// LXC memory + MemoryMax together) for a larger host.
 		MaxInFlight:        16,
+		UpstreamRetries:    1,
 		DefaultRpm:         20,
 		DefaultTpm:         20000,
 		DefaultConcurrency: 2,
 		SpoolRetentionDays: 90,
+		UsageBatchSize:     500,
+		UsagePushInterval:  30 * time.Second,
+		BodyQueueSize:      256,
+		BodyBatchSize:      20,
 		Upstreams:          map[string]Upstream{},
 	}
 
@@ -99,6 +146,18 @@ func FromEnv() (*Config, error) {
 	need("LISTEN", cfg.Listen)
 	need("SNAPSHOT_PATH", cfg.SnapshotPath)
 	need("SPOOL_DIR", cfg.SpoolDir)
+
+	switch cfg.SnapshotSource {
+	case SourceFile:
+	case SourceHTTP:
+		// The control plane decides who gets through, so an unset endpoint or
+		// token must stop the gateway rather than silently fall back to a file
+		// that may be stale or absent.
+		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
+		need("CONTROL_TOKEN", cfg.ControlToken)
+	default:
+		errs = append(errs, envPrefix+"SNAPSHOT_SOURCE must be "+SourceFile+" or "+SourceHTTP)
+	}
 
 	for _, opt := range []struct {
 		name string
@@ -118,6 +177,14 @@ func FromEnv() (*Config, error) {
 			*opt.dst = n
 		}
 	}
+	if v := getenv("UPSTREAM_RETRIES", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			errs = append(errs, envPrefix+"UPSTREAM_RETRIES must be a non-negative integer")
+		} else {
+			cfg.UpstreamRetries = n
+		}
+	}
 	if v := getenv("SPOOL_RETENTION_DAYS", ""); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
@@ -131,6 +198,8 @@ func FromEnv() (*Config, error) {
 		dst  *time.Duration
 	}{
 		{"SNAPSHOT_POLL_INTERVAL", &cfg.SnapshotPollInterval},
+		{"CONTROL_TIMEOUT", &cfg.ControlTimeout},
+		{"USAGE_PUSH_INTERVAL", &cfg.UsagePushInterval},
 		{"UPSTREAM_HEADER_WAIT", &cfg.UpstreamHeaderWait},
 		{"REQUEST_MAX_DURATION", &cfg.RequestMaxDuration},
 	} {
@@ -145,6 +214,27 @@ func FromEnv() (*Config, error) {
 	}
 	if v := getenv("ALLOW_GENERATION_RESET", ""); v == "1" || strings.EqualFold(v, "true") {
 		cfg.AllowGenerationReset = true
+	}
+	if v := getenv("USAGE_PUSH", ""); v == "on" || v == "1" || strings.EqualFold(v, "true") {
+		cfg.UsagePush = true
+		// Shipping needs somewhere to ship to, whichever way the document
+		// arrives — an operator may push usage while still editing the
+		// document by hand.
+		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
+		need("CONTROL_TOKEN", cfg.ControlToken)
+	}
+	if v := getenv("BODY_CAPTURE", ""); v == "on" || v == "1" || strings.EqualFold(v, "true") {
+		cfg.BodyCapture = true
+		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
+		need("CONTROL_TOKEN", cfg.ControlToken)
+	}
+	if v := getenv("USAGE_BATCH_SIZE", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			errs = append(errs, envPrefix+"USAGE_BATCH_SIZE must be a positive integer")
+		} else {
+			cfg.UsageBatchSize = n
+		}
 	}
 	if v := getenv("REQUEST_BODY_MAX_BYTES", ""); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
