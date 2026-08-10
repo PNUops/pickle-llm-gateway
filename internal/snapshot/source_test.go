@@ -321,13 +321,130 @@ func TestTopLevelStrictnessFollowsTheSource(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "snapshot.json")
 	src := NewHTTPSource(srv.URL, "tok", cache, 5*time.Second)
 	s, err := Open(context.Background(), src, cache, discard(), Options{
-		KnownUpstreams:          []string{"mock"},
-		TolerateUnknownTopLevel: true,
+		KnownUpstreams:   []string{"mock"},
+		FromControlPlane: true,
 	})
 	if err != nil {
 		t.Fatalf("a future top-level member froze authorization: %v", err)
 	}
 	if s.Generation() != 1 {
 		t.Fatalf("generation = %d", s.Generation())
+	}
+}
+
+// A value the gateway cannot act on must cost the entry, not the document. The
+// alternative — refusing everything — leaves the last good state serving
+// indefinitely while the control plane keeps getting 200s, so a revocation
+// issued afterwards never takes effect and nothing says so.
+func TestControlPlaneDropsUnusableEntriesInsteadOfFreezing(t *testing.T) {
+	hash := HashToken("live")
+	doc := fmt.Sprintf(`{"generation":2,"serviceEnabled":true,
+	  "models":[
+	    {"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"},
+	    {"publicName":"pnu-future","upstreamRef":"dgx","upstreamModel":"m"}],
+	  "keys":[
+	    {"keyId":"k-live","tokenHash":"%s","status":"ACTIVE","limits":{}},
+	    {"keyId":"k-new","tokenHash":"%s","status":"PENDING_ROTATION","limits":{}}]}`,
+		hash, HashToken("newstatus"))
+
+	cp := &controlPlane{doc: doc, gen: 2}
+	srv := httptest.NewServer(http.HandlerFunc(cp.serve))
+	defer srv.Close()
+	cache := filepath.Join(t.TempDir(), "snapshot.json")
+	s, err := Open(context.Background(), NewHTTPSource(srv.URL, "tok", cache, 5*time.Second),
+		cache, discard(), Options{KnownUpstreams: []string{"mock"}, FromControlPlane: true})
+	if err != nil {
+		t.Fatalf("one unusable entry refused the whole document: %v", err)
+	}
+	if s.Generation() != 2 {
+		t.Fatalf("generation = %d, want the new document applied", s.Generation())
+	}
+	if got := s.RejectedEntries(); got != 2 {
+		t.Fatalf("rejectedEntries = %d, want 2", got)
+	}
+	_, byHash, byName := s.Current()
+	if byHash(hash) == nil {
+		t.Fatal("the usable key was lost along with the unusable one")
+	}
+	if byHash(HashToken("newstatus")) != nil {
+		t.Fatal("a key whose status this build does not know was served anyway")
+	}
+	if byName("pnu-general") == nil {
+		t.Fatal("the usable model was lost")
+	}
+	if byName("pnu-future") != nil {
+		t.Fatal("a model naming an upstream this host has no config for was served")
+	}
+
+	// The same document from a file is an operator's edit, and there the loud
+	// failure is what they need.
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	writeDoc(t, path, doc, time.Now())
+	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"mock"}}); err == nil {
+		t.Fatal("a hand-maintained file quietly dropped an entry instead of failing")
+	}
+}
+
+// Omitting a member is how "nothing changed" is expressed, so a writer that
+// drops nulls can express a catastrophe by accident: no serviceEnabled reads as
+// maintenance mode, and models without keys reads as every key revoked.
+func TestHalfDocumentIsRefused(t *testing.T) {
+	cases := map[string]string{
+		"serviceEnabled missing": `{"generation":3,"models":[],"keys":[]}`,
+		"keys missing":           `{"generation":3,"serviceEnabled":true,"models":[]}`,
+		"models missing":         `{"generation":3,"serviceEnabled":true,"keys":[]}`,
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cp := &controlPlane{doc: doc, gen: 3}
+			srv := httptest.NewServer(http.HandlerFunc(cp.serve))
+			defer srv.Close()
+			cache := filepath.Join(t.TempDir(), "snapshot.json")
+			_, err := Open(context.Background(), NewHTTPSource(srv.URL, "tok", cache, 5*time.Second),
+				cache, discard(), Options{FromControlPlane: true})
+			if err == nil {
+				t.Fatal("a half-written document was applied")
+			}
+		})
+	}
+}
+
+// The poll is the only channel from gateway to api, so what it does not carry
+// the control plane cannot know. A frozen document shows up here as a
+// generation standing still; these fields are what says why.
+func TestSyncRequestCarriesTheSelfReport(t *testing.T) {
+	var got SyncRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		fmt.Fprint(w, `{"generation":1,"serviceEnabled":true,"models":[],"keys":[]}`)
+	}))
+	defer srv.Close()
+	src := NewHTTPSource(srv.URL, "tok", filepath.Join(t.TempDir(), "cache.json"), 5*time.Second)
+	src.SetGauges(func() SyncGauges {
+		return SyncGauges{
+			InFlight: 3, MaxInFlight: 16,
+			UpstreamRefs:    []string{"mock"},
+			RejectedEntries: 2, ReloadFailures: 5,
+			LastError: "unknown status\n\"PENDING\"",
+		}
+	})
+	if _, _, err := src.Load(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if got.SupportedFormat != SupportedFormat {
+		t.Fatalf("supportedFormat = %d, want %d — without it the writer cannot tell what this build reads",
+			got.SupportedFormat, SupportedFormat)
+	}
+	if got.MaxInFlight != 16 || got.InFlight != 3 {
+		t.Fatalf("load gauges = %d/%d", got.InFlight, got.MaxInFlight)
+	}
+	if got.RejectedEntries != 2 || got.ReloadFailures != 5 {
+		t.Fatalf("failure gauges = %d rejected, %d reload failures", got.RejectedEntries, got.ReloadFailures)
+	}
+	if len(got.UpstreamRefs) != 1 || got.UpstreamRefs[0] != "mock" {
+		t.Fatalf("upstreamRefs = %v, want the host's configured refs", got.UpstreamRefs)
+	}
+	if strings.ContainsAny(got.LastError, "\n\r") {
+		t.Fatalf("lastError carried control characters into someone else's log: %q", got.LastError)
 	}
 }
