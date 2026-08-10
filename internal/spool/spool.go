@@ -91,12 +91,21 @@ func (w *Writer) Write(ev Event) error {
 	return nil
 }
 
-// Prune deletes spool files whose day is older than retentionDays before now.
 // It is best-effort: a file that cannot be parsed or removed is left in place
 // and the error is returned for logging, never fatal. Retention exists because
 // nothing else rotates the spool and the gateway LXC has a small root disk;
 // once the api ingests these events it will own the authoritative copy.
-func (w *Writer) Prune(now time.Time, retentionDays int) error {
+//
+// keep is asked whether a day file may be deleted. Retention alone is not
+// enough once shipping is on: a day the reporter never confirmed is the only
+// copy of those events.
+type keepFunc func(day string) bool
+
+// Prune deletes spool files whose day is older than retentionDays before now,
+// skipping any day that keep reports as not yet shipped. keep may be nil when
+// nothing ships (the spool is then the only record and retention is the only
+// bound).
+func (w *Writer) Prune(now time.Time, retentionDays int, keep keepFunc) error {
 	if retentionDays <= 0 {
 		return nil
 	}
@@ -119,10 +128,16 @@ func (w *Writer) Prune(now time.Time, retentionDays int) error {
 		if err != nil {
 			continue
 		}
-		if d.Before(cutoff) {
-			if err := os.Remove(path); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if !d.Before(cutoff) {
+			continue
+		}
+		if keep != nil && !keep(day) {
+			// Past retention but never reported: keeping stale bytes is the
+			// lesser harm against losing the only record of that usage.
+			continue
+		}
+		if err := os.Remove(path); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr

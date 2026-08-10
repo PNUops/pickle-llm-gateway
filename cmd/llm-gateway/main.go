@@ -113,16 +113,27 @@ func main() {
 	// Usage reporting: walk the spool and ship batches to the control plane.
 	// The spool is written regardless, so enabling this later ships what
 	// already accumulated.
+	var shipped func(day string) bool
 	if cfg.UsagePush {
 		rep := reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
 			cfg.UsageBatchSize, cfg.ControlTimeout, log)
 		go rep.Run(ctx, cfg.UsagePushInterval)
+		// Retention must not delete a day the reporter never confirmed: with
+		// shipping on, an unreported day file is the only copy of that usage.
+		shipped = func(day string) bool {
+			offsets, err := rep.ShippedThrough()
+			if err != nil {
+				return false // unknown: keep the file
+			}
+			_, ok := offsets[day]
+			return ok
+		}
 	}
 
 	// Usage-spool retention: prune once at startup and daily thereafter.
 	go func() {
 		prune := func() {
-			if err := sp.Prune(time.Now(), cfg.SpoolRetentionDays); err != nil {
+			if err := sp.Prune(time.Now(), cfg.SpoolRetentionDays, shipped); err != nil {
 				log.Error("spool prune failed", "error", err)
 			}
 		}

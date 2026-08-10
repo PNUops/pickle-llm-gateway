@@ -242,3 +242,77 @@ func TestAuthHeaderAndVersion(t *testing.T) {
 		t.Fatalf("auth header = %q", auth)
 	}
 }
+
+// A request that starts before UTC midnight and finishes after it appends to
+// yesterday's file after today's has already shipped. A single "we are past
+// that day" cursor would skip those events forever.
+func TestLateWriteToAnEarlierDayStillShips(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	writeEvents(t, dir, "20260811", "today-1")
+	r := New(dir, url, "tok", 500, 5*time.Second, discard())
+	if sent, err := r.Flush(context.Background()); err != nil || sent != 1 {
+		t.Fatalf("sent=%d err=%v", sent, err)
+	}
+	// Now the straddling request lands in yesterday's file.
+	writeEvents(t, dir, "20260810", "straddler")
+	sent, err := r.Flush(context.Background())
+	if err != nil || sent != 1 {
+		t.Fatalf("a late write to an earlier day was skipped: sent=%d err=%v", sent, err)
+	}
+	got, _ := is.snapshot()
+	if got[len(got)-1] != "straddler" {
+		t.Fatalf("unexpected delivery: %v", got)
+	}
+	// And it is not shipped twice.
+	if sent, err := r.Flush(context.Background()); err != nil || sent != 0 {
+		t.Fatalf("re-flush shipped %d", sent)
+	}
+}
+
+// A file matching the glob but not named for a date must not become the
+// checkpoint and stall every real file behind it.
+func TestStrayFileDoesNotStallShipping(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	writeEvents(t, dir, "20260811", "real-1")
+	if err := os.WriteFile(filepath.Join(dir, "usage-backup.jsonl"),
+		[]byte(`{"eventUuid":"stray"}`+"\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	r := New(dir, url, "tok", 500, 5*time.Second, discard())
+	if _, err := r.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	writeEvents(t, dir, "20260812", "real-2")
+	sent, err := r.Flush(context.Background())
+	if err != nil || sent != 1 {
+		t.Fatalf("a stray file stalled shipping: sent=%d err=%v", sent, err)
+	}
+	got, _ := is.snapshot()
+	for _, id := range got {
+		if id == "stray" {
+			t.Fatal("a file this package never wrote was shipped")
+		}
+	}
+}
+
+func TestShippedThroughReportsDays(t *testing.T) {
+	dir := t.TempDir()
+	_, url := newIngest(t)
+	writeEvents(t, dir, "20260811", "a")
+	r := New(dir, url, "tok", 500, 5*time.Second, discard())
+	if _, err := r.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	days, err := r.ShippedThrough()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := days["20260811"]; !ok {
+		t.Fatalf("shipped day not reported: %v", days)
+	}
+	if _, ok := days["20260810"]; ok {
+		t.Fatalf("a day that never shipped was reported: %v", days)
+	}
+}
