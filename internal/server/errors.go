@@ -70,6 +70,7 @@ var (
 	errUnconfiguredUpstream = errors.New("model references an unconfigured upstream")
 	errUpstreamAuth         = errors.New("upstream rejected our credential")
 	errUpstreamStatus       = errors.New("upstream returned an error status")
+	errUpstreamThrottled    = errors.New("upstream is throttling this gateway")
 )
 
 func errUnsupportedParam(name string) apiError {
