@@ -35,6 +35,9 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 얼마인지가 JSON 문서 하나에 들어 있고, 게이트웨이는 이 문서를 통째로 읽어 원자적으로
 교체합니다. 문서가 바뀌면 폴링 주기 안에 반영되므로, Key 폐기는 수 초 안에 적용됩니다.
 세대 번호가 뒤로 가는 문서는 거부합니다. 폐기를 조용히 되돌릴 수 있기 때문입니다.
+최고 세대 번호는 문서 옆 `snapshot.json.highwater` 파일에 남으므로, 재시작 뒤에 예전
+문서가 되살아나도 거부합니다. 모델의 `upstreamRef`가 설정에 없는 업스트림을 가리키면
+그 문서는 적재 자체를 거부해, 오타가 요청 시점의 오류가 아니라 적재 시점에 드러납니다.
 
 현재는 로컬 파일을 폴링합니다. HTTP 동기화는 아직 제공하지 않습니다.
 
@@ -107,10 +110,11 @@ go run ./cmd/llm-gateway
 | `LLMGW_REQUEST_BODY_MAX_BYTES` | `2097152` | 요청 본문 크기 상한 |
 | `LLMGW_UPSTREAM_HEADER_WAIT` | `60s` | 업스트림 응답 시작 대기 상한 |
 | `LLMGW_REQUEST_MAX_DURATION` | `10m` | 요청 한 건의 전체 시간 상한 |
-| `LLMGW_MAX_IN_FLIGHT` | `64` | 게이트웨이 전체 동시 요청 상한 |
+| `LLMGW_MAX_IN_FLIGHT` | `16` | 게이트웨이 전체 동시 요청 상한 (호스트 메모리에 맞춰 조정) |
 | `LLMGW_DEFAULT_RPM` | `20` | Key에 한도가 없을 때의 분당 요청 수 |
 | `LLMGW_DEFAULT_TPM` | `20000` | Key에 한도가 없을 때의 분당 토큰 수 |
 | `LLMGW_DEFAULT_CONCURRENCY` | `2` | Key에 한도가 없을 때의 동시 요청 수 |
+| `LLMGW_ALLOW_GENERATION_RESET` | (off) | 스냅샷 세대가 기록된 최고값보다 낮아도 적재 허용(의도적 세대 초기화 시에만) |
 
 </details>
 
