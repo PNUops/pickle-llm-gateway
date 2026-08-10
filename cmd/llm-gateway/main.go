@@ -29,7 +29,10 @@ func main() {
 		log.Error("startup failed", "error", err)
 		os.Exit(1)
 	}
-	store, err := snapshot.Open(cfg.SnapshotPath, log)
+	store, err := snapshot.Open(cfg.SnapshotPath, log, snapshot.Options{
+		KnownUpstreams:       cfg.UpstreamRefs(),
+		AllowGenerationReset: cfg.AllowGenerationReset,
+	})
 	if err != nil {
 		log.Error("startup failed", "error", err)
 		os.Exit(1)
@@ -45,6 +48,11 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound the request-read phase. Slots (gateway-wide in-flight + per-key
+		// concurrency) are taken before the body is read, so an unbounded read
+		// would let a slow client hold them for as long as nginx allows; chat
+		// bodies are small, so a request that cannot be read in 30s is stuck.
+		ReadTimeout: 30 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -80,7 +88,12 @@ func main() {
 		}
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Drain in-flight requests before closing the spool: a handler still
+	// running when the spool is closed loses its usage record. The grace is a
+	// balance — long enough that ordinary requests finish and record, short
+	// enough that a deploy is not blocked by a maximal-length stream (which is
+	// cut at the grace, its handler then recording a canceled event).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	_ = hs.Shutdown(shutdownCtx)
 	if err := sp.Close(); err != nil {

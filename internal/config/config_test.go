@@ -20,7 +20,7 @@ func TestFromEnvDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SnapshotPollInterval != 5*time.Second || cfg.DefaultRpm != 20 || cfg.MaxInFlight != 64 {
+	if cfg.SnapshotPollInterval != 5*time.Second || cfg.DefaultRpm != 20 || cfg.MaxInFlight != 16 {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 	up, ok := cfg.Upstreams["openai"]

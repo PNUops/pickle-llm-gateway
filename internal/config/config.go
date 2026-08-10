@@ -44,7 +44,21 @@ type Config struct {
 	DefaultTpm         int
 	DefaultConcurrency int
 
+	// AllowGenerationReset lets the snapshot load a document whose generation
+	// is below the persisted high-water (an operator deliberately resetting the
+	// sequence). Off by default so a restored old snapshot fails closed.
+	AllowGenerationReset bool
+
 	Upstreams map[string]Upstream // by lowercase ref
+}
+
+// UpstreamRefs returns the configured upstream reference names.
+func (c *Config) UpstreamRefs() []string {
+	refs := make([]string, 0, len(c.Upstreams))
+	for ref := range c.Upstreams {
+		refs = append(refs, ref)
+	}
+	return refs
 }
 
 const envPrefix = "LLMGW_"
@@ -60,11 +74,15 @@ func FromEnv() (*Config, error) {
 		RequestBodyMaxBytes:  2 << 20,
 		UpstreamHeaderWait:   60 * time.Second,
 		RequestMaxDuration:   10 * time.Minute,
-		MaxInFlight:          64,
-		DefaultRpm:           20,
-		DefaultTpm:           20000,
-		DefaultConcurrency:   2,
-		Upstreams:            map[string]Upstream{},
+		// Sized for the gateway LXC's memory (512 MB): each in-flight request
+		// can transiently hold a few MB of request/response buffers, so the
+		// default stays well under the unit's MemoryMax. Raise it (and the
+		// LXC memory + MemoryMax together) for a larger host.
+		MaxInFlight:        16,
+		DefaultRpm:         20,
+		DefaultTpm:         20000,
+		DefaultConcurrency: 2,
+		Upstreams:          map[string]Upstream{},
 	}
 
 	var errs []string
@@ -111,6 +129,9 @@ func FromEnv() (*Config, error) {
 			}
 			*opt.dst = d
 		}
+	}
+	if v := getenv("ALLOW_GENERATION_RESET", ""); v == "1" || strings.EqualFold(v, "true") {
+		cfg.AllowGenerationReset = true
 	}
 	if v := getenv("REQUEST_BODY_MAX_BYTES", ""); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
