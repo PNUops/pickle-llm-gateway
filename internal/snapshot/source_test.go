@@ -293,3 +293,41 @@ func TestFallbackRefIsValidatedAtLoad(t *testing.T) {
 		t.Fatalf("a configured fallback was rejected: %v", err)
 	}
 }
+
+// Strictness follows the writer. A hand-maintained file must fail on a typo;
+// a control-plane document must survive a member this gateway does not know,
+// or every top-level addition becomes a gateway-before-api deployment.
+func TestTopLevelStrictnessFollowsTheSource(t *testing.T) {
+	withScopes := `{"generation":1,"serviceEnabled":true,` +
+		`"scopes":[{"id":"ws-7","limits":{"rpm":100}}],` +
+		`"models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],"keys":[]}`
+
+	// File: an unknown member is a typo and must be caught.
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	writeDoc(t, path, withScopes, time.Now())
+	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"mock"}}); err == nil {
+		t.Fatal("a hand-maintained file accepted an unknown top-level member")
+	}
+	// A real typo of a known member is caught for the same reason.
+	writeDoc(t, path, `{"generation":1,"serviceEnable":true,"models":[],"keys":[]}`, time.Now())
+	if _, err := OpenFile(path, discard(), Options{}); err == nil {
+		t.Fatal("a misspelled member was silently ignored in a file")
+	}
+
+	// Control plane: the same document must load, ignoring what it does not know.
+	cp := &controlPlane{doc: withScopes, gen: 1}
+	srv := httptest.NewServer(http.HandlerFunc(cp.serve))
+	defer srv.Close()
+	cache := filepath.Join(t.TempDir(), "snapshot.json")
+	src := NewHTTPSource(srv.URL, "tok", cache, 5*time.Second)
+	s, err := Open(context.Background(), src, cache, discard(), Options{
+		KnownUpstreams:          []string{"mock"},
+		TolerateUnknownTopLevel: true,
+	})
+	if err != nil {
+		t.Fatalf("a future top-level member froze authorization: %v", err)
+	}
+	if s.Generation() != 1 {
+		t.Fatalf("generation = %d", s.Generation())
+	}
+}

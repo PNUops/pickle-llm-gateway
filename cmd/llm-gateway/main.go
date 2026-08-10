@@ -45,6 +45,10 @@ func main() {
 	store, err := snapshot.Open(ctx, source, cfg.SnapshotPath, log, snapshot.Options{
 		KnownUpstreams:       cfg.UpstreamRefs(),
 		AllowGenerationReset: cfg.AllowGenerationReset,
+		// A hand-maintained file is held to the letter so a typo cannot pass;
+		// a document from the control plane may carry members a newer api
+		// added, and refusing it would stop revocations arriving.
+		TolerateUnknownTopLevel: cfg.SnapshotSource == config.SourceHTTP,
 	})
 	if err != nil {
 		log.Error("startup failed", "error", err)
