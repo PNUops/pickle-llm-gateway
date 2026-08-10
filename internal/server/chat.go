@@ -240,7 +240,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Try the model's upstream, then its fallback if it has one. Nothing has
 	// been written to the client yet, so switching upstreams here is invisible
 	// to the student; once the response starts, it is not.
-	resp, up, attemptErr := s.callUpstream(upCtx, model, params, outputCap)
+	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, params, outputCap)
 	ev.TtftMs = time.Since(start).Milliseconds()
 	if attemptErr != nil {
 		switch {
@@ -264,7 +264,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	_ = up
+	// Which upstream answered, and how many tries it took. The response's own
+	// model field is rewritten to the public name before the student sees it,
+	// so without this the accounting cannot tell a free local model from a
+	// paid fallback — and the two are billed to different people.
+	ev.UpstreamRef = up.Ref
+	ev.Attempts = attempts
 
 	// Body capture: only for a key that opted in, and only when the delivery
 	// channel exists — captured text is never written to this host's disk, so
@@ -275,8 +280,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			EventUUID:   ev.EventUUID,
 			KeyID:       key.KeyID,
 			RequestedAt: start,
-			Request:     append(json.RawMessage(nil), messagesRaw...),
 		}
+		capture.Request, capture.RequestTruncated = capRequest(messagesRaw)
 	}
 
 	if !streaming {
@@ -368,7 +373,7 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		contentChars = len(answer)
 	}
 	if capture != nil {
-		capture.Response, capture.Truncated = capString(answer)
+		capture.Response, capture.ResponseTruncated = capString(answer)
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -551,7 +556,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	s.settleUsage(ev, u, haveUsage, a.inputBytes, contentChars)
 	s.limiter.ChargeTokens(a.keyID, a.tpm, ev.InputTokens+ev.OutputTokens)
 	if a.capture != nil {
-		a.capture.Response, a.capture.Truncated = capString(answer.String())
+		a.capture.Response, a.capture.ResponseTruncated = capString(answer.String())
 		s.bodies.Offer(a.capture)
 		s.metrics.bodiesCaptured.Add(1)
 	}
@@ -561,15 +566,36 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 // capString bounds one captured answer. A cut record says so rather than
 // looking like a short answer.
 func capString(s string) (string, bool) {
-	if len(s) <= bodies.ResponseCapBytes {
+	return capAt(s, bodies.ResponseCapBytes)
+}
+
+func capAt(s string, limit int) (string, bool) {
+	if len(s) <= limit {
 		return s, false
 	}
 	// Cut on a rune boundary so the stored text stays valid UTF-8.
-	cut := bodies.ResponseCapBytes
+	cut := limit
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
 	return s[:cut], true
+}
+
+// capRequest bounds the captured prompt. Under the cap it stays the messages
+// array the student sent. Over it, the array cannot be cut and still parse, so
+// the record carries a JSON string holding the prefix instead and says so —
+// losing the structure is better than losing the whole prompt, and far better
+// than carrying two megabytes per record through a queue.
+func capRequest(raw json.RawMessage) (json.RawMessage, bool) {
+	if len(raw) <= bodies.RequestCapBytes {
+		return append(json.RawMessage(nil), raw...), false
+	}
+	prefix, _ := capAt(string(raw), bodies.RequestCapBytes)
+	encoded, err := json.Marshal(prefix)
+	if err != nil {
+		return nil, true
+	}
+	return encoded, true
 }
 
 // chunk is one parsed and rewritten SSE payload.

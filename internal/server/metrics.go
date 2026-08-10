@@ -56,6 +56,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"maxInFlight":       s.cfg.MaxInFlight,
 		"generation":        s.store.Generation(),
 		"reloadFailures":    s.store.ReloadFailures(),
+		"rejectedEntries":   s.store.RejectedEntries(),
+		"bodiesDropped":     s.bodies.Dropped(),
 		"requestsByStatus":  s.metrics.statusMap(),
 		"inputTokens":       s.metrics.inputTokens.Load(),
 		"outputTokens":      s.metrics.outputTokens.Load(),

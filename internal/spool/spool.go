@@ -34,17 +34,25 @@ type Event struct {
 	// Generation is the snapshot generation in force for this request, so a
 	// later reader can tell which model mapping and limits applied — needed
 	// because the public model name is stable across upstream-model swaps.
-	Generation      int64     `json:"generation,omitempty"`
-	KeyID           string    `json:"keyId,omitempty"`
-	PublicModelName string    `json:"publicModelName,omitempty"`
-	Status          string    `json:"status"`
-	ErrorType       string    `json:"errorType,omitempty"`
-	InputTokens     int       `json:"inputTokens"`
-	OutputTokens    int       `json:"outputTokens"`
-	Estimated       bool      `json:"estimated,omitempty"`
-	LatencyMs       int64     `json:"latencyMs"`
-	TtftMs          int64     `json:"ttftMs,omitempty"`
-	RequestedAt     time.Time `json:"requestedAt"`
+	Generation      int64  `json:"generation,omitempty"`
+	KeyID           string `json:"keyId,omitempty"`
+	PublicModelName string `json:"publicModelName,omitempty"`
+	// UpstreamRef names the upstream that actually served the request, and
+	// Attempts how many tries it took. The public model name deliberately hides
+	// which server answered, so without these a fallback to a second upstream —
+	// a different model, often a paid one — is indistinguishable in the
+	// accounting from the ordinary path. It cannot be reconstructed later
+	// either: nothing else records it.
+	UpstreamRef  string    `json:"upstreamRef,omitempty"`
+	Attempts     int       `json:"attempts,omitempty"`
+	Status       string    `json:"status"`
+	ErrorType    string    `json:"errorType,omitempty"`
+	InputTokens  int       `json:"inputTokens"`
+	OutputTokens int       `json:"outputTokens"`
+	Estimated    bool      `json:"estimated,omitempty"`
+	LatencyMs    int64     `json:"latencyMs"`
+	TtftMs       int64     `json:"ttftMs,omitempty"`
+	RequestedAt  time.Time `json:"requestedAt"`
 }
 
 // Writer appends events to a per-day file (usage-YYYYMMDD.jsonl, UTC) in the

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/version"
@@ -84,13 +85,81 @@ func (s *FileSource) Accept() {
 
 // --- control-plane source ----------------------------------------------------
 
-// SyncRequest is what the gateway reports on every poll. It is deliberately
-// small: the control plane decides everything, and anything the gateway says
-// about itself is a claim, not a measurement.
+// SyncRequest is what the gateway reports on every poll. The control plane
+// decides everything and anything the gateway says about itself is a claim,
+// not a measurement — but the claims matter, because this is the only channel
+// that carries them. The api never calls the gateway, so a fact that is not on
+// this request does not reach the control plane at all.
+//
+// AppliedGeneration standing still is the symptom of every silent freeze, and
+// on its own it does not say why. The rest of these fields are the why.
 type SyncRequest struct {
-	AppliedGeneration int64  `json:"appliedGeneration"`
-	AgentVersion      string `json:"agentVersion,omitempty"`
-	InFlight          int    `json:"inFlight,omitempty"`
+	AppliedGeneration int64 `json:"appliedGeneration"`
+	// SupportedFormat is the highest document format this build understands.
+	// Serving a format above it is what a lockstep deploy would look like, so
+	// the writer is told the reader's ceiling instead of having to assume it.
+	SupportedFormat int    `json:"supportedFormat"`
+	AgentVersion    string `json:"agentVersion,omitempty"`
+	// StartedAt marks this process. A value that moved since the last poll is
+	// a restart, which is otherwise invisible to the control plane.
+	StartedAt time.Time `json:"startedAt,omitzero"`
+	InFlight  int       `json:"inFlight"`
+	// MaxInFlight is the denominator for InFlight; without it a load figure
+	// cannot be read as anything.
+	MaxInFlight int `json:"maxInFlight,omitempty"`
+	// UpstreamRefs are the upstreams this host has configured. A model naming
+	// anything else is dropped on load, so the writer can check a name before
+	// it is stored rather than discovering it as a dropped entry.
+	UpstreamRefs []string `json:"upstreamRefs,omitempty"`
+	// RejectedEntries counts entries of the applied document this build could
+	// not act on: the gateway is enforcing less than the document describes.
+	RejectedEntries int `json:"rejectedEntries,omitempty"`
+	// ReloadFailures and LastError describe a document that is not being
+	// applied at all — the case where the served state is quietly going stale.
+	ReloadFailures    int64  `json:"reloadFailures,omitempty"`
+	LastError         string `json:"lastError,omitempty"`
+	BodiesDropped     int64  `json:"bodiesDropped,omitempty"`
+	UsageShipFailures int64  `json:"usageShipFailures,omitempty"`
+}
+
+// SyncGauges are the live numbers the poll reports. They come from components
+// the snapshot package does not own (the request server, the reporter, the
+// body sink), so they arrive through one closure set at startup rather than by
+// threading dependencies through the store.
+type SyncGauges struct {
+	InFlight          int
+	MaxInFlight       int
+	UpstreamRefs      []string
+	RejectedEntries   int
+	ReloadFailures    int64
+	LastError         string
+	BodiesDropped     int64
+	UsageShipFailures int64
+	StartedAt         time.Time
+}
+
+// maxReportedError bounds LastError. The text is a Go error string, so it is
+// short by construction; the bound exists because it crosses a trust boundary
+// into somebody else's log and database column.
+const maxReportedError = 500
+
+// sanitizeReported makes an error string safe to hand to another service:
+// control characters out (they corrupt logs and terminals), length bounded.
+func sanitizeReported(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		b.WriteRune(r)
+		if b.Len() >= maxReportedError {
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // HTTPSource fetches the document from the control plane. The response is
@@ -112,9 +181,9 @@ type HTTPSource struct {
 	// refuses (a rollback, an unconfigured upstream) become what a later
 	// restart loads — and then the gateway would refuse to start at all.
 	pending []byte
-	// inFlight reports the gateway's current concurrent requests; nil until
-	// the server is wired, and never load-bearing.
-	inFlight  func() int
+	// gauges reports what the gateway can say about itself; nil until the rest
+	// of the process is wired, and never load-bearing.
+	gauges    func() SyncGauges
 	delivered bool
 }
 
@@ -129,8 +198,9 @@ func NewHTTPSource(baseURL, token, cachePath string, timeout time.Duration) *HTT
 	}
 }
 
-// SetInFlight supplies the in-flight gauge reported on each poll.
-func (s *HTTPSource) SetInFlight(f func() int) { s.inFlight = f }
+// SetGauges supplies the self-report attached to each poll. It is set after
+// the store exists, so the very first load reports nothing but the generation.
+func (s *HTTPSource) SetGauges(f func() SyncGauges) { s.gauges = f }
 
 // Accept caches the document the caller just applied, so a restart while the
 // control plane is unreachable comes up on a document that was known good.
@@ -169,9 +239,22 @@ func (s *HTTPSource) Load(ctx context.Context, served int64) ([]byte, bool, erro
 }
 
 func (s *HTTPSource) fetch(ctx context.Context, served int64) ([]byte, bool, error) {
-	req := SyncRequest{AppliedGeneration: served, AgentVersion: version.String()}
-	if s.inFlight != nil {
-		req.InFlight = s.inFlight()
+	req := SyncRequest{
+		AppliedGeneration: served,
+		SupportedFormat:   SupportedFormat,
+		AgentVersion:      version.String(),
+	}
+	if s.gauges != nil {
+		g := s.gauges()
+		req.InFlight = g.InFlight
+		req.MaxInFlight = g.MaxInFlight
+		req.UpstreamRefs = g.UpstreamRefs
+		req.RejectedEntries = g.RejectedEntries
+		req.ReloadFailures = g.ReloadFailures
+		req.LastError = sanitizeReported(g.LastError)
+		req.BodiesDropped = g.BodiesDropped
+		req.UsageShipFailures = g.UsageShipFailures
+		req.StartedAt = g.StartedAt
 	}
 	body, err := json.Marshal(req)
 	if err != nil {

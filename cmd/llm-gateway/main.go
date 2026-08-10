@@ -25,6 +25,7 @@ import (
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	startedAt := time.Now()
 
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -48,7 +49,7 @@ func main() {
 		// A hand-maintained file is held to the letter so a typo cannot pass;
 		// a document from the control plane may carry members a newer api
 		// added, and refusing it would stop revocations arriving.
-		TolerateUnknownTopLevel: cfg.SnapshotSource == config.SourceHTTP,
+		FromControlPlane: cfg.SnapshotSource == config.SourceHTTP,
 	})
 	if err != nil {
 		log.Error("startup failed", "error", err)
@@ -60,10 +61,32 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
+	// Declared here so the sync self-report can read them; both stay nil when
+	// the corresponding channel is off.
+	var rep *reporter.Reporter
+	var sink *bodies.Sink
 	if controlSource != nil {
-		// The control plane sees the gateway's live load on every poll; the
-		// gauge is a claim, never something the server acts on.
-		controlSource.SetInFlight(srv.InFlight)
+		// The api never calls the gateway, so the poll is the only channel
+		// carrying what the gateway can say about itself. Everything here is a
+		// claim the control plane may display but must not act on.
+		controlSource.SetGauges(func() snapshot.SyncGauges {
+			g := snapshot.SyncGauges{
+				InFlight:        srv.InFlight(),
+				MaxInFlight:     cfg.MaxInFlight,
+				UpstreamRefs:    cfg.UpstreamRefs(),
+				RejectedEntries: store.RejectedEntries(),
+				ReloadFailures:  store.ReloadFailures(),
+				LastError:       store.LastError(),
+				StartedAt:       startedAt,
+			}
+			if sink != nil {
+				g.BodiesDropped = sink.Dropped()
+			}
+			if rep != nil {
+				g.UsageShipFailures = rep.ShipFailures()
+			}
+			return g
+		})
 	}
 
 	hs := &http.Server{
@@ -107,7 +130,7 @@ func main() {
 	// host's disk, so without delivery there is nowhere for it to go and
 	// nothing is captured. Individual keys still have to opt in.
 	if cfg.BodyCapture {
-		sink := bodies.New(cfg.ControlBaseURL, cfg.ControlToken,
+		sink = bodies.New(cfg.ControlBaseURL, cfg.ControlToken,
 			cfg.BodyQueueSize, cfg.BodyBatchSize, cfg.ControlTimeout, log)
 		srv.SetBodySink(sink)
 		go sink.Run(ctx)
@@ -119,7 +142,7 @@ func main() {
 	// already accumulated.
 	var shipped func(day string) bool
 	if cfg.UsagePush {
-		rep := reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
+		rep = reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
 			cfg.UsageBatchSize, cfg.ControlTimeout, log)
 		go rep.Run(ctx, cfg.UsagePushInterval)
 		// Retention must not delete a day the reporter never confirmed: with

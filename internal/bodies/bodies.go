@@ -23,6 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/version"
@@ -40,9 +41,28 @@ type Record struct {
 	// Response is the assistant text, assembled from the stream when the
 	// answer was streamed.
 	Response string `json:"response,omitempty"`
-	// Truncated marks a record whose response hit the capture cap.
-	Truncated bool `json:"truncated,omitempty"`
+	// RequestTruncated and ResponseTruncated say which side hit its cap. One
+	// flag for both would leave a reader unable to tell a cut prompt from a
+	// cut answer, and the two mean different things to whoever reads the
+	// record later.
+	//
+	// A truncated request cannot stay a messages array — cutting JSON mid-way
+	// produces something no parser will take — so it becomes a JSON string
+	// holding the prefix. The field is therefore "the messages array, or a
+	// string when RequestTruncated is set".
+	RequestTruncated  bool `json:"requestTruncated,omitempty"`
+	ResponseTruncated bool `json:"responseTruncated,omitempty"`
 }
+
+// size estimates what this record costs in memory and on the wire. Used to
+// bound the queue and the batch by bytes rather than by count: the records
+// vary by three orders of magnitude, so a count bounds nothing.
+func (r *Record) size() int {
+	return len(r.Request) + len(r.Response) + recordOverheadBytes
+}
+
+// recordOverheadBytes covers the ids, timestamp and JSON punctuation.
+const recordOverheadBytes = 256
 
 // Sink accepts records and ships them. A nil Sink is a working "capture
 // disabled" value: every method is safe to call on it.
@@ -53,19 +73,36 @@ type Sink struct {
 	client *http.Client
 	log    *slog.Logger
 	batch  int
+	// queuedBytes bounds the channel by size as well as by depth. Depth alone
+	// is not a bound: a queue of records that are each at their cap holds two
+	// orders of magnitude more memory than a queue of ordinary ones, and this
+	// process shares a small LXC with nothing to spare.
+	queuedBytes atomic.Int64
+	maxBytes    int64
+	dropped     atomic.Int64
 }
 
 // New builds a sink with a bounded queue. queueSize bounds the memory this
 // channel can hold; beyond it, records are dropped with a log line.
 func New(baseURL, token string, queueSize, batch int, timeout time.Duration, log *slog.Logger) *Sink {
 	return &Sink{
-		queue:  make(chan Record, queueSize),
-		url:    baseURL + "/internal/llm/bodies",
-		token:  token,
-		client: &http.Client{Timeout: timeout},
-		log:    log,
-		batch:  batch,
+		queue:    make(chan Record, queueSize),
+		url:      baseURL + "/internal/llm/bodies",
+		token:    token,
+		client:   &http.Client{Timeout: timeout},
+		log:      log,
+		batch:    batch,
+		maxBytes: int64(queueSize) * (RequestCapBytes + ResponseCapBytes + recordOverheadBytes) / 8,
 	}
+}
+
+// Dropped is how many records were discarded because the queue was full or a
+// delivery failed. Nil (capture off) has nothing to drop.
+func (s *Sink) Dropped() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.dropped.Load()
 }
 
 // Enabled reports whether capture should happen at all.
@@ -79,9 +116,17 @@ func (s *Sink) Offer(r *Record) {
 	if s == nil || r == nil {
 		return
 	}
+	size := int64(r.size())
+	if s.queuedBytes.Load()+size > s.maxBytes {
+		s.dropped.Add(1)
+		s.log.Warn("body capture queue over its memory bound, dropping a record", "keyId", r.KeyID)
+		return
+	}
 	select {
 	case s.queue <- *r:
+		s.queuedBytes.Add(size)
 	default:
+		s.dropped.Add(1)
 		s.log.Warn("body capture queue full, dropping a record", "keyId", r.KeyID)
 	}
 }
@@ -96,6 +141,7 @@ func (s *Sink) Run(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	pending := make([]Record, 0, s.batch)
+	pendingBytes := 0
 	flush := func() {
 		if len(pending) == 0 {
 			return
@@ -103,16 +149,23 @@ func (s *Sink) Run(ctx context.Context) {
 		if err := s.post(ctx, pending); err != nil && ctx.Err() == nil {
 			s.log.Error("body capture delivery failed, records dropped",
 				"count", len(pending), "error", err)
+			s.dropped.Add(int64(len(pending)))
 		}
 		pending = pending[:0]
+		pendingBytes = 0
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case r := <-s.queue:
+			s.queuedBytes.Add(-int64(r.size()))
 			pending = append(pending, r)
-			if len(pending) >= s.batch {
+			pendingBytes += r.size()
+			// Two bounds, because either one alone leaves a bad case: many
+			// small records make a batch the receiver would rather have split,
+			// and a handful of capped ones make one it would refuse outright.
+			if len(pending) >= s.batch || pendingBytes >= BatchCapBytes {
 				flush()
 			}
 		case <-ticker.C:
@@ -149,6 +202,17 @@ func (s *Sink) post(ctx context.Context, records []Record) error {
 	return nil
 }
 
-// ResponseCapBytes bounds how much assistant text one record carries. Long
-// answers are cut with Truncated set rather than held whole in memory.
-const ResponseCapBytes = 256 << 10
+const (
+	// ResponseCapBytes bounds how much assistant text one record carries. Long
+	// answers are cut, with ResponseTruncated set, rather than held whole in
+	// memory.
+	ResponseCapBytes = 256 << 10
+	// RequestCapBytes bounds the captured prompt the same way. Without it the
+	// only bound is the request-body limit, two megabytes, which multiplied by
+	// a full queue is more memory than this host has.
+	RequestCapBytes = 64 << 10
+	// BatchCapBytes bounds one delivery. It is deliberately well under any
+	// sane request-size limit on the receiving side: a batch refused for being
+	// too large is not retried, so the text would simply be lost.
+	BatchCapBytes = 4 << 20
+)
