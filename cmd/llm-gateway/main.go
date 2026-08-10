@@ -16,6 +16,7 @@ import (
 
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
+	"github.com/pnuops/pickle-llm-gateway/internal/reporter"
 	"github.com/pnuops/pickle-llm-gateway/internal/server"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
@@ -95,6 +96,15 @@ func main() {
 			}
 		}
 	}()
+
+	// Usage reporting: walk the spool and ship batches to the control plane.
+	// The spool is written regardless, so enabling this later ships what
+	// already accumulated.
+	if cfg.UsagePush {
+		rep := reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
+			cfg.UsageBatchSize, cfg.ControlTimeout, log)
+		go rep.Run(ctx, cfg.UsagePushInterval)
+	}
 
 	// Usage-spool retention: prune once at startup and daily thereafter.
 	go func() {

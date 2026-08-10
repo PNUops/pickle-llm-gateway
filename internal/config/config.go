@@ -62,6 +62,13 @@ type Config struct {
 	// Old day-files are deleted once past it; 0 disables pruning.
 	SpoolRetentionDays int
 
+	// UsagePush ships spooled usage events to the control plane. Off by
+	// default: the spool is written either way, so turning this on later loses
+	// nothing that happened before.
+	UsagePush         bool
+	UsageBatchSize    int
+	UsagePushInterval time.Duration
+
 	// AllowGenerationReset lets the snapshot load a document whose generation
 	// is below the persisted high-water (an operator deliberately resetting the
 	// sequence). Off by default so a restored old snapshot fails closed.
@@ -105,6 +112,8 @@ func FromEnv() (*Config, error) {
 		DefaultTpm:         20000,
 		DefaultConcurrency: 2,
 		SpoolRetentionDays: 90,
+		UsageBatchSize:     500,
+		UsagePushInterval:  30 * time.Second,
 		Upstreams:          map[string]Upstream{},
 	}
 
@@ -162,6 +171,7 @@ func FromEnv() (*Config, error) {
 	}{
 		{"SNAPSHOT_POLL_INTERVAL", &cfg.SnapshotPollInterval},
 		{"CONTROL_TIMEOUT", &cfg.ControlTimeout},
+		{"USAGE_PUSH_INTERVAL", &cfg.UsagePushInterval},
 		{"UPSTREAM_HEADER_WAIT", &cfg.UpstreamHeaderWait},
 		{"REQUEST_MAX_DURATION", &cfg.RequestMaxDuration},
 	} {
@@ -176,6 +186,22 @@ func FromEnv() (*Config, error) {
 	}
 	if v := getenv("ALLOW_GENERATION_RESET", ""); v == "1" || strings.EqualFold(v, "true") {
 		cfg.AllowGenerationReset = true
+	}
+	if v := getenv("USAGE_PUSH", ""); v == "on" || v == "1" || strings.EqualFold(v, "true") {
+		cfg.UsagePush = true
+		// Shipping needs somewhere to ship to, whichever way the document
+		// arrives — an operator may push usage while still editing the
+		// document by hand.
+		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
+		need("CONTROL_TOKEN", cfg.ControlToken)
+	}
+	if v := getenv("USAGE_BATCH_SIZE", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			errs = append(errs, envPrefix+"USAGE_BATCH_SIZE must be a positive integer")
+		} else {
+			cfg.UsageBatchSize = n
+		}
 	}
 	if v := getenv("REQUEST_BODY_MAX_BYTES", ""); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
