@@ -13,7 +13,16 @@ if [ -f go.mod ]; then
   fi
   go vet ./...
   go build ./...
-  go test ./...
+  # The race detector needs cgo (a C compiler). Use it wherever one is present
+  # — notably CI, which is where concurrent-access regressions are cheapest to
+  # catch — and fall back to a plain run on hosts without a compiler.
+  cc=$(go env CC)
+  if command -v "$cc" >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
+    CGO_ENABLED=1 go test -race ./...
+  else
+    echo "note: no C compiler found; running tests without -race" >&2
+    go test ./...
+  fi
 fi
 # Publication hygiene: no references to paths this repository does not contain,
 # none to a private tree or a vault, no internal process tokens. Enforced here because two manual scrubs
