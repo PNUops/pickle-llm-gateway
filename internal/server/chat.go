@@ -164,19 +164,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Output length: a JSON null is what SDKs send for "unset" and is treated
-	// as absent; an explicit value above the model cap is refused; no value at
-	// all gets the cap injected (field name per upstream — see config.CapField)
-	// so the upstream enforces it.
+	// Output length. A JSON null is what SDKs send for "unset" and is treated
+	// as absent; an explicit value above the model cap is refused. Whatever the
+	// student sent (on either OpenAI field) is normalized onto the upstream's
+	// configured cap field and capped at the model maximum, so the limit lands
+	// on the field the upstream actually honors — forwarding the student's
+	// field verbatim would let a legacy `max_tokens`-only server ignore a
+	// `max_completion_tokens` request and blow past the cap.
 	if model.MaxOutputTokens > 0 {
-		seen := false
+		effectiveCap := model.MaxOutputTokens
 		for _, f := range []string{"max_completion_tokens", "max_tokens"} {
 			raw, ok := params[f]
 			if !ok {
 				continue
 			}
+			delete(params, f) // re-added below on up.CapField
 			if string(bytes.TrimSpace(raw)) == "null" {
-				delete(params, f)
 				continue
 			}
 			var n int
@@ -188,11 +191,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				refuse(errOutputTooLong, spool.StatusBadRequest)
 				return
 			}
-			seen = true
+			if n < effectiveCap {
+				effectiveCap = n
+			}
 		}
-		if !seen {
-			params[up.CapField] = json.RawMessage(strconv.Itoa(model.MaxOutputTokens))
-		}
+		params[up.CapField] = json.RawMessage(strconv.Itoa(effectiveCap))
 	}
 	// Input length: token counting needs the model's tokenizer, which the
 	// gateway does not have. This guard only refuses what cannot possibly
@@ -317,6 +320,11 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 			ev.Status = spool.StatusUpstreamErr
 			ev.ErrorType = "upstream_read_failed"
 		}
+		// The upstream may have generated tokens before the read failed; charge
+		// an input-side estimate so a client looping large failing requests is
+		// still rate-limited rather than metered as free.
+		s.settleUsage(ev, usage{}, false, inputBytes, 0)
+		s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
 		record()
 		return
 	}
@@ -430,6 +438,15 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		}
 		c, ok := rewriteChunk(payload, a.publicName)
 		if !ok {
+			// Not valid JSON. A payload that does not even open an object is a
+			// heartbeat/keepalive (`ping`) with nothing structured to leak —
+			// forward it verbatim. One that looks like a truncated object is
+			// dropped rather than risk leaking a partial upstream identifier,
+			// and the answer is now incomplete, so the request is marked
+			// degraded below.
+			if len(payload) == 0 || payload[0] != '{' {
+				return writeRaw(append(append([]byte("data: "), payload...), '\n', '\n'))
+			}
 			dropped++
 			return true
 		}
@@ -484,20 +501,34 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		s.log.Warn("dropped unparseable stream chunks", "keyId", a.keyID, "count", dropped)
 	}
 
+	// A stream that ends without the upstream's own [DONE] (deadline or an
+	// interrupted read) gets a terminal error event plus [DONE] so the client
+	// can tell a truncated answer from a complete one, rather than guessing
+	// from a missing terminator.
+	emitStreamError := func(code, msg string) {
+		writeRaw([]byte(`data: {"error":{"message":"` + msg + `","type":"upstream_error","code":"` + code + `"}}` + "\n\n"))
+		writeRaw([]byte("data: [DONE]\n\n"))
+	}
 	switch {
 	case writeFailed || a.clientCtx.Err() != nil:
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
 	case errors.Is(readErr, context.DeadlineExceeded) || errors.Is(a.upCtx.Err(), context.DeadlineExceeded):
-		// The gateway's own duration cap, not an upstream fault. The client
-		// is told so before the stream closes.
+		// The gateway's own duration cap, not an upstream fault.
 		ev.Status = spool.StatusTimeout
 		ev.ErrorType = "request_deadline_exceeded"
-		writeRaw([]byte(`data: {"error":{"message":"요청 전체 시간 상한을 초과해 스트림을 종료했습니다.","type":"upstream_error","code":"request_deadline_exceeded"}}` + "\n\n"))
-		writeRaw([]byte("data: [DONE]\n\n"))
+		emitStreamError("request_deadline_exceeded", "요청 전체 시간 상한을 초과해 스트림을 종료했습니다.")
 	case readErr != nil:
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_interrupted"
+		emitStreamError("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.")
+	case dropped > 0:
+		// The stream reached its end, but some chunks could not be forwarded,
+		// so the answer the student received is incomplete. The upstream's
+		// [DONE] already went out, so this cannot be signalled inline anymore;
+		// record it as degraded rather than let it read as a clean success.
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = "upstream_chunk_unreadable"
 	default:
 		ev.Status = spool.StatusOK
 	}
