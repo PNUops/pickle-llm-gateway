@@ -87,8 +87,12 @@ func (h *upstreamHealth) recordSuccess(ref string) {
 // failure and falling back to the model's secondary upstream if it has one.
 // This can only be done before anything reaches the client, which is why it
 // lives entirely ahead of the response-writing paths.
+// The returned count is how many upstream attempts were made, including the
+// one that succeeded: 1 is the ordinary path and anything above it means the
+// request cost more than it looks like it did.
 func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
-	params map[string]json.RawMessage, outputCap int) (*http.Response, config.Upstream, *attemptError) {
+	params map[string]json.RawMessage, outputCap int) (*http.Response, config.Upstream, int, *attemptError) {
+	attempts := 0
 
 	refs := []string{model.UpstreamRef}
 	if model.FallbackRef != "" && !strings.EqualFold(model.FallbackRef, model.UpstreamRef) {
@@ -122,22 +126,23 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 		}
 		body, err := s.bodyFor(params, up, outputCap)
 		if err != nil {
-			return nil, up, &attemptError{err: err}
+			return nil, up, attempts, &attemptError{err: err}
 		}
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
+			attempts++
 			resp, ae := s.attempt(ctx, up, body)
 			if ae == nil {
 				s.health.recordSuccess(ref)
-				return resp, up, nil
+				return resp, up, attempts, nil
 			}
 			last = ae
 			if ae.refusal != nil {
 				// The upstream understood and refused: another upstream would
 				// refuse the same request, and a retry would only repeat it.
-				return nil, up, ae
+				return nil, up, attempts, ae
 			}
 			if ctx.Err() != nil {
-				return nil, up, ae
+				return nil, up, attempts, ae
 			}
 			if ae.throttled {
 				// Same upstream, immediately again, is exactly what it asked
@@ -166,7 +171,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 	if last == nil {
 		last = &attemptError{err: errUnconfiguredUpstream}
 	}
-	return nil, config.Upstream{}, last
+	return nil, config.Upstream{}, attempts, last
 }
 
 // bodyFor renders the request for one upstream, injecting the output cap on

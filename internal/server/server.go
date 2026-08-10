@@ -97,6 +97,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if failures > 0 {
 		body["status"] = "degraded"
 		body["reloadFailures"] = failures
+		body["lastError"] = s.store.LastError()
+	}
+	// Dropped entries are a different failure from a stuck reload: the document
+	// loaded, and the gateway is enforcing less than it says. Nothing else on
+	// this host would show it.
+	if dropped := s.store.RejectedEntries(); dropped > 0 {
+		body["status"] = "degraded"
+		body["rejectedEntries"] = dropped
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writeJSON(w, body)

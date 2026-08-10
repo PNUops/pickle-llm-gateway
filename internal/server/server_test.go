@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
@@ -1305,6 +1306,17 @@ func TestUpstreamFallback(t *testing.T) {
 	if !bytes.Contains(body, []byte(`"model":"pnu-general"`)) {
 		t.Fatalf("fallback answer leaked its own model name: %s", body)
 	}
+	// That hiding is exactly why the event has to say which upstream answered:
+	// the two are different models, often billed to different people, and
+	// nothing else on this host records the difference.
+	events := h.spoolEvents(t)
+	last := events[len(events)-1]
+	if last.UpstreamRef != "backup" {
+		t.Fatalf("event says upstreamRef=%q, want the upstream that actually served it", last.UpstreamRef)
+	}
+	if last.Attempts != 2 {
+		t.Fatalf("attempts = %d, want both tries counted", last.Attempts)
+	}
 }
 
 func TestUpstreamRefusalIsNotRetriedOrFailedOver(t *testing.T) {
@@ -1429,5 +1441,46 @@ func TestUpstreamThrottleIsNotRetriedAndSaysBusy(t *testing.T) {
 	mu.Unlock()
 	if got != 1 {
 		t.Fatalf("a throttling upstream was called %d times", got)
+	}
+}
+
+// The captured prompt has its own cap. Without one the only bound is the
+// request-body limit, and a queue of records at that size is more memory than
+// this host has. A cut prompt cannot stay a messages array — cutting JSON
+// mid-way produces something no parser takes — so it arrives as a string and
+// says so.
+func TestBodyCaptureCapsTheRequest(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Keys[0].RecordBodies = true
+	}, func(c *config.Config) {
+		c.RequestBodyMaxBytes = 4 << 20
+	})
+	cb := h.withBodyCapture(t)
+
+	long := strings.Repeat("가", bodies.RequestCapBytes) // multi-byte on purpose
+	body := `{"model":"pnu-general","messages":[{"role":"user","content":"` + long + `"}]}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("chat failed: %d %s", status, resp)
+	}
+	recs := waitForRecords(t, cb, 1)
+	if len(recs) != 1 {
+		t.Fatalf("captured %d records", len(recs))
+	}
+	r := recs[0]
+	if !r.RequestTruncated {
+		t.Fatal("an oversized prompt was captured whole")
+	}
+	if len(r.Request) > bodies.RequestCapBytes+64 {
+		t.Fatalf("captured request is %d bytes, over the cap", len(r.Request))
+	}
+	var asString string
+	if err := json.Unmarshal(r.Request, &asString); err != nil {
+		t.Fatalf("a truncated request must still be valid JSON: %v", err)
+	}
+	if !utf8.ValidString(asString) {
+		t.Fatal("the cut landed inside a rune")
+	}
+	if r.ResponseTruncated {
+		t.Fatal("the response flag fired for a truncated request")
 	}
 }
