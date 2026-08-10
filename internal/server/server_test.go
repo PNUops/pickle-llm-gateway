@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -175,7 +176,7 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 	}
 	h.writeSnapshot(t, doc)
 
-	store, err := snapshot.Open(h.snapPath, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
+	store, err := snapshot.OpenFile(h.snapPath, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +586,7 @@ func TestSnapshotReloadRevokesKey(t *testing.T) {
 	doc.Generation = 2
 	doc.Keys[0].Status = snapshot.KeyRevoked
 	h.writeSnapshot(t, doc)
-	h.store.Refresh()
+	h.store.Refresh(context.Background())
 	status, body := h.chat(t, testToken, chatBody)
 	if status != 401 || errCode(t, body) != "api_key_revoked" {
 		t.Fatalf("got %d %s", status, body)
@@ -956,14 +957,14 @@ func TestForwardCompatNestedUnknownField(t *testing.T) {
 	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := snapshot.Open(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}}); err != nil {
+	if _, err := snapshot.OpenFile(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}}); err != nil {
 		t.Fatalf("nested unknown field rejected: %v", err)
 	}
 	bad := `{"generation":1,"serviceEnabled":true,"models":[],"keys":[],"unknownTopLevel":1}`
 	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := snapshot.Open(path, slog.New(slog.DiscardHandler), snapshot.Options{}); err == nil {
+	if _, err := snapshot.OpenFile(path, slog.New(slog.DiscardHandler), snapshot.Options{}); err == nil {
 		t.Fatal("unknown top-level field accepted")
 	}
 }

@@ -29,7 +29,18 @@ func main() {
 		log.Error("startup failed", "error", err)
 		os.Exit(1)
 	}
-	store, err := snapshot.Open(cfg.SnapshotPath, log, snapshot.Options{
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var source snapshot.Source
+	var controlSource *snapshot.HTTPSource
+	if cfg.SnapshotSource == config.SourceHTTP {
+		controlSource = snapshot.NewHTTPSource(cfg.ControlBaseURL, cfg.ControlToken, cfg.SnapshotPath, cfg.ControlTimeout)
+		source = controlSource
+	} else {
+		source = snapshot.NewFileSource(cfg.SnapshotPath)
+	}
+	store, err := snapshot.Open(ctx, source, cfg.SnapshotPath, log, snapshot.Options{
 		KnownUpstreams:       cfg.UpstreamRefs(),
 		AllowGenerationReset: cfg.AllowGenerationReset,
 	})
@@ -43,6 +54,11 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
+	if controlSource != nil {
+		// The control plane sees the gateway's live load on every poll; the
+		// gauge is a claim, never something the server acts on.
+		controlSource.SetInFlight(srv.InFlight)
+	}
 
 	hs := &http.Server{
 		Addr:              cfg.Listen,
@@ -55,22 +71,27 @@ func main() {
 		ReadTimeout: 30 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 
 	go func() {
 		t := time.NewTicker(cfg.SnapshotPollInterval)
 		defer t.Stop()
+		refresh := func() {
+			// Bound one poll so a hung control plane cannot stall the loop past
+			// the next tick.
+			pollCtx, cancel := context.WithTimeout(ctx, cfg.ControlTimeout)
+			defer cancel()
+			store.Refresh(pollCtx)
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				store.Refresh()
+				refresh()
 			case <-hup:
-				store.Refresh()
+				refresh()
 			}
 		}
 	}()

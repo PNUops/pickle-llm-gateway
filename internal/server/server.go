@@ -49,6 +49,11 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 	}
 }
 
+// InFlight reports how many requests are occupying a gateway-wide slot right
+// now. It is a gauge for the control-plane handshake and the health surface;
+// nothing acts on it.
+func (s *Server) InFlight() int { return len(s.inFlight) }
+
 // Handler builds the route table.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()

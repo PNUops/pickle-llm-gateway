@@ -27,11 +27,25 @@ type Upstream struct {
 	CapField string
 }
 
+// SnapshotSource names where the authorization document comes from.
+const (
+	SourceFile = "file" // a local document an operator maintains
+	SourceHTTP = "http" // the control plane (pickle-api) serves it
+)
+
 // Config is everything the daemon needs to run.
 type Config struct {
 	Listen       string // address for the public-facing HTTP listener
-	SnapshotPath string // authorization state document
+	SnapshotPath string // authorization document (or, on http, its local cache)
 	SpoolDir     string // usage event spool directory
+
+	// SnapshotSource selects the document transport. The default stays "file"
+	// so enabling the control plane is a deliberate act, not a consequence of
+	// upgrading the binary.
+	SnapshotSource string
+	ControlBaseURL string        // control-plane root, e.g. http://172.30.1.20:8080
+	ControlToken   string        // bearer for the internal link
+	ControlTimeout time.Duration // per-poll deadline
 
 	SnapshotPollInterval time.Duration
 	RequestBodyMaxBytes  int64
@@ -74,6 +88,10 @@ func FromEnv() (*Config, error) {
 		Listen:               getenv("LISTEN", ""),
 		SnapshotPath:         getenv("SNAPSHOT_PATH", ""),
 		SpoolDir:             getenv("SPOOL_DIR", ""),
+		SnapshotSource:       getenv("SNAPSHOT_SOURCE", SourceFile),
+		ControlBaseURL:       strings.TrimRight(getenv("CONTROL_BASE_URL", ""), "/"),
+		ControlToken:         getenv("CONTROL_TOKEN", ""),
+		ControlTimeout:       10 * time.Second,
 		SnapshotPollInterval: 5 * time.Second,
 		RequestBodyMaxBytes:  2 << 20,
 		UpstreamHeaderWait:   60 * time.Second,
@@ -99,6 +117,18 @@ func FromEnv() (*Config, error) {
 	need("LISTEN", cfg.Listen)
 	need("SNAPSHOT_PATH", cfg.SnapshotPath)
 	need("SPOOL_DIR", cfg.SpoolDir)
+
+	switch cfg.SnapshotSource {
+	case SourceFile:
+	case SourceHTTP:
+		// The control plane decides who gets through, so an unset endpoint or
+		// token must stop the gateway rather than silently fall back to a file
+		// that may be stale or absent.
+		need("CONTROL_BASE_URL", cfg.ControlBaseURL)
+		need("CONTROL_TOKEN", cfg.ControlToken)
+	default:
+		errs = append(errs, envPrefix+"SNAPSHOT_SOURCE must be "+SourceFile+" or "+SourceHTTP)
+	}
 
 	for _, opt := range []struct {
 		name string
@@ -131,6 +161,7 @@ func FromEnv() (*Config, error) {
 		dst  *time.Duration
 	}{
 		{"SNAPSHOT_POLL_INTERVAL", &cfg.SnapshotPollInterval},
+		{"CONTROL_TIMEOUT", &cfg.ControlTimeout},
 		{"UPSTREAM_HEADER_WAIT", &cfg.UpstreamHeaderWait},
 		{"REQUEST_MAX_DURATION", &cfg.RequestMaxDuration},
 	} {

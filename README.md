@@ -48,7 +48,10 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 각 응답은 `X-Request-Id` 헤더로 그 요청의 기록 식별자를 돌려주므로 문의에 인용할 수
 있습니다. `/healthz`는 세대·스냅샷 나이·리로드 정체 여부를 함께 반환합니다.
 
-현재는 로컬 파일을 폴링합니다. HTTP 동기화는 아직 제공하지 않습니다.
+문서는 두 곳에서 올 수 있습니다. 기본값은 운영자가 관리하는 **로컬 파일**이고,
+`LLMGW_SNAPSHOT_SOURCE=http`로 두면 **관리 API에서 받아옵니다**. 관리 API 모드에서는 마지막
+문서를 로컬에 캐시해 두므로, 관리 API가 닿지 않는 동안 재시작해도 마지막 상태로 기동합니다.
+문서 형식은 두 경우가 같습니다.
 
 요청 처리는 이렇게 흐릅니다. Authorization 헤더의 Key를 sha256으로 해시해 스냅샷에서
 찾고, 한도를 확인한 뒤 요청 본문의 모델명을 실제 모델로 바꿔 업스트림에 전달합니다.
@@ -104,7 +107,7 @@ go run ./cmd/llm-gateway
 | 환경 변수 | 필수 | 설명 |
 |---|---|---|
 | `LLMGW_LISTEN` | ✔ | 수신 주소 (`127.0.0.1:8081`) |
-| `LLMGW_SNAPSHOT_PATH` | ✔ | 스냅샷 문서 경로 |
+| `LLMGW_SNAPSHOT_PATH` | ✔ | 스냅샷 문서 경로 (관리 API 모드에서는 받은 문서를 저장하는 캐시 경로) |
 | `LLMGW_SPOOL_DIR` | ✔ | 사용량 기록 디렉터리 |
 | `LLMGW_UPSTREAM_<REF>_BASE_URL` | ✔ | 업스트림 주소. `<REF>`는 스냅샷의 `upstreamRef`와 대소문자 무관하게 대응 |
 | `LLMGW_UPSTREAM_<REF>_API_KEY` | | 업스트림 인증 토큰. 비우면 인증 없이 호출 |
@@ -115,6 +118,10 @@ go run ./cmd/llm-gateway
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
+| `LLMGW_SNAPSHOT_SOURCE` | `file` | 스냅샷을 어디서 받을지. `file`(로컬 문서) 또는 `http`(관리 API) |
+| `LLMGW_CONTROL_BASE_URL` | | `http` 모드에서 관리 API 주소. 필수 |
+| `LLMGW_CONTROL_TOKEN` | | `http` 모드에서 관리 API 인증 토큰. 필수 |
+| `LLMGW_CONTROL_TIMEOUT` | `10s` | 동기화 한 번의 시간 상한 |
 | `LLMGW_SNAPSHOT_POLL_INTERVAL` | `5s` | 스냅샷 변경 확인 주기 |
 | `LLMGW_REQUEST_BODY_MAX_BYTES` | `2097152` | 요청 본문 크기 상한 |
 | `LLMGW_UPSTREAM_HEADER_WAIT` | `60s` | 업스트림 응답 시작 대기 상한 |
