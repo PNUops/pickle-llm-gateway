@@ -92,8 +92,26 @@ func New(baseURL, token string, queueSize, batch int, timeout time.Duration, log
 		client:   &http.Client{Timeout: timeout},
 		log:      log,
 		batch:    batch,
-		maxBytes: int64(queueSize) * (RequestCapBytes + ResponseCapBytes + recordOverheadBytes) / 8,
+		maxBytes: queueBytes(queueSize),
 	}
+}
+
+// queueBytes turns a queue depth into a memory bound. The eighth is because
+// records are nothing like their cap in practice — an ordinary prompt and
+// answer are a few kilobytes, not three hundred — so sizing for the worst case
+// would reserve two orders of magnitude more than the queue ever holds.
+//
+// The floor is what stops a small depth from meaning "capture nothing": below
+// about eight, an eighth of the worst case is less than one maximal record, so
+// every large record would be dropped on arrival, forever, with only a warning
+// per request to say so. A small depth has to mean "few records", never "no
+// records".
+func queueBytes(depth int) int64 {
+	const maxRecord = RequestCapBytes + ResponseCapBytes + recordOverheadBytes
+	if n := int64(depth) * maxRecord / 8; n > maxRecord {
+		return n
+	}
+	return maxRecord
 }
 
 // Dropped is how many records were discarded because the queue was full or a
@@ -196,7 +214,10 @@ func (s *Sink) post(ctx context.Context, records []Record) error {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	// Any 2xx is acceptance; see the same reasoning in the reporter. Here the
+	// cost of getting it wrong is worse — a failed body batch is dropped, not
+	// retried, so a 201 would silently discard captured text.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("control plane returned HTTP %d", resp.StatusCode)
 	}
 	return nil

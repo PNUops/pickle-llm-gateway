@@ -247,6 +247,17 @@ func (r *Reporter) shipFile(ctx context.Context, path, day string, offset int64)
 			batchEnd = pos
 			continue
 		}
+		// A line that is not valid JSON cannot be an event this package wrote:
+		// a full disk truncates a write mid-line, and the next append lands
+		// after it. Sending it would make the api refuse the whole batch as
+		// malformed — which is a batch fault, so the gateway skips it and up to
+		// 500 good events go with the one bad line.
+		if !json.Valid(trimmed) {
+			r.log.Error("skipping an unparseable spool line (a truncated write?)",
+				"day", day, "bytes", len(trimmed))
+			batchEnd = pos
+			continue
+		}
 		batch = append(batch, json.RawMessage(trimmed))
 		batchEnd = pos
 		if len(batch) >= r.batchSize {
@@ -321,7 +332,11 @@ func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	// Any 2xx is acceptance. Narrowing this to 200 and 202 would make a
+	// handler that answers 201 or 204 — an ordinary thing for a framework to
+	// do — look like a failure, and the channel would retry the same batch
+	// forever while the control plane happily stored it every time.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &postError{
 			status: resp.StatusCode,
 			msg:    fmt.Sprintf("reporter: control plane returned HTTP %d", resp.StatusCode),

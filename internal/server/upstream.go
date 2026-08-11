@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -150,10 +151,18 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 				break
 			}
 			if ae.timeout {
-				// A completion is not idempotent and the upstream may well be
-				// generating right now — it accepted the POST and is simply
-				// slow. Repeating it bills a second generation and doubles the
-				// student's wait for an answer they will not get twice.
+				// Do not send this again to *this* upstream. A completion is
+				// not idempotent and it may well be generating right now — it
+				// accepted the POST and is simply slow — so repeating it bills
+				// a second generation for an answer nobody will read twice.
+				//
+				// Falling through to the model's fallback is a different
+				// matter and is deliberate: from the student's side a timed-out
+				// upstream is a down upstream, which is exactly what the
+				// fallback exists for. It costs one generation on the second
+				// upstream while the first may still be producing one, so the
+				// event records which upstream answered and how many attempts
+				// it took — see the spool schema.
 				break
 			}
 			if s.health.recordFailure(ref) {
@@ -212,7 +221,7 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte) (
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	s.log.Warn("upstream refused request", "status", resp.StatusCode,
-		"upstreamRef", up.Ref, "detail", string(detail))
+		"upstreamRef", up.Ref, "detail", upstreamReason(detail))
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		// The request itself is wrong; no other upstream will like it better.
@@ -230,4 +239,26 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte) (
 	default:
 		return nil, &attemptError{err: errUpstreamStatus}
 	}
+}
+
+// upstreamReason reduces an upstream's error body to the part that is safe to
+// keep. The body is the upstream's, not ours, and a provider rejecting a
+// request routinely quotes the offending part of it back — which on this
+// service is a student's prompt. The service records counters, not text, so
+// the free-form message must not land in the journal by way of an error path.
+//
+// An OpenAI-shaped body has the two fields worth having; anything else is
+// reported by its shape alone.
+func upstreamReason(detail []byte) string {
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+			Code any    `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(detail, &body); err == nil && (body.Error.Type != "" || body.Error.Code != nil) {
+		code, _ := body.Error.Code.(string)
+		return strings.TrimSpace(body.Error.Type + " " + code)
+	}
+	return fmt.Sprintf("unparseable body, %d bytes", len(detail))
 }

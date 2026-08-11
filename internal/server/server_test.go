@@ -297,9 +297,17 @@ func errCode(t *testing.T, body []byte) string {
 // chatStatus is a goroutine-safe variant of chat that returns the status code
 // (or -1 on transport error) without calling t.Fatal off the test goroutine.
 func (h *harness) chatStatus(token, body string) int {
+	status, _ := h.chatRaw(token, body)
+	return status
+}
+
+// chatRaw is chatStatus with the body kept, for the concurrent tests that
+// cannot call t.Fatal on their goroutine but still need to know *which*
+// refusal they got.
+func (h *harness) chatRaw(token, body string) (int, []byte) {
 	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
-		return -1
+		return -1, nil
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -307,11 +315,11 @@ func (h *harness) chatStatus(token, body string) int {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return -1
+		return -1, nil
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw
 }
 
 func (h *harness) spoolEvents(t *testing.T) []spool.Event {
@@ -476,7 +484,17 @@ func TestSpoolNeverCarriesContent(t *testing.T) {
 	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
 		t.Fatal("request failed")
 	}
+	// The absence assertions below are only worth anything if something was
+	// written: a spool that silently stopped being written satisfies "contains
+	// no prompt text" trivially, and would make this test *more* likely to
+	// pass, not less.
+	if evs := h.spoolEvents(t); len(evs) != 1 {
+		t.Fatalf("spool holds %d events, want 1 — an empty spool passes every check below for the wrong reason", len(evs))
+	}
 	files, _ := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
+	if len(files) == 0 {
+		t.Fatal("no spool file was written")
+	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
@@ -575,24 +593,42 @@ func TestRpmLimit(t *testing.T) {
 	}
 }
 
+// The status alone does not distinguish this from the requests-per-minute
+// limit: a regression that collapsed the two would still answer 429.
 func TestConcurrencyLimit(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.Keys[0].Limits.Concurrency = 1
 	}, nil)
 	h.mock.set(func(u *mockOpts) { u.delay = 400 * time.Millisecond })
 
-	// Status codes only, collected off the test goroutine (no t.Fatal there).
-	results := make(chan int, 2)
+	// Status and code, collected off the test goroutine (no t.Fatal there).
+	type result struct {
+		status int
+		code   string
+	}
+	results := make(chan result, 2)
 	for range 2 {
-		go func() { results <- h.chatStatus(testToken, chatBody) }()
+		go func() {
+			status, body := h.chatRaw(testToken, chatBody)
+			var e struct {
+				Error struct{ Code string } `json:"error"`
+			}
+			_ = json.Unmarshal(body, &e)
+			results <- result{status, e.Error.Code}
+		}()
 		time.Sleep(50 * time.Millisecond)
 	}
 	a, b := <-results, <-results
-	if a > b {
+	if a.status > b.status {
 		a, b = b, a
 	}
-	if a != 200 || b != 429 {
-		t.Fatalf("got %d and %d, want 200 and 429", a, b)
+	if a.status != 200 || b.status != 429 {
+		t.Fatalf("got %d and %d, want 200 and 429", a.status, b.status)
+	}
+	// Which limit refused it matters: a regression that folded the per-key
+	// concurrency check into the requests-per-minute one answers 429 too.
+	if b.code != "rate_limit_concurrency" {
+		t.Fatalf("refused with %q, want rate_limit_concurrency", b.code)
 	}
 }
 
@@ -987,6 +1023,10 @@ func TestRestrictedModelHiddenAndDenied(t *testing.T) {
 	}
 }
 
+// Tolerating an unknown field inside an entry is only worth something if the
+// entry still works. Proving Open did not error says nothing: a build that
+// started dropping such entries would still open cleanly, and the key it
+// describes would stop working.
 func TestForwardCompatNestedUnknownField(t *testing.T) {
 	// An unknown field inside keys[] must be ignored (forward compatibility for
 	// the future api sync), while an unknown TOP-LEVEL field still fails.
@@ -999,8 +1039,23 @@ func TestForwardCompatNestedUnknownField(t *testing.T) {
 	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := snapshot.OpenFile(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}}); err != nil {
+	store, err := snapshot.OpenFile(path, slog.New(slog.DiscardHandler), snapshot.Options{KnownUpstreams: []string{"mock"}})
+	if err != nil {
 		t.Fatalf("nested unknown field rejected: %v", err)
+	}
+	// Loading is not the point — enforcing is. An entry carrying a field this
+	// build does not know must still authorize, and the model must still
+	// resolve; silently dropping either would leave Open succeeding and the
+	// key dead.
+	_, byHash, byName := store.Current()
+	if byHash(hash) == nil {
+		t.Fatal("a key carrying an unknown field loaded but no longer authorizes")
+	}
+	if byName("pnu-general") == nil {
+		t.Fatal("a model carrying an unknown field loaded but no longer resolves")
+	}
+	if store.RejectedEntries() != 0 {
+		t.Fatalf("%d entries were dropped for carrying a field this build does not know", store.RejectedEntries())
 	}
 	bad := `{"generation":1,"serviceEnabled":true,"models":[],"keys":[],"unknownTopLevel":1}`
 	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
@@ -1084,6 +1139,8 @@ func TestModelRetrieve(t *testing.T) {
 	}
 }
 
+// The catalogue is checked exhaustively by TestEveryAPIErrorIsWellFormed; this
+// one proves the type survives the round trip to the wire.
 func TestErrorTypesAreOpenAISet(t *testing.T) {
 	valid := map[string]bool{
 		"invalid_request_error": true, "authentication_error": true,
@@ -1238,7 +1295,17 @@ func TestNoCaptureWithoutChannel(t *testing.T) {
 	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
 		t.Fatal("request failed")
 	}
+	// Same trap as above, and worse here: this test's whole claim is "nothing
+	// was recorded", so a spool that stopped being written satisfies it for
+	// free. Prove the request was metered before proving the text was not.
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].Status != spool.StatusOK {
+		t.Fatalf("spool holds %d events (%v) — the absence check below would pass vacuously", len(evs), evs)
+	}
 	files, _ := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
+	if len(files) == 0 {
+		t.Fatal("no spool file was written")
+	}
 	for _, f := range files {
 		raw, _ := os.ReadFile(f)
 		if bytes.Contains(raw, []byte("MARKER-PROMPT-CONTENT")) {
@@ -1447,7 +1514,6 @@ func TestTimeoutIsNotRetried(t *testing.T) {
 func TestUpstreamThrottleIsNotRetriedAndSaysBusy(t *testing.T) {
 	var calls int
 	var mu sync.Mutex
-	h := newHarness(t, nil, func(c *config.Config) { c.UpstreamRetries = 2 })
 	throttling := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		calls++
@@ -1455,7 +1521,15 @@ func TestUpstreamThrottleIsNotRetriedAndSaysBusy(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer throttling.Close()
-	h.srv.cfg.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: throttling.URL, CapField: "max_completion_tokens"}
+	// Configured before the server exists, like every other test here. Writing
+	// to cfg.Upstreams after the server is live is a map write against readers
+	// that are already serving — safe only while the test happens to be
+	// sequential, and something the race detector would flag the moment it is
+	// not.
+	h := newHarness(t, nil, func(c *config.Config) {
+		c.UpstreamRetries = 2
+		c.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: throttling.URL, CapField: "max_completion_tokens"}
+	})
 
 	status, body := h.chat(t, testToken, chatBody)
 	if status != 503 || errCode(t, body) != "server_busy" {
@@ -1607,5 +1681,304 @@ func TestTokenLimitIsChargedFromTheRequestPath(t *testing.T) {
 	}
 	if code := errCode(t, body); code != "rate_limit_tokens" {
 		t.Fatalf("refused with %q, want rate_limit_tokens", code)
+	}
+}
+
+// A timed-out upstream must not be sent the same completion again — it may be
+// generating right now, and a second one is billed for an answer nobody reads
+// twice. Falling through to the model's fallback is deliberate and different:
+// from the student's side a timed-out upstream is a down upstream.
+func TestTimeoutFallsBackWithoutReissuingToTheSameUpstream(t *testing.T) {
+	var fbCalls int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fbCalls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"fb","object":"chat.completion","model":"other","choices":[{"index":0,"message":{"role":"assistant","content":"fallback"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer fb.Close()
+
+	var slowCalls int
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		slowCalls++
+		mu.Unlock()
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models[0].FallbackRef = "backup"
+	}, func(c *config.Config) {
+		c.UpstreamRetries = 2
+		c.UpstreamHeaderWait = 80 * time.Millisecond
+		c.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: slow.URL, CapField: "max_completion_tokens"}
+		c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+	})
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("the fallback did not answer a timed-out primary: %d %s", status, body)
+	}
+	mu.Lock()
+	sc, fc := slowCalls, fbCalls
+	mu.Unlock()
+	if sc != 1 {
+		t.Fatalf("the timed-out upstream was sent the completion %d times, want exactly 1", sc)
+	}
+	if fc != 1 {
+		t.Fatalf("the fallback was called %d times, want exactly 1", fc)
+	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "backup" || last.Attempts != 2 {
+		t.Fatalf("event does not record the real cost: upstreamRef=%q attempts=%d", last.UpstreamRef, last.Attempts)
+	}
+}
+
+// A model may declare no output maximum — the field is optional and the
+// control plane need not set it. The student's cap must still be moved onto
+// the field the upstream honors, or a legacy `max_tokens`-only server ignores
+// a `max_completion_tokens` request and generates without a limit, billed.
+func TestCapFieldIsNormalizedEvenWithoutAModelMaximum(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models[0].MaxOutputTokens = 0
+	}, func(c *config.Config) {
+		c.Upstreams["mock"] = config.Upstream{
+			Ref: "mock", BaseURL: c.Upstreams["mock"].BaseURL,
+			APIKey: upstreamCred, CapField: "max_tokens", // legacy-only server
+		}
+	})
+	body := `{"model":"pnu-general","max_completion_tokens":50,"messages":[{"role":"user","content":"hi"}]}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("status %d: %s", status, resp)
+	}
+	sent, _ := h.mock.last()
+	if _, ok := sent["max_completion_tokens"]; ok {
+		t.Fatal("the student's field went upstream verbatim; this server ignores it and would generate unbounded")
+	}
+	var got int
+	raw, ok := sent["max_tokens"]
+	if !ok {
+		t.Fatalf("no cap reached the upstream at all: %v", sent)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || got != 50 {
+		t.Fatalf("max_tokens = %s, want 50", raw)
+	}
+}
+
+// With no model maximum and no request cap, nothing is injected — the gateway
+// does not invent a limit the document did not set.
+func TestNoCapIsInjectedWhenNeitherSideSetsOne(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Models[0].MaxOutputTokens = 0 }, nil)
+	if status, resp := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("status %d: %s", status, resp)
+	}
+	sent, _ := h.mock.last()
+	for _, f := range []string{"max_tokens", "max_completion_tokens"} {
+		if _, ok := sent[f]; ok {
+			t.Fatalf("gateway invented a %s the document never set", f)
+		}
+	}
+}
+
+// allAPIErrors is every static error this package can answer with. A table
+// here beats triggering one error and checking it: the previous test named the
+// whole catalogue and exercised a single member, so any of the other twenty
+// could have carried a wrong type, a 200 status or an empty code.
+func allAPIErrors() map[string]apiError {
+	return map[string]apiError{
+		"errMissingKey": errMissingKey, "errInvalidKey": errInvalidKey,
+		"errKeyExpired": errKeyExpired, "errKeyRevoked": errKeyRevoked,
+		"errKeySuspended": errKeySuspended, "errQuotaExhausted": errQuotaExhausted,
+		"errRateRequests": errRateRequests, "errRateTokens": errRateTokens,
+		"errRateConcurrency": errRateConcurrency, "errServiceDisabled": errServiceDisabled,
+		"errModelNotFound": errModelNotFound, "errModelNotAllowed": errModelNotAllowed,
+		"errOutputTooLong": errOutputTooLong, "errInputTooLong": errInputTooLong,
+		"errRequestTooLarge": errRequestTooLarge, "errBadJSON": errBadJSON,
+		"errUpstream": errUpstream, "errUpstreamTimeout": errUpstreamTimeout,
+		"errUpstreamRejected": errUpstreamRejected,
+		"errServerBusy":       errServerBusy, "errNotFound": errNotFound,
+		"errMethod":               errMethod,
+		"errUnsupportedParam(x)":  errUnsupportedParam("x"),
+		"errInvalidParamValue(x)": errInvalidParamValue("x"),
+		"errMissingParam(x)":      errMissingParam("x"),
+	}
+}
+
+// Every error the student can see has to be well formed, not just the one a
+// test happens to trigger. The type set is OpenAI's because their SDKs branch
+// on it; the code is ours and has to be unique, or a client cannot tell two
+// refusals apart.
+func TestEveryAPIErrorIsWellFormed(t *testing.T) {
+	// The same set the single-error test used, kept in one place now.
+	okTypes := map[string]bool{
+		"invalid_request_error": true, "authentication_error": true,
+		"permission_error": true, "rate_limit_error": true, "server_error": true,
+	}
+	seenCode := map[string]string{}
+	for name, e := range allAPIErrors() {
+		if !okTypes[e.typ] {
+			t.Errorf("%s: type %q is outside the OpenAI set; SDKs branch on this", name, e.typ)
+		}
+		if e.status < 400 || e.status > 599 {
+			t.Errorf("%s: status %d is not an error status", name, e.status)
+		}
+		if e.code == "" {
+			t.Errorf("%s: empty code", name)
+		}
+		if e.message == "" {
+			t.Errorf("%s: empty message", name)
+		}
+		if prev, dup := seenCode[e.code]; dup {
+			t.Errorf("%s and %s share the code %q; a client cannot tell them apart", name, prev, e.code)
+		}
+		seenCode[e.code] = name
+		// Nothing here may leak where the gateway sends requests or what it
+		// authenticates with — the message is the one part a student sees.
+		// "Bearer" on its own is fine and deliberate: the missing-key message
+		// tells the student what header to send.
+		for _, leak := range []string{"http://", "https://", "sk-", "172.30.", "127.0.0.1", "openai", "gpt-"} {
+			if strings.Contains(strings.ToLower(e.message), leak) {
+				t.Errorf("%s: message carries %q", name, leak)
+			}
+		}
+	}
+}
+
+// The envelope shape is what every OpenAI SDK parses. A missing member or a
+// wrong content type breaks error handling in client code we do not control.
+func TestErrorEnvelopeShape(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeAPIError(rec, errModelNotFound)
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Fatalf("content type = %q", ct)
+	}
+	var body map[string]map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	inner, ok := body["error"]
+	if !ok || len(body) != 1 {
+		t.Fatalf("envelope is not a single error member: %s", rec.Body)
+	}
+	for _, k := range []string{"message", "type", "code"} {
+		if v, ok := inner[k]; !ok || v == "" {
+			t.Fatalf("error object missing %q: %s", k, rec.Body)
+		}
+	}
+	if rec.Code != errModelNotFound.status {
+		t.Fatalf("status %d, want %d", rec.Code, errModelNotFound.status)
+	}
+}
+
+// A client that hangs up mid-stream must still be metered, and must give back
+// the slots it took. Neither is visible from the client side, which is why
+// nothing caught it: the request simply ends.
+func TestClientDisconnectMidStreamIsMeteredAndReleasesSlots(t *testing.T) {
+	h := newHarness(t, nil, func(c *config.Config) {
+		c.DefaultConcurrency = 1 // so a leaked slot blocks the next request
+	})
+	h.mock.set(func(u *mockOpts) { u.chunkDelay = 120 * time.Millisecond })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.gw.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	_, _ = resp.Body.Read(buf) // wait until the stream has started
+	cancel()
+	resp.Body.Close()
+
+	// The handler finishes asynchronously; wait for its event.
+	var ev spool.Event
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		evs := h.spoolEvents(t)
+		if len(evs) == 1 {
+			ev = evs[0]
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ev.EventUUID == "" {
+		t.Fatal("a client that hung up mid-stream was never metered — the request was free")
+	}
+	if ev.Status != spool.StatusCanceled || ev.ErrorType != "client_disconnected" {
+		t.Fatalf("event = %s/%s, want CANCELED/client_disconnected", ev.Status, ev.ErrorType)
+	}
+	if ev.InputTokens <= 0 {
+		t.Fatalf("a canceled request was metered as %d input tokens", ev.InputTokens)
+	}
+	// The slots have to come back, or one abandoned stream permanently costs
+	// the key its concurrency.
+	h.mock.set(func(u *mockOpts) { u.chunkDelay = 0 })
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("the next request got %d — a slot was leaked by the disconnect: %s", status, body)
+	}
+}
+
+// One snapshot view per request is asserted only by a comment in the handler.
+// The race detector runs in CI; this gives it something to look at, and it
+// catches a nil map on the read side either way.
+func TestSnapshotSwapUnderLoad(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	doc := defaultDoc()
+
+	stop := make(chan struct{})
+	var swapper sync.WaitGroup
+	swapper.Add(1)
+	go func() {
+		defer swapper.Done()
+		for gen := int64(2); ; gen++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			doc.Generation = gen
+			h.writeSnapshot(t, doc)
+			h.store.Refresh(t.Context())
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	bad := make(chan string, 32)
+	for range 24 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status := h.chatStatus(testToken, chatBody)
+			if status != 200 && status != 429 {
+				select {
+				case bad <- fmt.Sprintf("status %d", status):
+				default:
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	swapper.Wait()
+	close(bad)
+	for msg := range bad {
+		t.Fatalf("a request saw a torn or missing snapshot: %s", msg)
+	}
+	// Every event must name a generation that was actually published.
+	for _, ev := range h.spoolEvents(t) {
+		if ev.Generation < 1 {
+			t.Fatalf("event recorded generation %d", ev.Generation)
+		}
 	}
 }
