@@ -372,3 +372,107 @@ func TestTransientRefusalIsRetried(t *testing.T) {
 		}
 	}
 }
+
+// The checkpoint is read by the retention goroutine while the shipping
+// goroutine writes it. Two goroutines on one Go map is not a race you survive
+// — it is a fatal runtime error that kills the process with no defer, no
+// shutdown, nothing. This drives both sides at once.
+func TestCheckpointIsSafeForTheRetentionGoroutine(t *testing.T) {
+	dir := t.TempDir()
+	_, url := newIngest(t)
+	for _, day := range []string{"20260801", "20260802", "20260803"} {
+		ids := make([]string, 200)
+		for i := range ids {
+			ids[i] = day + "-" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+		}
+		writeEvents(t, dir, day, ids...)
+	}
+	r := New(dir, url, "tok", 5, 5*time.Second, discard())
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := r.ShippedThrough(); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	if _, err := r.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// A control plane that answers 404 or 401 is not refusing this batch — it is
+// telling us the route or the credential is wrong. Skipping the batch there
+// walks the checkpoint to the end of the spool and lets retention delete
+// everything; and since the api half of this link does not exist yet, 404 is
+// the first answer this code will ever get.
+func TestConfigurationFaultsDoNotDestroyTheSpool(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusInternalServerError} {
+		dir := t.TempDir()
+		is, url := newIngest(t)
+		writeEvents(t, dir, "20260810", "a", "b", "c")
+		r := New(dir, url, "tok", 1, 5*time.Second, discard())
+		is.setStatus(status)
+
+		if _, err := r.Flush(context.Background()); err == nil {
+			t.Fatalf("HTTP %d was treated as a batch fault; the events would be skipped and the file deleted", status)
+		}
+		if got := r.ShipFailures(); got != 0 {
+			t.Fatalf("HTTP %d counted as dropped batches (%d)", status, got)
+		}
+		offsets, err := r.ShippedThrough()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if off := offsets["20260810"]; off != 0 {
+			t.Fatalf("HTTP %d advanced the checkpoint to %d; retention would now delete unshipped events", status, off)
+		}
+
+		// And once the route exists, everything is still there.
+		is.setStatus(http.StatusOK)
+		sent, err := r.Flush(context.Background())
+		if err != nil || sent != 3 {
+			t.Fatalf("HTTP %d: after recovery sent=%d err=%v, want all three", status, sent, err)
+		}
+	}
+}
+
+// Retention asks the reporter whether a day is safe to delete. A day whose
+// first batch shipped and whose tail did not is in the checkpoint map, so
+// asking only "is this day known" would delete the events that never went.
+func TestFullyShippedIsFalseForAPartiallyShippedDay(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	writeEvents(t, dir, "20260810", "a", "b", "c", "d")
+	r := New(dir, url, "tok", 2, 5*time.Second, discard())
+
+	// First batch lands, the second fails: the day is half shipped.
+	is.setStatus(http.StatusOK)
+	if _, err := r.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !r.FullyShipped("20260810") {
+		t.Fatal("a fully shipped day was reported as unsafe to delete")
+	}
+	// New events arrive after the checkpoint; the day is no longer complete.
+	writeEvents(t, dir, "20260810", "e", "f")
+	if r.FullyShipped("20260810") {
+		t.Fatal("a day with unshipped events was reported as safe to delete")
+	}
+	if r.FullyShipped("20260811") {
+		t.Fatal("a day that was never shipped at all was reported as safe to delete")
+	}
+}

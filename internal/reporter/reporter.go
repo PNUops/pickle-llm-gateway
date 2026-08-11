@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,15 +51,22 @@ func (c *checkpoint) set(day string, offset int64) {
 	c.Offsets[day] = offset
 }
 
-// Reporter walks the spool and posts batches. One instance, one goroutine.
+// Reporter walks the spool and posts batches. Shipping runs in one goroutine,
+// but the checkpoint is also read by the retention goroutine — which is the
+// whole point of keeping it: retention must not delete a day the reporter
+// never confirmed. Two goroutines on one map is a fatal runtime error in Go,
+// not a data race you get to survive, so the checkpoint is behind a mutex.
 type Reporter struct {
-	dir        string
-	url        string
-	token      string
-	batchSize  int
-	client     *http.Client
-	log        *slog.Logger
-	ckptPath   string
+	dir       string
+	url       string
+	token     string
+	batchSize int
+	client    *http.Client
+	log       *slog.Logger
+	ckptPath  string
+	// mu guards ckpt and loadedCkpt against the retention goroutine's
+	// ShippedThrough. Held only around the map itself, never across a POST.
+	mu         sync.Mutex
 	ckpt       checkpoint
 	loadedCkpt bool
 
@@ -116,7 +124,10 @@ func (r *Reporter) Run(ctx context.Context, interval time.Duration) {
 // events went out. It stops at the first failure so the checkpoint never runs
 // ahead of what the control plane accepted.
 func (r *Reporter) Flush(ctx context.Context) (int, error) {
-	if err := r.loadCheckpoint(); err != nil {
+	r.mu.Lock()
+	err := r.loadCheckpoint()
+	r.mu.Unlock()
+	if err != nil {
 		return 0, err
 	}
 	files, err := filepath.Glob(filepath.Join(r.dir, "usage-*.jsonl"))
@@ -133,7 +144,7 @@ func (r *Reporter) Flush(ctx context.Context) (int, error) {
 			// stray name from stalling every real file behind it.
 			continue
 		}
-		sent, err := r.shipFile(ctx, path, day, r.ckpt.offsetOf(day))
+		sent, err := r.shipFile(ctx, path, day, r.offsetOf(day))
 		total += sent
 		if err != nil {
 			return total, err
@@ -145,12 +156,38 @@ func (r *Reporter) Flush(ctx context.Context) (int, error) {
 // ShippedThrough reports the day files that have been fully or partly shipped,
 // so retention can refuse to delete what was never reported.
 func (r *Reporter) ShippedThrough() (map[string]int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err := r.loadCheckpoint(); err != nil {
 		return nil, err
 	}
 	out := make(map[string]int64, len(r.ckpt.Offsets))
 	maps.Copy(out, r.ckpt.Offsets)
 	return out, nil
+}
+
+// FullyShipped reports whether every byte of a day's file has been confirmed
+// by the control plane. Retention asks this before deleting: an unreported day
+// file is the only copy of that usage.
+//
+// "Confirmed" has to mean the whole file. The checkpoint is a byte offset, so a
+// day whose first batch shipped and whose tail did not still has an entry —
+// treating presence in the map as "shipped" would delete the events that never
+// went, which is the failure this predicate exists to prevent.
+func (r *Reporter) FullyShipped(day string) bool {
+	offsets, err := r.ShippedThrough()
+	if err != nil {
+		return false // unknown: keep the file
+	}
+	off, ok := offsets[day]
+	if !ok {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(r.dir, "usage-"+day+".jsonl"))
+	if err != nil {
+		return false
+	}
+	return off >= fi.Size()
 }
 
 // shipFile posts the complete lines of one day file from offset onward.
@@ -194,8 +231,7 @@ func (r *Reporter) shipFile(ctx context.Context, path, day string, offset int64)
 			sent += len(batch)
 		}
 		batch = batch[:0]
-		r.ckpt.set(day, batchEnd)
-		return r.saveCheckpoint()
+		return r.commit(day, batchEnd)
 	}
 
 	for {
@@ -242,18 +278,30 @@ type postError struct {
 
 func (e *postError) Error() string { return e.msg }
 
-// permanent reports whether retrying this error could ever succeed. A 4xx is
-// the control plane saying the batch itself is the problem — except 408 and
-// 429, which are timing, not judgement.
+// batchFault lists the statuses that mean "this batch is the problem" — the
+// only ones worth skipping over, because re-sending the same bytes cannot
+// change the answer.
+//
+// The list is a whitelist rather than "any 4xx" on purpose. 401, 403, 404 and
+// 405 are configuration faults, not batch faults: a wrong bearer, or a route
+// the api does not serve yet. Treating those as permanent would advance the
+// checkpoint past every event on the box and let retention delete the files —
+// and since the api half of this link does not exist yet, 404 is the very
+// first answer this code will ever see.
+var batchFault = map[int]bool{
+	http.StatusBadRequest:            true, // malformed batch
+	http.StatusConflict:              true,
+	http.StatusRequestEntityTooLarge: true, // will be too large again
+	http.StatusUnprocessableEntity:   true,
+}
+
+// permanent reports whether retrying this error could ever succeed.
 func permanent(err error) bool {
 	var pe *postError
 	if !errors.As(err, &pe) {
 		return false
 	}
-	if pe.status == http.StatusRequestTimeout || pe.status == http.StatusTooManyRequests {
-		return false
-	}
-	return pe.status >= 400 && pe.status < 500
+	return batchFault[pe.status]
 }
 
 func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
@@ -282,6 +330,7 @@ func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
 	return nil
 }
 
+// loadCheckpoint reads the persisted offsets once. Callers hold r.mu.
 func (r *Reporter) loadCheckpoint() error {
 	if r.loadedCkpt {
 		return nil
@@ -304,6 +353,22 @@ func (r *Reporter) loadCheckpoint() error {
 	return nil
 }
 
+// offsetOf reads one day's shipped offset.
+func (r *Reporter) offsetOf(day string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ckpt.offsetOf(day)
+}
+
+// commit records how far a day has been shipped and persists it.
+func (r *Reporter) commit(day string, offset int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ckpt.set(day, offset)
+	return r.saveCheckpoint()
+}
+
+// saveCheckpoint writes the offsets out. Callers hold r.mu.
 func (r *Reporter) saveCheckpoint() error {
 	raw, err := json.Marshal(r.ckpt)
 	if err != nil {
