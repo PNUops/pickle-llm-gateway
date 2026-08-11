@@ -151,10 +151,18 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 				break
 			}
 			if ae.timeout {
-				// A completion is not idempotent and the upstream may well be
-				// generating right now — it accepted the POST and is simply
-				// slow. Repeating it bills a second generation and doubles the
-				// student's wait for an answer they will not get twice.
+				// Do not send this again to *this* upstream. A completion is
+				// not idempotent and it may well be generating right now — it
+				// accepted the POST and is simply slow — so repeating it bills
+				// a second generation for an answer nobody will read twice.
+				//
+				// Falling through to the model's fallback is a different
+				// matter and is deliberate: from the student's side a timed-out
+				// upstream is a down upstream, which is exactly what the
+				// fallback exists for. It costs one generation on the second
+				// upstream while the first may still be producing one, so the
+				// event records which upstream answered and how many attempts
+				// it took — see the spool schema.
 				break
 			}
 			if s.health.recordFailure(ref) {

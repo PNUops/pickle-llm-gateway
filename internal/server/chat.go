@@ -195,32 +195,42 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// on the field the upstream actually honors — forwarding the student's
 	// field verbatim would let a legacy `max_tokens`-only server ignore a
 	// `max_completion_tokens` request and blow past the cap.
+	// The normalization runs whether or not the model declares a maximum. A
+	// model with none is a valid document (the field is optional, and the
+	// control plane may simply not set it), and leaving the student's field
+	// untouched in that case puts it back exactly where it does not work: a
+	// legacy `max_tokens`-only upstream ignores `max_completion_tokens`, and
+	// the request the student thought they had bounded generates without a
+	// limit, billed.
 	outputCap := 0
-	if model.MaxOutputTokens > 0 {
-		effectiveCap := model.MaxOutputTokens
-		for _, f := range []string{"max_completion_tokens", "max_tokens"} {
-			raw, ok := params[f]
-			if !ok {
-				continue
-			}
-			delete(params, f) // re-added below on up.CapField
-			if string(bytes.TrimSpace(raw)) == "null" {
-				continue
-			}
-			var n int
-			if json.Unmarshal(raw, &n) != nil || n <= 0 {
-				refuse(errInvalidParamValue(f), spool.StatusBadRequest)
-				return
-			}
-			if n > model.MaxOutputTokens {
-				refuse(errOutputTooLong, spool.StatusBadRequest)
-				return
-			}
-			if n < effectiveCap {
-				effectiveCap = n
-			}
+	asked := 0
+	for _, f := range []string{"max_completion_tokens", "max_tokens"} {
+		raw, ok := params[f]
+		if !ok {
+			continue
 		}
-		outputCap = effectiveCap
+		delete(params, f) // re-added below on up.CapField
+		if string(bytes.TrimSpace(raw)) == "null" {
+			continue
+		}
+		var n int
+		if json.Unmarshal(raw, &n) != nil || n <= 0 {
+			refuse(errInvalidParamValue(f), spool.StatusBadRequest)
+			return
+		}
+		if model.MaxOutputTokens > 0 && n > model.MaxOutputTokens {
+			refuse(errOutputTooLong, spool.StatusBadRequest)
+			return
+		}
+		if asked == 0 || n < asked {
+			asked = n
+		}
+	}
+	switch {
+	case asked > 0:
+		outputCap = asked
+	case model.MaxOutputTokens > 0:
+		outputCap = model.MaxOutputTokens
 	}
 	// Input length: token counting needs the model's tokenizer, which the
 	// gateway does not have. This guard only refuses what cannot possibly

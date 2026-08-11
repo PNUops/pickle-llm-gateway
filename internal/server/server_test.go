@@ -476,7 +476,17 @@ func TestSpoolNeverCarriesContent(t *testing.T) {
 	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
 		t.Fatal("request failed")
 	}
+	// The absence assertions below are only worth anything if something was
+	// written: a spool that silently stopped being written satisfies "contains
+	// no prompt text" trivially, and would make this test *more* likely to
+	// pass, not less.
+	if evs := h.spoolEvents(t); len(evs) != 1 {
+		t.Fatalf("spool holds %d events, want 1 — an empty spool passes every check below for the wrong reason", len(evs))
+	}
 	files, _ := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
+	if len(files) == 0 {
+		t.Fatal("no spool file was written")
+	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
@@ -1238,7 +1248,17 @@ func TestNoCaptureWithoutChannel(t *testing.T) {
 	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
 		t.Fatal("request failed")
 	}
+	// Same trap as above, and worse here: this test's whole claim is "nothing
+	// was recorded", so a spool that stopped being written satisfies it for
+	// free. Prove the request was metered before proving the text was not.
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].Status != spool.StatusOK {
+		t.Fatalf("spool holds %d events (%v) — the absence check below would pass vacuously", len(evs), evs)
+	}
 	files, _ := filepath.Glob(filepath.Join(h.spoolDir, "usage-*.jsonl"))
+	if len(files) == 0 {
+		t.Fatal("no spool file was written")
+	}
 	for _, f := range files {
 		raw, _ := os.ReadFile(f)
 		if bytes.Contains(raw, []byte("MARKER-PROMPT-CONTENT")) {
@@ -1607,5 +1627,105 @@ func TestTokenLimitIsChargedFromTheRequestPath(t *testing.T) {
 	}
 	if code := errCode(t, body); code != "rate_limit_tokens" {
 		t.Fatalf("refused with %q, want rate_limit_tokens", code)
+	}
+}
+
+// A timed-out upstream must not be sent the same completion again — it may be
+// generating right now, and a second one is billed for an answer nobody reads
+// twice. Falling through to the model's fallback is deliberate and different:
+// from the student's side a timed-out upstream is a down upstream.
+func TestTimeoutFallsBackWithoutReissuingToTheSameUpstream(t *testing.T) {
+	var fbCalls int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fbCalls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"fb","object":"chat.completion","model":"other","choices":[{"index":0,"message":{"role":"assistant","content":"fallback"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer fb.Close()
+
+	var slowCalls int
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		slowCalls++
+		mu.Unlock()
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models[0].FallbackRef = "backup"
+	}, func(c *config.Config) {
+		c.UpstreamRetries = 2
+		c.UpstreamHeaderWait = 80 * time.Millisecond
+		c.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: slow.URL, CapField: "max_completion_tokens"}
+		c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+	})
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("the fallback did not answer a timed-out primary: %d %s", status, body)
+	}
+	mu.Lock()
+	sc, fc := slowCalls, fbCalls
+	mu.Unlock()
+	if sc != 1 {
+		t.Fatalf("the timed-out upstream was sent the completion %d times, want exactly 1", sc)
+	}
+	if fc != 1 {
+		t.Fatalf("the fallback was called %d times, want exactly 1", fc)
+	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "backup" || last.Attempts != 2 {
+		t.Fatalf("event does not record the real cost: upstreamRef=%q attempts=%d", last.UpstreamRef, last.Attempts)
+	}
+}
+
+// A model may declare no output maximum — the field is optional and the
+// control plane need not set it. The student's cap must still be moved onto
+// the field the upstream honors, or a legacy `max_tokens`-only server ignores
+// a `max_completion_tokens` request and generates without a limit, billed.
+func TestCapFieldIsNormalizedEvenWithoutAModelMaximum(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Models[0].MaxOutputTokens = 0
+	}, func(c *config.Config) {
+		c.Upstreams["mock"] = config.Upstream{
+			Ref: "mock", BaseURL: c.Upstreams["mock"].BaseURL,
+			APIKey: upstreamCred, CapField: "max_tokens", // legacy-only server
+		}
+	})
+	body := `{"model":"pnu-general","max_completion_tokens":50,"messages":[{"role":"user","content":"hi"}]}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("status %d: %s", status, resp)
+	}
+	sent, _ := h.mock.last()
+	if _, ok := sent["max_completion_tokens"]; ok {
+		t.Fatal("the student's field went upstream verbatim; this server ignores it and would generate unbounded")
+	}
+	var got int
+	raw, ok := sent["max_tokens"]
+	if !ok {
+		t.Fatalf("no cap reached the upstream at all: %v", sent)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || got != 50 {
+		t.Fatalf("max_tokens = %s, want 50", raw)
+	}
+}
+
+// With no model maximum and no request cap, nothing is injected — the gateway
+// does not invent a limit the document did not set.
+func TestNoCapIsInjectedWhenNeitherSideSetsOne(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) { d.Models[0].MaxOutputTokens = 0 }, nil)
+	if status, resp := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("status %d: %s", status, resp)
+	}
+	sent, _ := h.mock.last()
+	for _, f := range []string{"max_tokens", "max_completion_tokens"} {
+		if _, ok := sent[f]; ok {
+			t.Fatalf("gateway invented a %s the document never set", f)
+		}
 	}
 }
