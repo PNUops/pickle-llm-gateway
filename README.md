@@ -119,8 +119,25 @@ go run ./cmd/llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json \
   -expires-days 90 -rpm 20 -tpm 20000 -concurrency 2
 ```
 
-분실한 Key는 다시 조회할 수 없습니다. 스냅샷에서 해당 항목의 `status`를 `REVOKED`로
-바꾸고 새로 발급합니다.
+분실한 Key는 다시 조회할 수 없습니다. 폐기하고 새로 발급하세요.
+
+## 운영 조작
+
+문서를 손으로 고치지 마세요. 같은 도구가 잠금과 원자적 교체, 소유자 보존을 처리하며,
+세대 번호를 올려 게이트웨이가 다음 폴링에서 알아채게 합니다. 급할 때 편집기로 여는 것이
+바로 이 장치들을 전부 우회하는 경로입니다.
+
+```bash
+# Key 긴급 회수 — 항목은 남습니다. 그래야 "폐기된 Key"라고 답할 수 있습니다
+llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json -revoke key-1a2b3c
+
+# 서비스 점검 모드 — Key와 모델은 그대로 두고 모든 요청을 거부합니다
+llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json -service off
+llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json -service on
+```
+
+없는 keyId나 이미 폐기된 Key를 지정하면 실패하고 문서를 건드리지 않습니다. 오타가 조용히
+아무 일도 하지 않는 것보다 낫기 때문입니다.
 
 ## 시작하기
 
