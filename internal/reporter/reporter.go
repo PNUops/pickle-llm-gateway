@@ -321,7 +321,11 @@ func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	// Any 2xx is acceptance. Narrowing this to 200 and 202 would make a
+	// handler that answers 201 or 204 — an ordinary thing for a framework to
+	// do — look like a failure, and the channel would retry the same batch
+	// forever while the control plane happily stored it every time.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &postError{
 			status: resp.StatusCode,
 			msg:    fmt.Sprintf("reporter: control plane returned HTTP %d", resp.StatusCode),

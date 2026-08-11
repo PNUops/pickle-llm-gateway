@@ -29,7 +29,7 @@ func (s *ingestServer) handler(w http.ResponseWriter, r *http.Request) {
 	s.auth = r.Header.Get("Authorization")
 	status := s.status
 	s.mu.Unlock()
-	if status != 0 && status != http.StatusOK {
+	if status != 0 && (status < 200 || status >= 300) {
 		w.WriteHeader(status)
 		return
 	}
@@ -51,6 +51,10 @@ func (s *ingestServer) handler(w http.ResponseWriter, r *http.Request) {
 		s.received = append(s.received, ev.EventUUID)
 	}
 	s.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -474,5 +478,25 @@ func TestFullyShippedIsFalseForAPartiallyShippedDay(t *testing.T) {
 	}
 	if r.FullyShipped("20260811") {
 		t.Fatal("a day that was never shipped at all was reported as safe to delete")
+	}
+}
+
+// A framework answering 201 or 204 is an ordinary thing. Reading only 200 and
+// 202 as success would make the control plane store every batch and the
+// gateway retry it forever, on a five-minute ceiling, silently.
+func TestAnyTwoHundredIsAcceptance(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent} {
+		dir := t.TempDir()
+		is, url := newIngest(t)
+		writeEvents(t, dir, "20260810", "a")
+		is.setStatus(status)
+		r := New(dir, url, "tok", 500, 5*time.Second, discard())
+		if _, err := r.Flush(context.Background()); err != nil {
+			t.Fatalf("HTTP %d was read as a failure: %v", status, err)
+		}
+		offsets, _ := r.ShippedThrough()
+		if offsets["20260810"] == 0 {
+			t.Fatalf("HTTP %d did not advance the checkpoint; the batch would be sent forever", status)
+		}
 	}
 }

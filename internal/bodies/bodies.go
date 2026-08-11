@@ -196,7 +196,10 @@ func (s *Sink) post(ctx context.Context, records []Record) error {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	// Any 2xx is acceptance; see the same reasoning in the reporter. Here the
+	// cost of getting it wrong is worse — a failed body batch is dropped, not
+	// retried, so a 201 would silently discard captured text.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("control plane returned HTTP %d", resp.StatusCode)
 	}
 	return nil
