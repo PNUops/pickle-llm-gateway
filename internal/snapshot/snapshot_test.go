@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -194,5 +196,71 @@ func TestHighWaterRefusesRollbackAcrossRestart(t *testing.T) {
 	// The override lets it through.
 	if _, err := OpenFile(path, discard(), Options{AllowGenerationReset: true}); err != nil {
 		t.Fatalf("override did not permit the reset: %v", err)
+	}
+}
+
+// A document with no models and no keys is not "an empty campus" — through a
+// file it can only be truncation, and applying it revokes everyone at once
+// while every failure signal stays at zero. Over the sync link the same bytes
+// mean "nothing changed", which the transport filters out before the parser
+// ever sees them.
+func TestDocumentMissingBothListsIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	hash := HashToken("live")
+	writeDoc(t, path, fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
+	  "models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{}}]}`, hash), time.Now())
+	s, err := OpenFile(path, discard(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeDoc(t, path, `{"generation":2,"serviceEnabled":true}`, time.Now().Add(time.Minute))
+	s.Refresh(t.Context())
+
+	if s.Generation() != 1 {
+		t.Fatalf("generation = %d: a document with nothing in it was applied", s.Generation())
+	}
+	_, byHash, _ := s.Current()
+	if byHash(hash) == nil {
+		t.Fatal("every key was revoked by a document that simply omitted them")
+	}
+	if s.ReloadFailures() == 0 {
+		t.Fatal("the refusal left no trace: health would keep saying ok")
+	}
+	if s.LastError() == "" {
+		t.Fatal("no lastError to tell the control plane why")
+	}
+}
+
+// Startup must survive a control plane that answers "unchanged" to a gateway
+// with no state — a plausible first implementation, since the gateway reports
+// generation 0 and the api's own generation may match its last known value.
+// Refusing to start while holding a good cached document is the wrong trade.
+func TestCachedDocumentStartsTheGatewayWhenTheFirstPollSaysUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	cache := filepath.Join(dir, "snapshot.json")
+	hash := HashToken("cached")
+	body := fmt.Sprintf(`{"generation":5,"serviceEnabled":true,
+	  "models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{}}]}`, hash)
+	if err := os.WriteFile(cache, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"generation":5}`) // unchanged, to a caller with nothing
+	}))
+	defer srv.Close()
+
+	src := NewHTTPSource(srv.URL, "tok", cache, 5*time.Second)
+	s, err := Open(t.Context(), src, cache, discard(), Options{
+		KnownUpstreams: []string{"mock"}, FromControlPlane: true,
+	})
+	if err != nil {
+		t.Fatalf("the gateway refused to start while holding a usable cache: %v", err)
+	}
+	_, byHash, _ := s.Current()
+	if byHash(hash) == nil {
+		t.Fatal("started, but not on the cached document")
 	}
 }

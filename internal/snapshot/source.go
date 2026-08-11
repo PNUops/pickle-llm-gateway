@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -120,6 +121,10 @@ type SyncRequest struct {
 	LastError         string `json:"lastError,omitempty"`
 	BodiesDropped     int64  `json:"bodiesDropped,omitempty"`
 	UsageShipFailures int64  `json:"usageShipFailures,omitempty"`
+	// SpoolWriteFailures counts usage events that could not be written to the
+	// outbox at all. Those are gone before shipping ever sees them, so the api
+	// would otherwise just receive quietly incomplete accounting.
+	SpoolWriteFailures int64 `json:"spoolWriteFailures,omitempty"`
 }
 
 // SyncGauges are the live numbers the poll reports. They come from components
@@ -127,15 +132,16 @@ type SyncRequest struct {
 // body sink), so they arrive through one closure set at startup rather than by
 // threading dependencies through the store.
 type SyncGauges struct {
-	InFlight          int
-	MaxInFlight       int
-	UpstreamRefs      []string
-	RejectedEntries   int
-	ReloadFailures    int64
-	LastError         string
-	BodiesDropped     int64
-	UsageShipFailures int64
-	StartedAt         time.Time
+	InFlight           int
+	MaxInFlight        int
+	UpstreamRefs       []string
+	RejectedEntries    int
+	ReloadFailures     int64
+	LastError          string
+	BodiesDropped      int64
+	UsageShipFailures  int64
+	SpoolWriteFailures int64
+	StartedAt          time.Time
 }
 
 // maxReportedError bounds LastError. The text is a Go error string, so it is
@@ -181,6 +187,7 @@ type HTTPSource struct {
 	// refuses (a rollback, an unconfigured upstream) become what a later
 	// restart loads — and then the gateway would refuse to start at all.
 	pending []byte
+	log     *slog.Logger
 	// gauges reports what the gateway can say about itself; nil until the rest
 	// of the process is wired, and never load-bearing.
 	gauges    func() SyncGauges
@@ -195,6 +202,16 @@ func NewHTTPSource(baseURL, token, cachePath string, timeout time.Duration) *HTT
 		url:       baseURL + "/internal/llm/sync",
 		token:     token,
 		cachePath: cachePath,
+		log:       slog.New(slog.DiscardHandler),
+	}
+}
+
+// SetLogger attaches a logger. Without one the cache-write failures below are
+// invisible, and restart resilience is exactly the thing you find out about at
+// the worst moment.
+func (s *HTTPSource) SetLogger(log *slog.Logger) {
+	if log != nil {
+		s.log = log
 	}
 }
 
@@ -219,6 +236,22 @@ func (s *HTTPSource) Load(ctx context.Context, served int64) ([]byte, bool, erro
 	if err == nil {
 		if changed {
 			s.pending = raw
+			s.delivered = true
+			return raw, changed, nil
+		}
+		// "Unchanged" answered to a caller with nothing to serve leaves the
+		// gateway unable to start. The control plane should not do that — the
+		// gateway reports appliedGeneration 0 — but a cached document from the
+		// last run is a better answer than refusing to come up, and the
+		// generation guard still refuses anything older than what was served.
+		if served == 0 && !s.delivered {
+			if cached, cerr := os.ReadFile(s.cachePath); cerr == nil {
+				s.log.Warn("control plane reported no change to a gateway with no state; starting on the cached document",
+					"cache", s.cachePath)
+				s.delivered = true
+				s.pending = nil // already on disk
+				return cached, true, nil
+			}
 		}
 		s.delivered = true
 		return raw, changed, nil
@@ -254,6 +287,7 @@ func (s *HTTPSource) fetch(ctx context.Context, served int64) ([]byte, bool, err
 		req.LastError = sanitizeReported(g.LastError)
 		req.BodiesDropped = g.BodiesDropped
 		req.UsageShipFailures = g.UsageShipFailures
+		req.SpoolWriteFailures = g.SpoolWriteFailures
 		req.StartedAt = g.StartedAt
 	}
 	body, err := json.Marshal(req)
@@ -301,22 +335,36 @@ func (s *HTTPSource) fetch(ctx context.Context, served int64) ([]byte, bool, err
 // not user data; a response beyond this is a malfunction, not a big campus.
 const maxDocumentBytes = 32 << 20
 
+// writeCache mirrors an accepted document for restart resilience. A failure
+// here is not fatal — the running gateway is fine — but it must be visible:
+// silently, restart resilience would simply be off, and the discovery would
+// come during the outage it exists for.
 func (s *HTTPSource) writeCache(raw []byte) {
+	fail := func(err error) {
+		s.log.Error("snapshot cache write failed; a restart during a control-plane outage will have no document",
+			"cache", s.cachePath, "error", err)
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(s.cachePath), ".snapshot-cache-*")
 	if err != nil {
+		fail(err)
 		return
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
+		fail(err)
 		return
 	}
 	if err := tmp.Chmod(0o640); err != nil {
 		tmp.Close()
+		fail(err)
 		return
 	}
 	if err := tmp.Close(); err != nil {
+		fail(err)
 		return
 	}
-	_ = os.Rename(tmp.Name(), s.cachePath)
+	if err := os.Rename(tmp.Name(), s.cachePath); err != nil {
+		fail(err)
+	}
 }
