@@ -247,6 +247,17 @@ func (r *Reporter) shipFile(ctx context.Context, path, day string, offset int64)
 			batchEnd = pos
 			continue
 		}
+		// A line that is not valid JSON cannot be an event this package wrote:
+		// a full disk truncates a write mid-line, and the next append lands
+		// after it. Sending it would make the api refuse the whole batch as
+		// malformed — which is a batch fault, so the gateway skips it and up to
+		// 500 good events go with the one bad line.
+		if !json.Valid(trimmed) {
+			r.log.Error("skipping an unparseable spool line (a truncated write?)",
+				"day", day, "bytes", len(trimmed))
+			batchEnd = pos
+			continue
+		}
 		batch = append(batch, json.RawMessage(trimmed))
 		batchEnd = pos
 		if len(batch) >= r.batchSize {

@@ -500,3 +500,31 @@ func TestAnyTwoHundredIsAcceptance(t *testing.T) {
 		}
 	}
 }
+
+// A full disk truncates a write mid-line and the next append lands after it.
+// Forwarding that line makes the api refuse the batch as malformed — a batch
+// fault, which the gateway skips, taking up to 500 good events with the one
+// bad line.
+func TestTruncatedSpoolLineDoesNotCostTheBatch(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	path := filepath.Join(dir, "usage-20260810.jsonl")
+	body := `{"eventUuid":"a","status":"OK"}` + "\n" +
+		`{"eventUuid":"b","statu` + "\n" + // truncated by a full disk
+		`{"eventUuid":"c","status":"OK"}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	r := New(dir, url, "tok", 500, 5*time.Second, discard())
+	sent, err := r.Flush(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 2 {
+		t.Fatalf("sent %d events, want the two good ones", sent)
+	}
+	got, _ := is.snapshot()
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Fatalf("delivered %v, want the events either side of the bad line", got)
+	}
+}
