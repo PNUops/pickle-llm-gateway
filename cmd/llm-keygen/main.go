@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -137,15 +138,26 @@ func parseSwitch(v string) (bool, error) {
 // instead of "no such key" — the difference between a student who knows what
 // happened and one who files a ticket.
 func revokeKey(path, keyID string) error {
-	return mutate(path, func(doc *snapshot.Document) error {
-		for i := range doc.Keys {
-			if doc.Keys[i].KeyID != keyID {
+	return mutate(path, func(doc *document) error {
+		for i, raw := range doc.Keys {
+			var probe struct {
+				KeyID  string `json:"keyId"`
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal(raw, &probe); err != nil {
+				return fmt.Errorf("key %d in %s is unreadable: %w", i, path, err)
+			}
+			if probe.KeyID != keyID {
 				continue
 			}
-			if doc.Keys[i].Status == snapshot.KeyRevoked {
+			if probe.Status == snapshot.KeyRevoked {
 				return fmt.Errorf("keyId %s is already revoked", keyID)
 			}
-			doc.Keys[i].Status = snapshot.KeyRevoked
+			patched, err := setMember(raw, "status", snapshot.KeyRevoked)
+			if err != nil {
+				return err
+			}
+			doc.Keys[i] = patched
 			return nil
 		}
 		return fmt.Errorf("keyId %s is not in %s", keyID, path)
@@ -155,13 +167,32 @@ func revokeKey(path, keyID string) error {
 // setService flips the kill switch. Off refuses every request with the
 // maintenance error while leaving the keys and models untouched.
 func setService(path string, on bool) error {
-	return mutate(path, func(doc *snapshot.Document) error {
+	return mutate(path, func(doc *document) error {
 		if doc.ServiceEnabled == on {
 			return fmt.Errorf("serviceEnabled is already %t", on)
 		}
 		doc.ServiceEnabled = on
 		return nil
 	})
+}
+
+// setMember replaces one member of an object without disturbing the rest of
+// it. Entries are patched rather than re-serialized from a Go struct because
+// the document format promises that a field this build does not know is
+// ignored, not lost — that promise is what lets the control plane extend an
+// entry, and a tool that round-trips through the struct quietly breaks it the
+// first time an operator revokes a key.
+func setMember(raw json.RawMessage, name string, value any) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	obj[name] = encoded
+	return json.Marshal(obj)
 }
 
 func newToken() (string, error) {
@@ -185,15 +216,36 @@ func newToken() (string, error) {
 // and a root-owned replacement would silently freeze the gateway on its last
 // good state.
 func insert(path string, entry snapshot.Key) error {
-	return mutate(path, func(doc *snapshot.Document) error {
-		for _, k := range doc.Keys {
-			if k.KeyID == entry.KeyID {
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	return mutate(path, func(doc *document) error {
+		for i, raw := range doc.Keys {
+			var probe struct {
+				KeyID string `json:"keyId"`
+			}
+			if err := json.Unmarshal(raw, &probe); err != nil {
+				return fmt.Errorf("key %d in %s is unreadable: %w", i, path, err)
+			}
+			if probe.KeyID == entry.KeyID {
 				return fmt.Errorf("keyId %s already exists in %s", entry.KeyID, path)
 			}
 		}
-		doc.Keys = append(doc.Keys, entry)
+		doc.Keys = append(doc.Keys, encoded)
 		return nil
 	})
+}
+
+// document is the envelope this tool edits. models and keys stay as raw
+// entries so nothing outside the fields being changed is touched, and the
+// member order here is the order the file keeps.
+type document struct {
+	FormatVersion  *int              `json:"formatVersion,omitempty"`
+	Generation     int64             `json:"generation"`
+	ServiceEnabled bool              `json:"serviceEnabled"`
+	Models         []json.RawMessage `json:"models"`
+	Keys           []json.RawMessage `json:"keys"`
 }
 
 // mutate applies change to the document under an exclusive lock and writes the
@@ -202,7 +254,7 @@ func insert(path string, entry snapshot.Key) error {
 // ownership-preserving replace are properties of the document, not of any one
 // operation, and the one time they were open-coded elsewhere the lock was the
 // part that got left out.
-func mutate(path string, change func(*snapshot.Document) error) error {
+func mutate(path string, change func(*document) error) error {
 	// Serialize the read-modify-write against a concurrent keygen or a hand
 	// edit: without the lock, two writers each read the pre-edit document and
 	// the second rename silently discards the first's change — a lost key, or a
@@ -226,9 +278,24 @@ func mutate(path string, change func(*snapshot.Document) error) error {
 	if err != nil {
 		return err
 	}
-	var doc snapshot.Document
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	var doc document
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// Strict, like the gateway is with a file: a member this tool does not know
+	// would be dropped on write, and dropping something out of the document
+	// that decides who may call the service is not a thing to do quietly.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&doc); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
+	}
+	// A nil slice marshals as null, which the loader refuses — so a document
+	// that arrived without one of these members would come back out of here
+	// unloadable, and the gateway would keep serving its last state while this
+	// tool reported success.
+	if doc.Models == nil {
+		doc.Models = []json.RawMessage{}
+	}
+	if doc.Keys == nil {
+		doc.Keys = []json.RawMessage{}
 	}
 	if err := change(&doc); err != nil {
 		return err
@@ -237,6 +304,13 @@ func mutate(path string, change func(*snapshot.Document) error) error {
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
+	}
+	// Check the result against the reader before replacing the file. Renaming
+	// first would move the failure to the gateway, which handles it by keeping
+	// its last good state — so the operator would be told the revocation
+	// landed while the key kept working.
+	if err := snapshot.Validate(append(out, '\n')); err != nil {
+		return fmt.Errorf("refusing to write a document the gateway would reject: %w", err)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".snapshot-*")
 	if err != nil {

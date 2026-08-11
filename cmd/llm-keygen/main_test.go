@@ -205,3 +205,84 @@ func TestParseSwitch(t *testing.T) {
 		t.Fatal("an unrecognized switch value was accepted")
 	}
 }
+
+// The document format promises that a field this build does not know is
+// ignored rather than lost — that is what lets the control plane extend an
+// entry without a lockstep gateway. A tool that re-serializes entries from Go
+// structs breaks that promise the first time an operator revokes a key, and
+// once the api writes this document it is data loss between two writers.
+func TestMaintenancePreservesFieldsItDoesNotKnow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	raw := `{
+  "generation": 3,
+  "serviceEnabled": true,
+  "models": [{"publicName": "pnu-general", "upstreamRef": "mock", "upstreamModel": "m", "futureField": 7}],
+  "keys": [{"keyId": "k-a", "tokenHash": "` + snapshot.HashToken("a") + `", "status": "ACTIVE",
+            "limits": {}, "owner": "someone", "scopes": ["ws-7"]}]
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := revokeKey(path, "k-a"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Models []map[string]any `json:"models"`
+		Keys   []map[string]any `json:"keys"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Keys[0]["owner"] != "someone" {
+		t.Fatalf("revocation erased a field it does not model: %v", doc.Keys[0])
+	}
+	if _, ok := doc.Keys[0]["scopes"]; !ok {
+		t.Fatalf("revocation erased scopes: %v", doc.Keys[0])
+	}
+	if doc.Keys[0]["status"] != snapshot.KeyRevoked {
+		t.Fatalf("status not applied: %v", doc.Keys[0])
+	}
+	if doc.Models[0]["futureField"] == nil {
+		t.Fatalf("an untouched model entry lost a field: %v", doc.Models[0])
+	}
+}
+
+// A document the gateway would refuse must never reach the file. The gateway's
+// response to a refused document is to keep serving its last good state, so
+// writing one turns "the key is revoked" into "the tool said so and the key
+// still works" — with the only signal on a health endpoint nobody reads during
+// an incident.
+func TestMaintenanceRefusesToWriteAnUnloadableDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	// No models member at all — the shape the loader refuses.
+	raw := `{"generation":1,"serviceEnabled":true,
+	         "keys":[{"keyId":"k-a","tokenHash":"` + snapshot.HashToken("a") + `","status":"ACTIVE","limits":{}}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// The tool repairs the missing member rather than propagating it, so this
+	// succeeds — and what it wrote must load.
+	if err := revokeKey(path, "k-a"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Validate(out); err != nil {
+		t.Fatalf("the tool wrote a document the gateway refuses: %v", err)
+	}
+
+	// A member this tool does not know is refused rather than silently dropped.
+	bad := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := os.WriteFile(bad, []byte(`{"generation":1,"serviceEnabled":true,"models":[],"keys":[],"scopes":[]}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := setService(bad, false); err == nil {
+		t.Fatal("a document with an unknown top-level member was rewritten without it")
+	}
+}
