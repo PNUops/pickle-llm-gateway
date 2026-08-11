@@ -1,6 +1,6 @@
 # pickle-llm-gateway
 
-부산대학교 클라우드 플랫폼(PNU Cloud)의 교내 LLM API 게이트웨이입니다. 학생 코드가 보내는
+부산대학교 클라우드 플랫폼(Pickle)의 교내 LLM API 게이트웨이입니다. 학생 코드가 보내는
 OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적용한 뒤, 업스트림 모델 서버로
 전달합니다. 학생이 쓰는 주소는 `https://llm.pcl.kr/v1`이고, 발급받은 Key를 OpenAI SDK의
 `base_url`과 `api_key`에 그대로 넣으면 됩니다.
@@ -231,3 +231,84 @@ go run ./cmd/llm-gateway
   ]
 }
 ```
+
+## 전체 아키텍처
+
+<!-- arch:begin -->
+```mermaid
+flowchart LR
+    subgraph ext [외부]
+        B[콘솔 접속]
+        V[VM 도메인 접속]
+        S[VM SSH 접속]
+        PC[VM 포트 접속]
+        L[LLM API 호출]
+    end
+
+    subgraph relay [오프캠퍼스 릴레이]
+        HA[HAProxy :22]
+        NFT[nftables DNAT]
+        RA[pickle-relay-agent]
+    end
+
+    subgraph campus [부산대학교 서버팜]
+        PN[Pickle nginx]
+        VN[VM nginx]
+        C[pickle-console]
+        A[pickle-api]
+        J[JobRunr]
+        G[pickle-sshgw]
+        P[pickle-proxy-agent]
+        DB[(PostgreSQL)]
+        PVE[Proxmox VE]
+        VM[사용자 VM]
+        IB[pickle-image-builder]
+        LG[pickle-llm-gateway]
+        UP[업스트림 모델 서버]
+    end
+
+    B --> PN
+    V --> VN
+    S --> HA
+    PC --> NFT
+    L --> PN
+
+    HA -->|WireGuard| G
+    NFT -->|WireGuard| VM
+    NFT -. 규칙 적용 .- RA
+    RA -->|sync| A
+
+    PN -->|/| C
+    PN -->|/api| A
+    PN -->|/terminal| G
+    PN -->|llm.pcl.kr| LG
+
+    G -->|인가 질의| A
+    LG -->|키·모델 동기화| A
+    LG --> UP
+    G --> VM
+    VN --> VM
+
+    A --> DB
+    A -->|작업 등록| J
+    J -->|Proxmox API| PVE
+    A -->|도메인 설정| P
+    P -.->|vhost 적용| VN
+    PVE -.->|생성/제어| VM
+    IB -.->|템플릿 빌드| PVE
+```
+
+| 레포지토리 | 역할 |
+|---|---|
+| [pickle-api](https://github.com/PNUops/pickle-api) | REST API와 프로비저닝 워커 (Spring Boot 4, Java 25, PostgreSQL 18, JobRunr) |
+| [pickle-console](https://github.com/PNUops/pickle-console) | 사용자·관리자 웹 콘솔 (React 19, TypeScript) |
+| [pickle-sshgw](https://github.com/PNUops/pickle-sshgw) | SSH 게이트웨이와 웹 터미널 브리지 (sshpiperd, Go) |
+| [pickle-proxy-agent](https://github.com/PNUops/pickle-proxy-agent) | nginx 리버스 프록시 제어 에이전트 (Go) |
+| [pickle-relay-agent](https://github.com/PNUops/pickle-relay-agent) | 오프캠퍼스 릴레이의 nftables DNAT 에이전트 (Go) |
+| [pickle-llm-gateway](https://github.com/PNUops/pickle-llm-gateway) | 교내 LLM API 게이트웨이 (Go) |
+| [pickle-image-builder](https://github.com/PNUops/pickle-image-builder) | 사용자 VM OS 이미지 빌드 레시피 (shell, virt-customize) |
+| [pickle-infra](https://github.com/PNUops/pickle-infra) (비공개) | 인프라 프로비저닝 스크립트와 운영 런북 (shell) |
+| [pickle-infra-example](https://github.com/PNUops/pickle-infra-example) | 프로비저닝·배포 스크립트와 런북 샘플 |
+| [pickle-secrets](https://github.com/PNUops/pickle-secrets) (비공개) | 호스트 시크릿 볼트 (git-crypt) |
+| [pickle-secrets-example](https://github.com/PNUops/pickle-secrets-example) | 볼트 레이아웃과 git-crypt 운용 절차 |
+<!-- arch:end -->
