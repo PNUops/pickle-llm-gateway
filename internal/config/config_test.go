@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -145,5 +147,79 @@ func TestGeneralUpstreamSettingsAreNotParsedAsDeclarations(t *testing.T) {
 	t.Setenv("LLMGW_UPSTREAM_OPENAI_BASEURL", "https://x.example")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("a misspelled upstream field was accepted")
+	}
+}
+
+// The reserved-name list that keeps a general setting from being parsed as an
+// upstream declaration is hand-maintained, and it was added after a name
+// collision stopped the process from starting at all. Pinning the two names it
+// holds today only remembers that incident; this reads every variable the
+// README documents and asserts the whole set is accepted, so the next addition
+// cannot reintroduce the same failure quietly.
+func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
+	raw, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, m := range regexp.MustCompile(`LLMGW_[A-Z0-9_]+`).FindAllString(string(raw), -1) {
+		names[m] = true
+	}
+	if len(names) < 20 {
+		t.Fatalf("only %d variables found in the README; the extraction is wrong", len(names))
+	}
+	// Values that parse for every type the config reads.
+	value := func(n string) string {
+		switch {
+		case strings.HasSuffix(n, "_INTERVAL"), strings.HasSuffix(n, "_WAIT"),
+			strings.HasSuffix(n, "_DURATION"), strings.HasSuffix(n, "_TIMEOUT"):
+			return "5s"
+		case n == "LLMGW_SNAPSHOT_SOURCE":
+			return "file"
+		case strings.HasSuffix(n, "_PUSH"), strings.HasSuffix(n, "_CAPTURE"),
+			strings.HasSuffix(n, "_RESET"):
+			return "on"
+		case strings.HasSuffix(n, "_BYTES"), strings.HasSuffix(n, "_SIZE"),
+			strings.HasSuffix(n, "_DAYS"), strings.HasSuffix(n, "_RETRIES"),
+			strings.HasSuffix(n, "_RPM"), strings.HasSuffix(n, "_TPM"),
+			strings.HasSuffix(n, "_CONCURRENCY"), n == "LLMGW_MAX_IN_FLIGHT":
+			return "7"
+		case strings.HasSuffix(n, "_LISTEN"):
+			return "127.0.0.1:9999"
+		case strings.HasSuffix(n, "_PATH"), strings.HasSuffix(n, "_DIR"):
+			return t.TempDir()
+		case strings.HasSuffix(n, "_URL"):
+			return "https://example.invalid/v1"
+		}
+		return "x"
+	}
+	// The README writes the upstream block as a shape (`LLMGW_UPSTREAM_<REF>_BASE_URL`),
+	// which the extraction sees as a name ending in an underscore. Those are
+	// placeholders, not variables.
+	declared := map[string]bool{}
+	for n := range names {
+		if strings.HasSuffix(n, "_") {
+			continue
+		}
+		if after, ok := strings.CutPrefix(n, "LLMGW_UPSTREAM_"); ok {
+			if ref, _, found := strings.Cut(after, "_"); found && !reservedUpstreamSettings[ref] {
+				declared[strings.ToLower(ref)] = true
+			}
+		}
+		t.Setenv(n, value(n))
+	}
+	// One real upstream so the config has something to serve.
+	t.Setenv("LLMGW_UPSTREAM_MOCK_BASE_URL", "https://example.invalid/v1")
+	t.Setenv("LLMGW_UPSTREAM_MOCK_API_KEY", "k")
+	declared["mock"] = true
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("a configuration of every documented variable was rejected: %v", err)
+	}
+	for ref := range cfg.Upstreams {
+		if !declared[ref] {
+			t.Fatalf("a general setting was parsed as an upstream declaration: %q", ref)
+		}
 	}
 }
