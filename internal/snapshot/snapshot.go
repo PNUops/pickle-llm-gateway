@@ -411,13 +411,17 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 	if env.ServiceEnabled == nil {
 		return nil, errors.New("serviceEnabled is missing: a document that does not say whether the service is on is not a document")
 	}
-	if (env.Models == nil) != (env.Keys == nil) {
-		return nil, errors.New("models and keys must be present together: a document carrying only one of them would silently empty the other")
+	// Both members must be there. One missing would silently empty the other;
+	// both missing empties everything — every key invalid, every model gone —
+	// and does it without a single failure signal, because as far as the parser
+	// is concerned the document simply says there is nothing. Over the sync
+	// link those same bytes are the "nothing changed" answer, which the
+	// transport filters out before it ever reaches here (see HTTPSource.fetch);
+	// through a file they can only be a truncated or half-written document.
+	if env.Models == nil || env.Keys == nil {
+		return nil, errors.New("models and keys must both be present: a document missing either one silently empties authorization")
 	}
-	var rawModels, rawKeys []json.RawMessage
-	if env.Models != nil {
-		rawModels, rawKeys = *env.Models, *env.Keys
-	}
+	rawModels, rawKeys := *env.Models, *env.Keys
 	doc := Document{
 		FormatVersion:  env.FormatVersion,
 		Generation:     env.Generation,
@@ -545,6 +549,20 @@ func keyProblem(k *Key, i int, seen map[string]*Key) string {
 	}
 	seen[k.TokenHash] = nil
 	return ""
+}
+
+// Validate reports whether raw is a document this build would accept from a
+// file — strict about the top level, and refusing any entry it cannot act on.
+// It exists so a writer can check its own output before replacing the file the
+// gateway reads: a tool that renames first and finds out never finds out at
+// all, because the failure surfaces on the reader's side, minutes later, as a
+// silently unchanged authorization state.
+//
+// Upstream names are not checked here: the writer does not know which upstreams
+// a given host has configured. That check stays with the gateway.
+func Validate(raw []byte) error {
+	_, err := build(raw, nil, false)
+	return err
 }
 
 func validHash(h string) bool {

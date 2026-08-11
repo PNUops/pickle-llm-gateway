@@ -39,6 +39,7 @@ func main() {
 	var controlSource *snapshot.HTTPSource
 	if cfg.SnapshotSource == config.SourceHTTP {
 		controlSource = snapshot.NewHTTPSource(cfg.ControlBaseURL, cfg.ControlToken, cfg.SnapshotPath, cfg.ControlTimeout)
+		controlSource.SetLogger(log)
 		source = controlSource
 	} else {
 		source = snapshot.NewFileSource(cfg.SnapshotPath)
@@ -61,23 +62,38 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
-	// Declared here so the sync self-report can read them; both stay nil when
-	// the corresponding channel is off.
+
+	// Both channels are constructed before anything reads them. The sync
+	// goroutine's self-report closure captures these variables, and assigning
+	// them after that goroutine starts would be a race with no happens-before
+	// edge — one that only fails to bite today because the first poll is five
+	// seconds out.
 	var rep *reporter.Reporter
 	var sink *bodies.Sink
+	if cfg.BodyCapture {
+		sink = bodies.New(cfg.ControlBaseURL, cfg.ControlToken,
+			cfg.BodyQueueSize, cfg.BodyBatchSize, cfg.ControlTimeout, log)
+		srv.SetBodySink(sink)
+	}
+	if cfg.UsagePush {
+		rep = reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
+			cfg.UsageBatchSize, cfg.ControlTimeout, log)
+	}
+
 	if controlSource != nil {
 		// The api never calls the gateway, so the poll is the only channel
 		// carrying what the gateway can say about itself. Everything here is a
 		// claim the control plane may display but must not act on.
 		controlSource.SetGauges(func() snapshot.SyncGauges {
 			g := snapshot.SyncGauges{
-				InFlight:        srv.InFlight(),
-				MaxInFlight:     cfg.MaxInFlight,
-				UpstreamRefs:    cfg.UpstreamRefs(),
-				RejectedEntries: store.RejectedEntries(),
-				ReloadFailures:  store.ReloadFailures(),
-				LastError:       store.LastError(),
-				StartedAt:       startedAt,
+				InFlight:           srv.InFlight(),
+				MaxInFlight:        cfg.MaxInFlight,
+				UpstreamRefs:       cfg.UpstreamRefs(),
+				RejectedEntries:    store.RejectedEntries(),
+				ReloadFailures:     store.ReloadFailures(),
+				LastError:          store.LastError(),
+				StartedAt:          startedAt,
+				SpoolWriteFailures: srv.SpoolWriteFailures(),
 			}
 			if sink != nil {
 				g.BodiesDropped = sink.Dropped()
@@ -129,10 +145,7 @@ func main() {
 	// control plane to deliver to: captured text is never written to this
 	// host's disk, so without delivery there is nowhere for it to go and
 	// nothing is captured. Individual keys still have to opt in.
-	if cfg.BodyCapture {
-		sink = bodies.New(cfg.ControlBaseURL, cfg.ControlToken,
-			cfg.BodyQueueSize, cfg.BodyBatchSize, cfg.ControlTimeout, log)
-		srv.SetBodySink(sink)
+	if sink != nil {
 		go sink.Run(ctx)
 		log.Info("body capture channel enabled (per-key opt-in still required)")
 	}
@@ -141,20 +154,12 @@ func main() {
 	// The spool is written regardless, so enabling this later ships what
 	// already accumulated.
 	var shipped func(day string) bool
-	if cfg.UsagePush {
-		rep = reporter.New(cfg.SpoolDir, cfg.ControlBaseURL, cfg.ControlToken,
-			cfg.UsageBatchSize, cfg.ControlTimeout, log)
+	if rep != nil {
 		go rep.Run(ctx, cfg.UsagePushInterval)
 		// Retention must not delete a day the reporter never confirmed: with
 		// shipping on, an unreported day file is the only copy of that usage.
-		shipped = func(day string) bool {
-			offsets, err := rep.ShippedThrough()
-			if err != nil {
-				return false // unknown: keep the file
-			}
-			_, ok := offsets[day]
-			return ok
-		}
+		//
+		shipped = rep.FullyShipped
 	}
 
 	// Usage-spool retention: prune once at startup and daily thereafter.

@@ -67,8 +67,10 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 드러냅니다. 키 한 개가 사라지면 그 키가 막히고(안전한 쪽), 모델 한 개가 사라지면 그 모델만
 없어지지만, 문서 전체가 얼어붙으면 폐기한 키가 계속 동작합니다. 반면 손으로 관리하는
 파일에서는 같은 상황이 방금 한 편집의 오류이므로 적재를 실패시킵니다. 파싱 자체가 안 되는
-문서, `serviceEnabled`가 빠진 문서, `models`와 `keys` 중 한쪽만 실린 문서는 어느 쪽에서도
-거부합니다 — 각각 서비스 전체 점검 모드와 전 키 무효를 뜻하게 되기 때문입니다.
+문서, `serviceEnabled`가 빠진 문서, `models`와 `keys` 중 한쪽이라도 빠진 문서는 어느
+쪽에서도 거부합니다 — 각각 서비스 전체 점검 모드와 전 키 무효를 뜻하게 되기 때문입니다.
+둘 다 빠진 문서도 마찬가지입니다. 관리 API에서는 그 형태가 "변경 없음"을 뜻하지만 전송
+계층이 걸러내므로 여기까지 오지 않고, 파일에서는 잘렸거나 쓰다 만 문서일 수밖에 없습니다.
 
 요청 처리는 이렇게 흐릅니다. Authorization 헤더의 Key를 sha256으로 해시해 스냅샷에서
 찾고, 한도를 확인한 뒤 요청 본문의 모델명을 실제 모델로 바꿔 업스트림에 전달합니다.
@@ -119,8 +121,25 @@ go run ./cmd/llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json \
   -expires-days 90 -rpm 20 -tpm 20000 -concurrency 2
 ```
 
-분실한 Key는 다시 조회할 수 없습니다. 스냅샷에서 해당 항목의 `status`를 `REVOKED`로
-바꾸고 새로 발급합니다.
+분실한 Key는 다시 조회할 수 없습니다. 폐기하고 새로 발급하세요.
+
+## 운영 조작
+
+문서를 손으로 고치지 마세요. 같은 도구가 잠금과 원자적 교체, 소유자 보존을 처리하며,
+세대 번호를 올려 게이트웨이가 다음 폴링에서 알아채게 합니다. 급할 때 편집기로 여는 것이
+바로 이 장치들을 전부 우회하는 경로입니다.
+
+```bash
+# Key 긴급 회수 — 항목은 남습니다. 그래야 "폐기된 Key"라고 답할 수 있습니다
+llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json -revoke key-1a2b3c
+
+# 서비스 점검 모드 — Key와 모델은 그대로 두고 모든 요청을 거부합니다
+llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json -service off
+llm-keygen -snapshot /var/lib/pickle-llm-gateway/snapshot.json -service on
+```
+
+없는 keyId나 이미 폐기된 Key를 지정하면 실패하고 문서를 건드리지 않습니다. 오타가 조용히
+아무 일도 하지 않는 것보다 낫기 때문입니다.
 
 ## 시작하기
 

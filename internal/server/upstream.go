@@ -116,7 +116,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 	}
 
 	var last *attemptError
-	for _, ref := range refs {
+	for i, ref := range refs {
 		up, ok := s.cfg.Upstreams[strings.ToLower(ref)]
 		if !ok {
 			s.log.Error("model references an unconfigured upstream",
@@ -162,7 +162,10 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 			}
 			s.metrics.upstreamRetries.Add(1)
 		}
-		if len(refs) > 1 {
+		// Only when there is somewhere left to fall back to. Counting the last
+		// exhausted upstream as a fallback makes the metric and the log both
+		// claim a recovery for requests that simply died.
+		if i < len(refs)-1 {
 			s.metrics.upstreamFallbacks.Add(1)
 			s.log.Warn("falling back to the model's secondary upstream",
 				"model", model.PublicName, "from", ref)
