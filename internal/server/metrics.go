@@ -13,12 +13,13 @@ import (
 // Completed requests are reconstructable from the spool afterwards; in-flight
 // and queued work only exists while it is happening.
 type counters struct {
-	byStatus          sync.Map // status string -> *atomic.Int64
-	inputTokens       atomic.Int64
-	outputTokens      atomic.Int64
-	upstreamRetries   atomic.Int64
-	upstreamFallbacks atomic.Int64
-	bodiesCaptured    atomic.Int64
+	byStatus           sync.Map // status string -> *atomic.Int64
+	inputTokens        atomic.Int64
+	outputTokens       atomic.Int64
+	upstreamRetries    atomic.Int64
+	upstreamFallbacks  atomic.Int64
+	bodiesCaptured     atomic.Int64
+	spoolWriteFailures atomic.Int64
 }
 
 func (c *counters) observe(ev spool.Event) {
@@ -52,18 +53,19 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writeJSON(w, map[string]any{
-		"inFlight":          s.InFlight(),
-		"maxInFlight":       s.cfg.MaxInFlight,
-		"generation":        s.store.Generation(),
-		"reloadFailures":    s.store.ReloadFailures(),
-		"rejectedEntries":   s.store.RejectedEntries(),
-		"bodiesDropped":     s.bodies.Dropped(),
-		"requestsByStatus":  s.metrics.statusMap(),
-		"inputTokens":       s.metrics.inputTokens.Load(),
-		"outputTokens":      s.metrics.outputTokens.Load(),
-		"upstreamRetries":   s.metrics.upstreamRetries.Load(),
-		"upstreamFallbacks": s.metrics.upstreamFallbacks.Load(),
-		"bodiesCaptured":    s.metrics.bodiesCaptured.Load(),
+		"inFlight":           s.InFlight(),
+		"maxInFlight":        s.cfg.MaxInFlight,
+		"generation":         s.store.Generation(),
+		"reloadFailures":     s.store.ReloadFailures(),
+		"rejectedEntries":    s.store.RejectedEntries(),
+		"bodiesDropped":      s.bodies.Dropped(),
+		"requestsByStatus":   s.metrics.statusMap(),
+		"inputTokens":        s.metrics.inputTokens.Load(),
+		"outputTokens":       s.metrics.outputTokens.Load(),
+		"upstreamRetries":    s.metrics.upstreamRetries.Load(),
+		"upstreamFallbacks":  s.metrics.upstreamFallbacks.Load(),
+		"bodiesCaptured":     s.metrics.bodiesCaptured.Load(),
+		"spoolWriteFailures": s.metrics.spoolWriteFailures.Load(),
 	})
 }
 

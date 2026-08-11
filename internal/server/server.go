@@ -114,6 +114,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // but an ACTIVE, unexpired key. The lookup comes from the caller so a request
 // authenticates against the same snapshot view it does everything else with.
 // The auth scheme is matched case-insensitively (RFC 7235).
+//
+// A refusal still returns the key when one was resolved. Whose key was
+// suspended, revoked or expired is the whole value of recording the refusal —
+// without it the event says only that somebody was turned away. Only a token
+// that matched nothing (or was never presented) has no owner to name.
 func (s *Server) authenticate(r *http.Request, lookup func(string) *snapshot.Key) (*snapshot.Key, *apiError) {
 	h := r.Header.Get("Authorization")
 	const scheme = "bearer "
@@ -130,12 +135,12 @@ func (s *Server) authenticate(r *http.Request, lookup func(string) *snapshot.Key
 	}
 	switch key.Status {
 	case snapshot.KeyRevoked:
-		return nil, &errKeyRevoked
+		return key, &errKeyRevoked
 	case snapshot.KeySuspended:
-		return nil, &errKeySuspended
+		return key, &errKeySuspended
 	}
 	if key.ExpiresAt != nil && s.now().After(*key.ExpiresAt) {
-		return nil, &errKeyExpired
+		return key, &errKeyExpired
 	}
 	return key, nil
 }
@@ -215,3 +220,8 @@ func (s *Server) keyLimits(k *snapshot.Key) (rpm, tpm, conc int) {
 	}
 	return rpm, tpm, conc
 }
+
+// SpoolWriteFailures is how many usage events could not be written to the
+// outbox. Reported to the control plane, which cannot otherwise tell quiet
+// accounting loss from a quiet week.
+func (s *Server) SpoolWriteFailures() int64 { return s.metrics.spoolWriteFailures.Load() }

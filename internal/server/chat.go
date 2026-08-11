@@ -66,7 +66,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	record := func() {
 		ev.LatencyMs = time.Since(start).Milliseconds()
 		s.metrics.observe(ev)
+		// A request that never resolved to a key has nobody to account to, and
+		// the spool is a small disk with a long retention that anyone on the
+		// internet can reach. Writing a line per unauthenticated attempt makes
+		// filling it a matter of a loop; the counters still see them, and a
+		// rejection for a key that *did* resolve (suspended, revoked, expired)
+		// is still spooled, because that one belongs to someone.
+		if ev.KeyID == "" && ev.Status == spool.StatusAuthRejected {
+			return
+		}
 		if err := s.spool.Write(ev); err != nil {
+			// The spool is the durable accounting record. A failure here is
+			// counted as well as logged: otherwise usage simply comes out low
+			// and nothing on any surface says why.
+			s.metrics.spoolWriteFailures.Add(1)
 			s.log.Error("usage spool write failed", "error", err)
 		}
 		s.log.Info("chat request", "keyId", ev.KeyID, "model", ev.PublicModelName,
@@ -90,11 +103,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key, authErr := s.authenticate(r, keyLookup)
+	// Attribute before refusing: a key that resolved has an owner, and that is
+	// the fact worth recording about a rejection.
+	if key != nil {
+		ev.KeyID = key.KeyID
+	}
 	if authErr != nil {
 		refuse(*authErr, spool.StatusAuthRejected)
 		return
 	}
-	ev.KeyID = key.KeyID
 
 	if key.QuotaExhausted {
 		refuse(errQuotaExhausted, spool.StatusRateLimited)
@@ -315,8 +332,15 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 	return out
 }
 
+// upstreamResponseCapBytes bounds what one upstream response may cost this
+// process. A chat completion is text; the previous 32 MiB allowed for was
+// several times what any model produces, and the non-stream path holds the raw
+// bytes, the decoded map and the re-marshalled output at once — so the real
+// cost is a multiple of this, times the in-flight cap.
+const upstreamResponseCapBytes = 8 << 20
+
 func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			writeAPIError(w, errUpstreamTimeout)
@@ -487,7 +511,11 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		return writeRaw(append(append([]byte("data: "), c.out...), '\n', '\n'))
 	}
 
-	br := bufio.NewReaderSize(resp.Body, 64<<10)
+	// Bounded like the non-stream read. ReadBytes accumulates into one growing
+	// allocation until it finds a newline, so an upstream that emits a long
+	// line without one grows it without limit — times the in-flight cap, on a
+	// host with half a gigabyte.
+	br := bufio.NewReaderSize(io.LimitReader(resp.Body, upstreamResponseCapBytes), 64<<10)
 	var readErr error
 	for {
 		line, err := br.ReadBytes('\n')

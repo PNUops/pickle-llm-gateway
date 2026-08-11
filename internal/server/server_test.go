@@ -50,6 +50,16 @@ type upstreamMock struct {
 	lastBody map[string]json.RawMessage
 	lastAuth string
 	opts     mockOpts
+	calls    int
+}
+
+// callCount is how many requests reached the upstream. A test that asserts
+// only the client-visible outcome cannot tell one attempt from three, and the
+// difference is what the upstream bills.
+func (u *upstreamMock) callCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
 }
 
 func (u *upstreamMock) set(f func(*mockOpts)) {
@@ -71,6 +81,7 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	u.lastBody = params
 	u.lastAuth = r.Header.Get("Authorization")
+	u.calls++
 	cp := u.opts
 	u.mu.Unlock()
 
@@ -105,6 +116,10 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// noUsage applies to streams too: an upstream may simply ignore
+	// stream_options.include_usage, and that is the case the estimate path
+	// exists for. The knob used to be honored only on the non-stream branch,
+	// so a stream test that set it silently tested nothing.
 	w.Header().Set("Content-Type", "text/event-stream")
 	fl := w.(http.Flusher)
 	emit := func(raw string) {
@@ -141,7 +156,9 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"하세요"}}]}` + "\n\n")
 	emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n")
-	emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}` + "\n\n")
+	if !cp.noUsage {
+		emit(`data: {"id":"c1","object":"chat.completion.chunk","model":"` + upstreamModel + `","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}` + "\n\n")
+	}
 	emit("data: [DONE]\n\n")
 }
 
@@ -353,13 +370,21 @@ func TestAuthRefusals(t *testing.T) {
 			}
 		})
 	}
+	// Only the refusals that resolved to a key are spooled, and each names its
+	// owner. The two that did not — no key, unknown key — have nobody to
+	// account to, and writing a line for them would let anyone on the internet
+	// fill a small disk with a loop.
 	evs := h.spoolEvents(t)
-	if len(evs) != len(cases) {
-		t.Fatalf("spool has %d events, want %d", len(evs), len(cases))
+	wantIDs := []string{"k-rev", "k-sus", "k-exp"}
+	if len(evs) != len(wantIDs) {
+		t.Fatalf("spool has %d events, want %d (only the attributable refusals)", len(evs), len(wantIDs))
 	}
-	for _, ev := range evs {
-		if ev.Status != spool.StatusAuthRejected {
-			t.Fatalf("event status %s, want AUTH_REJECTED", ev.Status)
+	for i, want := range wantIDs {
+		if evs[i].KeyID != want {
+			t.Fatalf("event %d attributed to %q, want %q — a rejection nobody can be told about is worth little", i, evs[i].KeyID, want)
+		}
+		if evs[i].Status != spool.StatusAuthRejected {
+			t.Fatalf("event %d status = %q", i, evs[i].Status)
 		}
 	}
 }
@@ -1482,5 +1507,105 @@ func TestBodyCaptureCapsTheRequest(t *testing.T) {
 	}
 	if r.ResponseTruncated {
 		t.Fatal("the response flag fired for a truncated request")
+	}
+}
+
+// The one surface an operator or a monitor reads. Its failure mode is silence:
+// a gateway serving a three-day-old key set answering {"status":"ok"} is
+// exactly the shape of every silent-freeze defect this codebase has had.
+func TestHealthzReportsDegradedWhenTheDocumentIsNotBeingApplied(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	if err := os.WriteFile(h.snapPath, []byte("{ this is not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.snapMod = h.snapMod.Add(time.Minute)
+	if err := os.Chtimes(h.snapPath, h.snapMod, h.snapMod); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		h.store.Refresh(t.Context())
+	}
+	resp, err := http.Get(h.gw.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "degraded" {
+		t.Fatalf("health says %v while the served state is going stale: %v", body["status"], body)
+	}
+	if body["snapshotReloadStuck"] != true {
+		t.Fatalf("snapshotReloadStuck = %v", body["snapshotReloadStuck"])
+	}
+	if n, _ := body["reloadFailures"].(float64); n != 3 {
+		t.Fatalf("reloadFailures = %v, want 3", body["reloadFailures"])
+	}
+	if s, _ := body["lastError"].(string); s == "" {
+		t.Fatal("no lastError: the operator is told something is wrong but not what")
+	}
+}
+
+// A retry that fires once is correct; one that fires three times bills three
+// times. TestTimeoutIsNotRetried covers "must not retry"; this is the positive
+// case, which asserted only a 200 and so could not see over-retrying.
+func TestRetrySucceedsAndIsCountedExactlyOnce(t *testing.T) {
+	h := newHarness(t, nil, func(c *config.Config) { c.UpstreamRetries = 3 })
+	h.mock.set(func(u *mockOpts) { u.failNext = 1 })
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("status %d: %s", status, body)
+	}
+	if got := h.mock.callCount(); got != 2 {
+		t.Fatalf("upstream called %d times, want exactly 2 (one failure, one retry)", got)
+	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.Attempts != 2 {
+		t.Fatalf("event records %d attempts, want 2 — the cost of a request is not what it looks like", last.Attempts)
+	}
+}
+
+// An upstream may simply ignore stream_options.include_usage. Without the
+// estimate, every streamed request against such an upstream is metered as zero
+// tokens — billed as free and never charging the token bucket.
+func TestStreamWithoutUsageIsEstimated(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(u *mockOpts) { u.noUsage = true })
+	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if status != 200 {
+		t.Fatalf("status %d: %s", status, body)
+	}
+	evs := h.spoolEvents(t)
+	ev := evs[len(evs)-1]
+	if !ev.Estimated {
+		t.Fatal("an upstream that reported no usage produced an event claiming exact counts")
+	}
+	if ev.InputTokens <= 0 || ev.OutputTokens <= 0 {
+		t.Fatalf("metered %d/%d tokens: the request was billed as free", ev.InputTokens, ev.OutputTokens)
+	}
+}
+
+// Nothing proved the request path charges the token bucket at all — only that
+// the bucket works when charged directly. A wrong key id, the wrong count, or
+// no charge at all leaves the token limit permanently unreachable.
+func TestTokenLimitIsChargedFromTheRequestPath(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		// The bucket is charged after the fact and admission only requires it
+		// out of debt, so the limit has to be under one response's total (12)
+		// for the second request to be the one refused.
+		d.Keys[0].Limits.Tpm = 10
+	}, nil)
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("first request: %d %s", status, body)
+	}
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 429 {
+		t.Fatalf("second request got %d, want 429 — the token bucket is never charged: %s", status, body)
+	}
+	if code := errCode(t, body); code != "rate_limit_tokens" {
+		t.Fatalf("refused with %q, want rate_limit_tokens", code)
 	}
 }
