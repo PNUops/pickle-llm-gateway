@@ -52,6 +52,21 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 그 모델을 `allowedModels`에 명시한 키만 접근할 수 있고, 비어 있는 `allowedModels`는
 `PUBLIC` 모델만 허용합니다. 새 모델을 넣어도 기존 키에 자동으로 열리지 않습니다.
 
+모델에는 **예산 축**(`budgetAxis`)이 있습니다. `TOKEN`(기본값, 필드가 없으면 이 값)은
+교내 서빙 모델의 축으로, 문서의 `quotaExhausted` 플래그(일일 토큰 한도)가 이 축의
+모델에만 적용됩니다. `CREDIT`은 상용 모델의 축으로, 요청에 **그 Key 전용 업스트림
+자격증명**(`upstreamCredentials`의 해당 업스트림 항목)이 있어야 하고 금액 한도는 그
+자격증명을 발급한 쪽이 강제합니다. CREDIT 축에서는 게이트웨이 공용 env 자격증명을
+절대 대신 쓰지 않습니다 — 자격증명이 없는 Key는 `credit_unavailable`로 거절됩니다.
+축은 모델 행의 속성이지 업스트림 종류가 아니므로, 같은 모델의 업스트림을 교체해도
+축은 바뀌지 않습니다.
+
+문서 최상위의 `passthroughRef`가 설정돼 있으면, 카탈로그에 없는 모델명은 그 업스트림으로
+**이름 그대로** 전달됩니다(패스스루). 패스스루 모델은 항상 CREDIT 축으로 취급되므로 Key
+자격증명이 없으면 거절되고, `pnu-` 접두 이름은 패스스루되지 않습니다 — 교내 모델명의
+오타가 과금 요청이 되지 않도록 404로 남습니다. 공개 모델명은 소문자로 쓰고 조회는
+대소문자를 구분하며, `pnu-` 접두는 교내(자체 서빙) 모델 전용입니다.
+
 각 응답은 `X-Request-Id` 헤더로 그 요청의 기록 식별자를 돌려주므로 문의에 인용할 수
 있습니다. `/healthz`는 세대·스냅샷 나이·리로드 정체 여부를 함께 반환합니다.
 
@@ -211,12 +226,14 @@ go run ./cmd/llm-gateway
 {
   "generation": 1,
   "serviceEnabled": true,
+  "passthroughRef": "openrouter",
   "models": [
     {
       "publicName": "pnu-general",
       "upstreamRef": "main",
       "upstreamModel": "example-model-32b",
       "fallbackRef": "backup",
+      "budgetAxis": "TOKEN",
       "maxOutputTokens": 4096
     }
   ],
@@ -226,11 +243,16 @@ go run ./cmd/llm-gateway
       "tokenHash": "<sha256 hex>",
       "status": "ACTIVE",
       "expiresAt": "2026-11-08T00:00:00Z",
-      "limits": { "rpm": 20, "tpm": 20000, "concurrency": 2 }
+      "limits": { "rpm": 20, "tpm": 20000, "concurrency": 2 },
+      "upstreamCredentials": { "openrouter": "<그 Key 전용 업스트림 Key>" }
     }
   ]
 }
 ```
+
+`tokenHash`는 해시라 문서만으로 Key 평문을 복원할 수 없지만, `upstreamCredentials`는
+**사용 가능한 업스트림 자격증명 그 자체**입니다. 문서를 백업하거나 옮길 때는 자격증명이
+든 파일로 취급하세요.
 
 ## 전체 아키텍처
 

@@ -91,7 +91,7 @@ func (h *upstreamHealth) recordSuccess(ref string) {
 // The returned count is how many upstream attempts were made, including the
 // one that succeeded: 1 is the ordinary path and anything above it means the
 // request cost more than it looks like it did.
-func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
+func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *snapshot.Key,
 	params map[string]json.RawMessage, outputCap int) (*http.Response, config.Upstream, int, *attemptError) {
 	attempts := 0
 
@@ -125,13 +125,27 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model,
 			last = &attemptError{err: errUnconfiguredUpstream}
 			continue
 		}
+		// Which bearer this attempt carries. A CREDIT-axis model spends the
+		// key's own money budget, so only the key's credential for this
+		// upstream will do — the gateway-wide env credential is deliberately
+		// never a fallback there (it would spend a shared budget for a key
+		// that was never granted one). The primary ref was already checked
+		// before anything was forwarded; this guards the fallback ref too.
+		cred := up.APIKey
+		if model.CreditAxis() {
+			cred = key.CredentialFor(up.Ref)
+			if cred == "" {
+				last = &attemptError{err: errNoKeyCredential}
+				continue
+			}
+		}
 		body, err := s.bodyFor(params, up, outputCap)
 		if err != nil {
 			return nil, up, attempts, &attemptError{err: err}
 		}
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
-			resp, ae := s.attempt(ctx, up, body)
+			resp, ae := s.attempt(ctx, up, body, cred)
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
@@ -200,16 +214,17 @@ func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, 
 	return json.Marshal(out)
 }
 
-// attempt performs one upstream call. A nil error means resp is a 200 whose
-// body the caller now owns.
-func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte) (*http.Response, *attemptError) {
+// attempt performs one upstream call carrying the given bearer (empty sends
+// no auth header). A nil error means resp is a 200 whose body the caller now
+// owns.
+func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, cred string) (*http.Response, *attemptError) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, &attemptError{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if up.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+up.APIKey)
+	if cred != "" {
+		req.Header.Set("Authorization", "Bearer "+cred)
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
