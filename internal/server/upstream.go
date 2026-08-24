@@ -145,7 +145,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 		}
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
-			resp, ae := s.attempt(ctx, up, body, cred)
+			resp, ae := s.attempt(ctx, up, body, cred, model.CreditAxis())
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
@@ -217,7 +217,8 @@ func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, 
 // attempt performs one upstream call carrying the given bearer (empty sends
 // no auth header). A nil error means resp is a 200 whose body the caller now
 // owns.
-func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, cred string) (*http.Response, *attemptError) {
+func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, cred string,
+	creditAxis bool) (*http.Response, *attemptError) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, &attemptError{err: err}
@@ -252,13 +253,21 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 		// retry fixes. Fall through to another upstream if one exists.
 		return nil, &attemptError{err: errUpstreamAuth}
 	case http.StatusPaymentRequired:
-		// The money ran out — on this key's own budget or on the account
-		// behind it. This is the money axis working, not a fault: retrying
-		// spends nothing and fixes nothing, another upstream would answer the
-		// same, and putting the upstream into cooldown for it would let one
-		// exhausted key reorder everybody else's traffic. Refuse it back to
-		// the student in their own words.
-		return nil, &attemptError{refusal: &errCreditExhausted}
+		if creditAxis {
+			// The money ran out on this key's own budget. This is the money
+			// axis working, not a fault: retrying spends nothing and fixes
+			// nothing, another upstream would answer the same, and cooling
+			// the upstream down for it would let one exhausted key reorder
+			// everybody else's traffic. Refuse it in the student's own words.
+			return nil, &attemptError{refusal: &errCreditExhausted}
+		}
+		// A TOKEN-axis model runs on the gateway's own account, so a 402
+		// there is the platform's bill, not the student's — telling them to
+		// request a limit increase would send them to fix something they do
+		// not own. Treat it as the upstream fault it is, which also keeps
+		// the model's fallback in play: that fallback exists for exactly
+		// "the primary cannot serve right now".
+		return nil, &attemptError{err: errUpstreamStatus}
 	default:
 		return nil, &attemptError{err: errUpstreamStatus}
 	}
