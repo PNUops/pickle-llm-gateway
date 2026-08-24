@@ -30,6 +30,8 @@ var (
 		"이용이 정지된 상태입니다. 관리자에게 문의해주세요."}
 	errQuotaExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "quota_exhausted",
 		"사용량 한도를 모두 사용했습니다. 한도는 기간이 지나면 초기화되며, 증액이 필요하면 콘솔에서 신청해주세요."}
+	errCreditUnavailable = apiError{http.StatusForbidden, "permission_error", "credit_unavailable",
+		"이 API Key에는 상용 모델을 쓸 금액 한도가 연결되어 있지 않습니다. 금액 한도가 부여된 뒤 다시 시도해주세요."}
 	errServiceDisabled = apiError{http.StatusServiceUnavailable, "server_error", "service_disabled",
 		"LLM API 서비스가 점검 중입니다. 잠시 후 다시 시도해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
@@ -68,6 +70,7 @@ var (
 // the client sees the shaped envelope above.
 var (
 	errUnconfiguredUpstream = errors.New("model references an unconfigured upstream")
+	errNoKeyCredential      = errors.New("key has no credential for this upstream")
 	errUpstreamAuth         = errors.New("upstream rejected our credential")
 	errUpstreamStatus       = errors.New("upstream returned an error status")
 	errUpstreamThrottled    = errors.New("upstream is throttling this gateway")

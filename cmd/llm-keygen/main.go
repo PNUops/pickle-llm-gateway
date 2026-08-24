@@ -246,6 +246,7 @@ type document struct {
 	ServiceEnabled bool              `json:"serviceEnabled"`
 	Models         []json.RawMessage `json:"models"`
 	Keys           []json.RawMessage `json:"keys"`
+	PassthroughRef string            `json:"passthroughRef,omitempty"`
 }
 
 // mutate applies change to the document under an exclusive lock and writes the

@@ -43,6 +43,14 @@ type Document struct {
 	ServiceEnabled bool    `json:"serviceEnabled"`
 	Models         []Model `json:"models"`
 	Keys           []Key   `json:"keys"`
+	// PassthroughRef, when set, names the upstream that serves any public model
+	// name the catalog does not list. The commercial provider carries its own
+	// ever-changing model catalog, so those names are forwarded as-is instead of
+	// being enumerated here; a passthrough model is always on the CREDIT budget
+	// axis, and names under the self-serve prefix never pass through (a typo in
+	// a curated name must stay a 404, not become a billable request). Empty
+	// keeps today's behaviour: unknown model names are 404.
+	PassthroughRef string `json:"passthroughRef,omitempty"`
 }
 
 // Model visibility. RESTRICTED models are reachable only by a key that names
@@ -53,6 +61,22 @@ const (
 	ModelPublic     = "PUBLIC"
 	ModelRestricted = "RESTRICTED"
 )
+
+// Budget axes. A model's axis decides which of a key's two budgets its usage
+// counts against and which enforcement applies: TOKEN models are covered by
+// the document's QuotaExhausted flag (the daily token allowance, decided by
+// the control plane), CREDIT models by the per-key upstream credential whose
+// issuer enforces a money limit. The axis is a property of the model row, not
+// of the upstream kind — a self-serve model temporarily served by an external
+// upstream stays on the TOKEN axis, and swapping the upstream never moves it.
+const (
+	AxisToken  = "TOKEN"
+	AxisCredit = "CREDIT"
+)
+
+// SelfServePrefix is the reserved prefix for curated self-serve model names.
+// Names under it are never passed through to a commercial upstream.
+const SelfServePrefix = "pnu-"
 
 // Model maps one public model name to an upstream target. Students only ever
 // see PublicName; UpstreamRef selects a configured upstream block and
@@ -67,10 +91,18 @@ type Model struct {
 	Visibility      string `json:"visibility,omitempty"` // PUBLIC (default) | RESTRICTED
 	MaxInputTokens  int    `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"`
+	// BudgetAxis is TOKEN (default when empty) or CREDIT — see the axis
+	// constants. Empty means TOKEN so a document written before the axis
+	// existed keeps meaning what it meant.
+	BudgetAxis string `json:"budgetAxis,omitempty"`
 }
 
 // Restricted reports whether the model is reachable only by keys that name it.
 func (m *Model) Restricted() bool { return m.Visibility == ModelRestricted }
+
+// CreditAxis reports whether the model's usage is governed by the money
+// budget (per-key upstream credential) rather than the token budget.
+func (m *Model) CreditAxis() bool { return m.BudgetAxis == AxisCredit }
 
 // Key statuses. Anything but ACTIVE refuses requests; the distinction only
 // changes the error message.
@@ -80,9 +112,12 @@ const (
 	KeyRevoked   = "REVOKED"
 )
 
-// Key is one issued API key. The plaintext never appears anywhere: TokenHash
-// is the hex sha256 of the full bearer token, and lookup hashes the presented
-// token before comparing.
+// Key is one issued API key. The key's own plaintext never appears anywhere:
+// TokenHash is the hex sha256 of the full bearer token, and lookup hashes the
+// presented token before comparing. UpstreamCredentials is the deliberate
+// exception to the old "hashes only" rule: it carries usable upstream secrets
+// for this key, which is what makes per-key money limits enforceable by the
+// upstream that holds the money.
 type Key struct {
 	KeyID          string     `json:"keyId"`
 	TokenHash      string     `json:"tokenHash"`
@@ -91,6 +126,13 @@ type Key struct {
 	AllowedModels  []string   `json:"allowedModels,omitempty"`
 	Limits         Limits     `json:"limits"`
 	QuotaExhausted bool       `json:"quotaExhausted,omitempty"`
+	// UpstreamCredentials maps an upstream ref (lowercased at load) to the
+	// bearer this key must use there. CREDIT-axis models require an entry for
+	// the serving upstream — there is deliberately no fallback to the
+	// gateway-wide env credential, because that would spend a shared budget on
+	// behalf of a key that was never granted one. Absent or empty means the
+	// key cannot reach CREDIT-axis models at all.
+	UpstreamCredentials map[string]string `json:"upstreamCredentials,omitempty"`
 	// RecordBodies opts this key into prompt and response capture. It is the
 	// key owner's choice, expressed in the control plane and carried here; the
 	// default is off, so a key says nothing about bodies unless someone asked
@@ -106,6 +148,16 @@ type Limits struct {
 	Rpm         int `json:"rpm,omitempty"`
 	Tpm         int `json:"tpm,omitempty"`
 	Concurrency int `json:"concurrency,omitempty"`
+}
+
+// CredentialFor returns the key's own bearer for the named upstream, or ""
+// when it has none there. Refs are matched case-insensitively, like every
+// other upstream-ref comparison.
+func (k *Key) CredentialFor(ref string) string {
+	if len(k.UpstreamCredentials) == 0 {
+		return ""
+	}
+	return k.UpstreamCredentials[strings.ToLower(ref)]
 }
 
 // AllowsModel reports whether the key may use the model. An empty allow list
@@ -400,6 +452,7 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 		ServiceEnabled *bool              `json:"serviceEnabled"`
 		Models         *[]json.RawMessage `json:"models"`
 		Keys           *[]json.RawMessage `json:"keys"`
+		PassthroughRef string             `json:"passthroughRef"`
 	}
 	envDec := json.NewDecoder(strings.NewReader(string(raw)))
 	if !fromControl {
@@ -428,6 +481,7 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 		ServiceEnabled: *env.ServiceEnabled,
 		Models:         make([]Model, 0, len(rawModels)),
 		Keys:           make([]Key, 0, len(rawKeys)),
+		PassthroughRef: strings.ToLower(env.PassthroughRef),
 	}
 	st := &state{
 		byHash:   make(map[string]*Key, len(rawKeys)),
@@ -446,6 +500,17 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 		return nil
 	}
 
+	// A passthrough target this host has not configured cannot serve anything;
+	// disabling passthrough (unknown names go back to 404) is the local,
+	// visible failure, where keeping the ref would turn every uncatalogued
+	// model name into a per-request upstream error.
+	if doc.PassthroughRef != "" && known != nil && !known[doc.PassthroughRef] {
+		if derr := drop("passthroughRef %q is not a configured upstream; passthrough disabled", doc.PassthroughRef); derr != nil {
+			return nil, derr
+		}
+		doc.PassthroughRef = ""
+	}
+
 	for i, rawModel := range rawModels {
 		var m Model
 		if err := json.Unmarshal(rawModel, &m); err != nil {
@@ -454,6 +519,10 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			}
 			continue
 		}
+		// Upstream refs are matched case-insensitively everywhere; lowering
+		// them once here is what lets every later comparison be a plain hit.
+		m.UpstreamRef = strings.ToLower(m.UpstreamRef)
+		m.FallbackRef = strings.ToLower(m.FallbackRef)
 		reason := modelProblem(&m, i, known, st.byPublic)
 		if reason != "" {
 			if derr := drop("%s", reason); derr != nil {
@@ -467,6 +536,34 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 		var k Key
 		if err := json.Unmarshal(rawKey, &k); err != nil {
 			if derr := drop("key %d: %v", i, err); derr != nil {
+				return nil, derr
+			}
+			continue
+		}
+		// Credential refs are lowercased once here so every later lookup can
+		// be a plain map hit; an empty credential is the same as none. Two
+		// refs that collide after lowering would leave map iteration order
+		// picking which credential gets spent — that entry is unusable, and
+		// dropping it is fail-closed like every other unusable entry.
+		credProblem := ""
+		if len(k.UpstreamCredentials) > 0 {
+			norm := make(map[string]string, len(k.UpstreamCredentials))
+			for ref, cred := range k.UpstreamCredentials {
+				if cred == "" {
+					continue
+				}
+				lower := strings.ToLower(ref)
+				if _, dup := norm[lower]; dup {
+					credProblem = fmt.Sprintf(
+						"key %s: upstreamCredentials refs collide on %q", k.KeyID, lower)
+					break
+				}
+				norm[lower] = cred
+			}
+			k.UpstreamCredentials = norm
+		}
+		if credProblem != "" {
+			if derr := drop("%s", credProblem); derr != nil {
 				return nil, derr
 			}
 			continue
@@ -509,6 +606,14 @@ func modelProblem(m *Model, i int, known map[string]bool, seen map[string]*Model
 		// Not knowing how visible a model is means not knowing who may reach
 		// it, so the entry goes rather than being guessed at either way.
 		return fmt.Sprintf("model %q: unknown visibility %q", m.PublicName, m.Visibility)
+	}
+	switch m.BudgetAxis {
+	case "", AxisToken, AxisCredit:
+	default:
+		// The axis decides which budget governs the model; guessing it would
+		// either bill a token model against money or exempt a credit model
+		// from its credential requirement.
+		return fmt.Sprintf("model %q: unknown budgetAxis %q", m.PublicName, m.BudgetAxis)
 	}
 	if known != nil && !known[strings.ToLower(m.UpstreamRef)] {
 		return fmt.Sprintf("model %q references upstream %q, which is not configured", m.PublicName, m.UpstreamRef)

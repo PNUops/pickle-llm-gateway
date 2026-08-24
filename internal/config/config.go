@@ -14,8 +14,11 @@ import (
 )
 
 // Upstream is one OpenAI-compatible target the snapshot's upstreamRef can
-// select. The API key never appears in the snapshot or in logs; it lives in
-// the environment only.
+// select. This env-level API key never appears in the snapshot or in logs; it
+// lives in the environment only, and it serves TOKEN-axis models. CREDIT-axis
+// models never use it — they require the per-key credential the snapshot
+// carries (snapshot.Key.UpstreamCredentials), which is the one deliberate
+// exception to "the snapshot holds no usable secret".
 type Upstream struct {
 	Ref     string // lowercase reference name, as used in the snapshot
 	BaseURL string // e.g. https://api.openai.com/v1

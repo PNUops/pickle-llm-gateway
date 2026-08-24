@@ -1793,7 +1793,8 @@ func allAPIErrors() map[string]apiError {
 		"errMissingKey": errMissingKey, "errInvalidKey": errInvalidKey,
 		"errKeyExpired": errKeyExpired, "errKeyRevoked": errKeyRevoked,
 		"errKeySuspended": errKeySuspended, "errQuotaExhausted": errQuotaExhausted,
-		"errRateRequests": errRateRequests, "errRateTokens": errRateTokens,
+		"errCreditUnavailable": errCreditUnavailable,
+		"errRateRequests":      errRateRequests, "errRateTokens": errRateTokens,
 		"errRateConcurrency": errRateConcurrency, "errServiceDisabled": errServiceDisabled,
 		"errModelNotFound": errModelNotFound, "errModelNotAllowed": errModelNotAllowed,
 		"errOutputTooLong": errOutputTooLong, "errInputTooLong": errInputTooLong,
@@ -1932,7 +1933,11 @@ func TestClientDisconnectMidStreamIsMeteredAndReleasesSlots(t *testing.T) {
 // The race detector runs in CI; this gives it something to look at, and it
 // catches a nil map on the read side either way.
 func TestSnapshotSwapUnderLoad(t *testing.T) {
-	h := newHarness(t, nil, nil)
+	// The gateway-wide cap must clear the 24 concurrent requests below: this
+	// test asserts snapshot consistency, and with the default cap of 16 a
+	// fast machine overlaps enough of them to see legitimate server_busy
+	// refusals that have nothing to do with a torn snapshot.
+	h := newHarness(t, nil, func(c *config.Config) { c.MaxInFlight = 64 })
 	doc := defaultDoc()
 
 	stop := make(chan struct{})

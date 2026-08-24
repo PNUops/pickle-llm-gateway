@@ -20,8 +20,39 @@ import (
 
 	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
+
+// maxPassthroughNameBytes bounds a passthrough model name. Catalog names are
+// short by construction; an uncatalogued name is client input headed for logs,
+// the usage spool and an upstream URL-less request body, so junk is cut off
+// here rather than carried through all three.
+const maxPassthroughNameBytes = 256
+
+// passthroughModel synthesizes a model entry for a public name the catalog
+// does not list, when the current document names a passthrough upstream. The
+// synthesized model is always on the CREDIT axis: the commercial provider
+// prices it, so the per-key credential (and the money limit behind it) is the
+// only budget that can govern it. Names under the self-serve prefix never
+// pass through — a typo in a curated name must stay a 404 rather than become
+// a billable request to the commercial provider.
+func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model {
+	// The prefix guard is case-insensitive even though catalog lookup is not:
+	// "PNU-general" must fail like "pnu-generall" does, not slip past the
+	// guard into a billable request.
+	if doc.PassthroughRef == "" ||
+		strings.HasPrefix(strings.ToLower(publicName), snapshot.SelfServePrefix) ||
+		len(publicName) > maxPassthroughNameBytes {
+		return nil
+	}
+	return &snapshot.Model{
+		PublicName:    publicName,
+		UpstreamRef:   doc.PassthroughRef,
+		UpstreamModel: publicName,
+		BudgetAxis:    snapshot.AxisCredit,
+	}
+}
 
 // allowedParams are the top-level request fields the gateway forwards. An
 // unknown field is refused rather than silently forwarded, so replacing the
@@ -113,7 +144,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if key.QuotaExhausted {
+	// The daily token quota is checked after the model resolves — it governs
+	// only TOKEN-axis models, and which axis applies is a fact about the model
+	// the request names. But a key that is BOTH quota-exhausted and without
+	// any upstream credential cannot pass either axis, so it is refused here,
+	// before it spends an in-flight slot and a body parse per attempt.
+	if key.QuotaExhausted && len(key.UpstreamCredentials) == 0 {
 		refuse(errQuotaExhausted, spool.StatusRateLimited)
 		return
 	}
@@ -180,12 +216,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	model := modelLookup(publicModel)
 	if model == nil {
+		model = passthroughModel(&doc, publicModel)
+	}
+	if model == nil {
 		refuse(errModelNotFound, spool.StatusBadRequest)
 		return
 	}
 	ev.PublicModelName = publicModel
 	if !key.AllowsModel(model) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
+		return
+	}
+	// Budget-axis enforcement, now that the model (and so the axis) is known.
+	// TOKEN models answer to the document's daily-quota flag; CREDIT models
+	// answer to the per-key upstream credential, whose issuer holds the money
+	// limit — a key granted no money budget simply carries no credential.
+	if model.CreditAxis() {
+		if key.CredentialFor(model.UpstreamRef) == "" {
+			refuse(errCreditUnavailable, spool.StatusAuthRejected)
+			return
+		}
+	} else if key.QuotaExhausted {
+		refuse(errQuotaExhausted, spool.StatusRateLimited)
 		return
 	}
 	// Output length. A JSON null is what SDKs send for "unset" and is treated
@@ -267,7 +319,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Try the model's upstream, then its fallback if it has one. Nothing has
 	// been written to the client yet, so switching upstreams here is invisible
 	// to the student; once the response starts, it is not.
-	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, params, outputCap)
+	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, key, params, outputCap)
 	ev.TtftMs = time.Since(start).Milliseconds()
 	if attemptErr != nil {
 		switch {
