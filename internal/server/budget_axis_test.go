@@ -223,6 +223,25 @@ func TestCreditExhaustedIsARefusalNotAnOutage(t *testing.T) {
 	}
 }
 
+func TestTokenAxis402IsAnUpstreamFaultNotTheStudentsBudget(t *testing.T) {
+	// The same status on a TOKEN-axis model means the platform's own account
+	// ran dry, not the key's budget. Telling the student to request a limit
+	// increase would send them to fix something they do not own, so it stays
+	// an upstream fault — which also keeps the model's fallback in play.
+	h := newHarness(t, creditDoc, nil)
+	h.mock.set(func(u *mockOpts) { u.status = 402; u.errBody = `{"error":{"code":402}}` })
+
+	status, body := h.chat(t, testToken, chatBody)
+
+	if status != 502 || errCode(t, body) != "upstream_error" {
+		t.Fatalf("402 on a token-axis model: got %d %s", status, body)
+	}
+	evs := h.spoolEvents(t)
+	if last := evs[len(evs)-1]; last.Status != "UPSTREAM_ERROR" {
+		t.Fatalf("event recorded as %q, want UPSTREAM_ERROR", last.Status)
+	}
+}
+
 func TestRestrictedKeyListGovernsPassthroughToo(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.PassthroughRef = "mock"
