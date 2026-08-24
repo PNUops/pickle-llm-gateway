@@ -1794,6 +1794,7 @@ func allAPIErrors() map[string]apiError {
 		"errKeyExpired": errKeyExpired, "errKeyRevoked": errKeyRevoked,
 		"errKeySuspended": errKeySuspended, "errQuotaExhausted": errQuotaExhausted,
 		"errCreditUnavailable": errCreditUnavailable,
+		"errCreditExhausted":   errCreditExhausted,
 		"errRateRequests":      errRateRequests, "errRateTokens": errRateTokens,
 		"errRateConcurrency": errRateConcurrency, "errServiceDisabled": errServiceDisabled,
 		"errModelNotFound": errModelNotFound, "errModelNotAllowed": errModelNotAllowed,

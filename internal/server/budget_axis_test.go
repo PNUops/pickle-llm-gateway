@@ -198,6 +198,31 @@ func TestUnknownModelStays404WithoutPassthrough(t *testing.T) {
 	}
 }
 
+func TestCreditExhaustedIsARefusalNotAnOutage(t *testing.T) {
+	// 402 is the money axis working: the student hears "budget spent", the
+	// request is not retried, the upstream is not cooled down (one exhausted
+	// key must not reorder everybody else's traffic), and the event counts as
+	// a limit refusal rather than an upstream fault.
+	h := newHarness(t, creditDoc, nil)
+	h.mock.set(func(u *mockOpts) { u.status = 402; u.errBody = `{"error":{"code":402}}` })
+
+	status, body := h.chat(t, testToken, creditChatBody)
+
+	if status != 429 || errCode(t, body) != "credit_exhausted" {
+		t.Fatalf("402 from the upstream: got %d %s", status, body)
+	}
+	if h.mock.callCount() != 1 {
+		t.Fatalf("a budget refusal was retried: %d upstream calls", h.mock.callCount())
+	}
+	if h.srv.health.cooling("mock") {
+		t.Fatal("a budget refusal put the upstream in cooldown")
+	}
+	evs := h.spoolEvents(t)
+	if last := evs[len(evs)-1]; last.Status != "RATE_LIMITED" {
+		t.Fatalf("event recorded as %q, want RATE_LIMITED", last.Status)
+	}
+}
+
 func TestRestrictedKeyListGovernsPassthroughToo(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.PassthroughRef = "mock"

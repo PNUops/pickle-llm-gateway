@@ -251,6 +251,14 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 		// Our credential, not the student's problem — and not something a
 		// retry fixes. Fall through to another upstream if one exists.
 		return nil, &attemptError{err: errUpstreamAuth}
+	case http.StatusPaymentRequired:
+		// The money ran out — on this key's own budget or on the account
+		// behind it. This is the money axis working, not a fault: retrying
+		// spends nothing and fixes nothing, another upstream would answer the
+		// same, and putting the upstream into cooldown for it would let one
+		// exhausted key reorder everybody else's traffic. Refuse it back to
+		// the student in their own words.
+		return nil, &attemptError{refusal: &errCreditExhausted}
 	default:
 		return nil, &attemptError{err: errUpstreamStatus}
 	}

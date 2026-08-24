@@ -331,7 +331,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		case upCtx.Err() != nil || attemptErr.timeout:
 			refuse(errUpstreamTimeout, spool.StatusTimeout)
 		case attemptErr.refusal != nil:
-			refuse(*attemptErr.refusal, spool.StatusUpstreamErr)
+			// A budget refusal is accounting, not a fault: it belongs with the
+			// other limit refusals so "how often did this key hit a wall"
+			// counts it and "is the upstream broken" does not.
+			status := spool.StatusUpstreamErr
+			if attemptErr.refusal.code == errCreditExhausted.code {
+				status = spool.StatusRateLimited
+			}
+			refuse(*attemptErr.refusal, status)
 		case attemptErr.throttled:
 			// Every upstream is throttling us: the service really is busy.
 			refuse(errServerBusy, spool.StatusUpstreamErr)
