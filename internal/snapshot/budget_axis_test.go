@@ -94,3 +94,41 @@ func TestCredentialNormalization(t *testing.T) {
 		t.Fatal("a key with no credentials must answer none")
 	}
 }
+
+func TestCredentialRefCollisionDropsTheKey(t *testing.T) {
+	// Refs that collide after lowering would leave map iteration deciding
+	// which credential gets spent; the entry is unusable and must drop.
+	doc := `{
+	  "generation": 1, "serviceEnabled": true, "models": [],
+	  "keys": [{"keyId": "k1", "tokenHash": "` + HashToken("t") + `", "status": "ACTIVE",
+	            "upstreamCredentials": {"OpenRouter": "sk-a", "openrouter": "sk-b"}}]
+	}`
+	st, err := build([]byte(doc), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.doc.Keys) != 0 || st.rejected != 1 {
+		t.Fatalf("colliding credential refs survived: %d keys, %d rejected",
+			len(st.doc.Keys), st.rejected)
+	}
+	if _, err := build([]byte(doc), nil, false); err == nil {
+		t.Fatal("file path accepted colliding credential refs")
+	}
+}
+
+func TestModelRefsAreLoweredAtLoad(t *testing.T) {
+	doc := `{
+	  "generation": 1, "serviceEnabled": true,
+	  "models": [{"publicName": "a", "upstreamRef": "Mock", "upstreamModel": "m",
+	              "fallbackRef": "BACKUP"}],
+	  "keys": []
+	}`
+	st, err := build([]byte(doc), known("mock", "backup"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := st.byPublic["a"]
+	if m.UpstreamRef != "mock" || m.FallbackRef != "backup" {
+		t.Fatalf("refs not normalized: %q/%q", m.UpstreamRef, m.FallbackRef)
+	}
+}

@@ -182,6 +182,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// restricted model's existence.
 	if id := strings.TrimPrefix(r.URL.Path, "/v1/models/"); id != "" && id != r.URL.Path {
 		m := modelLookup(id)
+		// The retrieve surface must agree with chat: a name chat would serve
+		// through passthrough exists here too, but only for a key that could
+		// actually call it (credential for the passthrough upstream) — for
+		// anyone else an arbitrary name is a 404, same as before.
+		if m == nil {
+			if p := passthroughModel(&doc, id); p != nil && key.CredentialFor(p.UpstreamRef) != "" {
+				m = p
+			}
+		}
 		if m == nil || !key.AllowsModel(m) {
 			writeAPIError(w, errModelNotFound)
 			return

@@ -519,6 +519,10 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			}
 			continue
 		}
+		// Upstream refs are matched case-insensitively everywhere; lowering
+		// them once here is what lets every later comparison be a plain hit.
+		m.UpstreamRef = strings.ToLower(m.UpstreamRef)
+		m.FallbackRef = strings.ToLower(m.FallbackRef)
 		reason := modelProblem(&m, i, known, st.byPublic)
 		if reason != "" {
 			if derr := drop("%s", reason); derr != nil {
@@ -537,16 +541,32 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			continue
 		}
 		// Credential refs are lowercased once here so every later lookup can
-		// be a plain map hit; an empty credential is the same as none.
+		// be a plain map hit; an empty credential is the same as none. Two
+		// refs that collide after lowering would leave map iteration order
+		// picking which credential gets spent — that entry is unusable, and
+		// dropping it is fail-closed like every other unusable entry.
+		credProblem := ""
 		if len(k.UpstreamCredentials) > 0 {
 			norm := make(map[string]string, len(k.UpstreamCredentials))
 			for ref, cred := range k.UpstreamCredentials {
 				if cred == "" {
 					continue
 				}
-				norm[strings.ToLower(ref)] = cred
+				lower := strings.ToLower(ref)
+				if _, dup := norm[lower]; dup {
+					credProblem = fmt.Sprintf(
+						"key %s: upstreamCredentials refs collide on %q", k.KeyID, lower)
+					break
+				}
+				norm[lower] = cred
 			}
 			k.UpstreamCredentials = norm
+		}
+		if credProblem != "" {
+			if derr := drop("%s", credProblem); derr != nil {
+				return nil, derr
+			}
+			continue
 		}
 		reason := keyProblem(&k, i, st.byHash)
 		if reason != "" {

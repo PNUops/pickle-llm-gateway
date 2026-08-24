@@ -38,8 +38,11 @@ const maxPassthroughNameBytes = 256
 // pass through — a typo in a curated name must stay a 404 rather than become
 // a billable request to the commercial provider.
 func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model {
+	// The prefix guard is case-insensitive even though catalog lookup is not:
+	// "PNU-general" must fail like "pnu-generall" does, not slip past the
+	// guard into a billable request.
 	if doc.PassthroughRef == "" ||
-		strings.HasPrefix(publicName, snapshot.SelfServePrefix) ||
+		strings.HasPrefix(strings.ToLower(publicName), snapshot.SelfServePrefix) ||
 		len(publicName) > maxPassthroughNameBytes {
 		return nil
 	}
@@ -141,9 +144,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The daily token quota is checked after the model resolves, not here: it
-	// governs only TOKEN-axis models, and which axis applies is a fact about
-	// the model the request names.
+	// The daily token quota is checked after the model resolves — it governs
+	// only TOKEN-axis models, and which axis applies is a fact about the model
+	// the request names. But a key that is BOTH quota-exhausted and without
+	// any upstream credential cannot pass either axis, so it is refused here,
+	// before it spends an in-flight slot and a body parse per attempt.
+	if key.QuotaExhausted && len(key.UpstreamCredentials) == 0 {
+		refuse(errQuotaExhausted, spool.StatusRateLimited)
+		return
+	}
 	// The gateway-wide cap is checked before any per-key charge: a refusal
 	// the student cannot influence must not spend their request budget.
 	select {

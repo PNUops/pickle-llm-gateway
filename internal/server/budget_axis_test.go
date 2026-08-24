@@ -5,6 +5,7 @@
 package server
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -133,13 +134,57 @@ func TestPassthroughNeverServesSelfServePrefix(t *testing.T) {
 	}, nil)
 
 	// A typo under the curated prefix must stay a 404 rather than become a
-	// billable request to the commercial provider.
-	status, body := h.chat(t, testToken, `{"model":"pnu-generall","messages":[{"role":"user","content":"hi"}]}`)
-	if status != 404 || errCode(t, body) != "model_not_found" {
-		t.Fatalf("self-serve-prefixed unknown name: got %d %s", status, body)
+	// billable request to the commercial provider — case variants included:
+	// the catalog lookup is case-sensitive, so "PNU-general" misses it, and
+	// without a case-insensitive guard it would slip through as billable.
+	for _, name := range []string{"pnu-generall", "PNU-general", "Pnu-x"} {
+		status, body := h.chat(t, testToken,
+			`{"model":"`+name+`","messages":[{"role":"user","content":"hi"}]}`)
+		if status != 404 || errCode(t, body) != "model_not_found" {
+			t.Fatalf("self-serve-prefixed unknown name %q: got %d %s", name, status, body)
+		}
 	}
 	if h.mock.callCount() != 0 {
 		t.Fatal("a pnu-prefixed unknown name reached the upstream")
+	}
+}
+
+func TestQuotaExhaustedKeyWithoutCredentialRefusedEarly(t *testing.T) {
+	// Exhausted token quota and no credential: no axis can serve this key, so
+	// it is refused before the upstream and before any body handling.
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		d.Keys[0].QuotaExhausted = true
+		d.Keys[0].UpstreamCredentials = nil
+	}, nil)
+	for _, body := range []string{chatBody, creditChatBody} {
+		status, out := h.chat(t, testToken, body)
+		if status != 429 || errCode(t, out) != "quota_exhausted" {
+			t.Fatalf("got %d %s", status, out)
+		}
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("an unusable key reached the upstream")
+	}
+}
+
+func TestModelRetrieveAgreesWithPassthrough(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.PassthroughRef = "mock"
+		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
+	}, nil)
+	req, err := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/vendor%2Fsome-model", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("retrieve of a passthrough-served name answered %d", resp.StatusCode)
 	}
 }
 
