@@ -149,7 +149,7 @@ Go 1.26 이상이 필요합니다.
 
 ```bash
 go build ./...          # 빌드
-bash scripts/verify.sh  # 셸 린트, Go 포맷·정적 검사·테스트, 게시 위생 검사
+bash scripts/verify.sh  # 셸 린트, Go 포맷·정적 검사·테스트
 ```
 
 로컬 실행 예시:
