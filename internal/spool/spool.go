@@ -37,12 +37,15 @@ type Event struct {
 	Generation      int64  `json:"generation,omitempty"`
 	KeyID           string `json:"keyId,omitempty"`
 	PublicModelName string `json:"publicModelName,omitempty"`
-	// UpstreamRef names the upstream that actually served the request, and
+	// UpstreamRef names the last upstream the request was sent to, and
 	// Attempts how many tries it took. The public model name deliberately hides
 	// which server answered, so without these a fallback to a second upstream —
 	// a different model, often a paid one — is indistinguishable in the
 	// accounting from the ordinary path. It cannot be reconstructed later
-	// either: nothing else records it.
+	// either: nothing else records it. A failed request carries them too: a
+	// timeout or a 5xx still costs whatever the upstream had already produced,
+	// and a request refused before any upstream was contacted is the only one
+	// that leaves both empty.
 	UpstreamRef  string    `json:"upstreamRef,omitempty"`
 	Attempts     int       `json:"attempts,omitempty"`
 	Status       string    `json:"status"`

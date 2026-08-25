@@ -117,6 +117,11 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 	}
 
 	var last *attemptError
+	// The last upstream a request was actually sent to. On total failure the
+	// caller still has to record who was tried, and `up` below is scoped to
+	// the loop. It stays zero-valued while nothing has been contacted, which
+	// is the honest answer for a model whose refs are all unconfigured.
+	var lastUp config.Upstream
 	for i, ref := range refs {
 		up, ok := s.cfg.Upstreams[strings.ToLower(ref)]
 		if !ok {
@@ -139,6 +144,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 				continue
 			}
 		}
+		lastUp = up
 		body, err := s.bodyFor(params, up, outputCap)
 		if err != nil {
 			return nil, up, attempts, &attemptError{err: err}
@@ -197,7 +203,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 	if last == nil {
 		last = &attemptError{err: errUnconfiguredUpstream}
 	}
-	return nil, config.Upstream{}, attempts, last
+	return nil, lastUp, attempts, last
 }
 
 // bodyFor renders the request for one upstream, injecting the output cap on
