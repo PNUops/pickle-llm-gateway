@@ -177,7 +177,7 @@ func defaultDoc() snapshot.Document {
 		Generation:     1,
 		ServiceEnabled: true,
 		Models: []snapshot.Model{{
-			PublicName: "pnu-general", UpstreamRef: "mock",
+			PublicName: "pickle-general", UpstreamRef: "mock",
 			UpstreamModel: upstreamModel, MaxOutputTokens: 4096,
 		}},
 		Keys: []snapshot.Key{{
@@ -348,7 +348,7 @@ func (h *harness) spoolEvents(t *testing.T) []spool.Event {
 	return evs
 }
 
-const chatBody = `{"model":"pnu-general","messages":[{"role":"user","content":"MARKER-PROMPT-CONTENT"}]}`
+const chatBody = `{"model":"pickle-general","messages":[{"role":"user","content":"MARKER-PROMPT-CONTENT"}]}`
 
 func TestAuthRefusals(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
@@ -407,7 +407,7 @@ func TestChatNonStream(t *testing.T) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp["model"] != "pnu-general" {
+	if resp["model"] != "pickle-general" {
 		t.Fatalf("model in response = %v, want the public name", resp["model"])
 	}
 	if bytes.Contains(body, []byte(upstreamModel)) {
@@ -437,19 +437,19 @@ func TestChatNonStream(t *testing.T) {
 	if ev.Status != spool.StatusOK || ev.InputTokens != 7 || ev.OutputTokens != 5 || ev.Estimated {
 		t.Fatalf("unexpected event: %+v", ev)
 	}
-	if ev.KeyID != "k-test" || ev.PublicModelName != "pnu-general" {
+	if ev.KeyID != "k-test" || ev.PublicModelName != "pickle-general" {
 		t.Fatalf("unexpected event identity: %+v", ev)
 	}
 }
 
 func TestChatStream(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if status != 200 {
 		t.Fatalf("status %d: %s", status, body)
 	}
 	text := string(body)
-	if !strings.Contains(text, `"model":"pnu-general"`) {
+	if !strings.Contains(text, `"model":"pickle-general"`) {
 		t.Fatalf("chunks not rewritten to the public name:\n%s", text)
 	}
 	if strings.Contains(text, upstreamModel) {
@@ -510,7 +510,7 @@ func TestSpoolNeverCarriesContent(t *testing.T) {
 
 func TestUnsupportedAndMissingParams(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"logit_bias":{}}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"logit_bias":{}}`)
 	if status != 400 || errCode(t, body) != "unsupported_parameter" {
 		t.Fatalf("got %d %s", status, body)
 	}
@@ -518,7 +518,7 @@ func TestUnsupportedAndMissingParams(t *testing.T) {
 	if status != 400 || errCode(t, body) != "missing_parameter" {
 		t.Fatalf("got %d %s", status, body)
 	}
-	status, body = h.chat(t, testToken, `{"model":"pnu-general"}`)
+	status, body = h.chat(t, testToken, `{"model":"pickle-general"}`)
 	if status != 400 || errCode(t, body) != "missing_parameter" {
 		t.Fatalf("got %d %s", status, body)
 	}
@@ -531,15 +531,15 @@ func TestUnsupportedAndMissingParams(t *testing.T) {
 func TestModelChecks(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.Models = append(d.Models, snapshot.Model{
-			PublicName: "pnu-restricted", UpstreamRef: "mock", UpstreamModel: "other"})
-		d.Keys[0].AllowedModels = []string{"pnu-general"}
+			PublicName: "pickle-restricted", UpstreamRef: "mock", UpstreamModel: "other"})
+		d.Keys[0].AllowedModels = []string{"pickle-general"}
 	}, nil)
 
-	status, body := h.chat(t, testToken, `{"model":"pnu-none","messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-none","messages":[]}`)
 	if status != 404 || errCode(t, body) != "model_not_found" {
 		t.Fatalf("got %d %s", status, body)
 	}
-	status, body = h.chat(t, testToken, `{"model":"pnu-restricted","messages":[]}`)
+	status, body = h.chat(t, testToken, `{"model":"pickle-restricted","messages":[]}`)
 	if status != 403 || errCode(t, body) != "model_not_allowed" {
 		t.Fatalf("got %d %s", status, body)
 	}
@@ -548,8 +548,8 @@ func TestModelChecks(t *testing.T) {
 func TestModelsListFiltered(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.Models = append(d.Models, snapshot.Model{
-			PublicName: "pnu-restricted", UpstreamRef: "mock", UpstreamModel: "other"})
-		d.Keys[0].AllowedModels = []string{"pnu-general"}
+			PublicName: "pickle-restricted", UpstreamRef: "mock", UpstreamModel: "other"})
+		d.Keys[0].AllowedModels = []string{"pickle-general"}
 	}, nil)
 	req, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
@@ -567,14 +567,14 @@ func TestModelsListFiltered(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		t.Fatal(err)
 	}
-	if list.Object != "list" || len(list.Data) != 1 || list.Data[0].ID != "pnu-general" {
+	if list.Object != "list" || len(list.Data) != 1 || list.Data[0].ID != "pickle-general" {
 		t.Fatalf("unexpected model list: %+v", list)
 	}
 }
 
 func TestOutputCapRefusal(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_tokens":999999}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"max_tokens":999999}`)
 	if status != 400 || errCode(t, body) != "output_limit_exceeded" {
 		t.Fatalf("got %d %s", status, body)
 	}
@@ -739,7 +739,7 @@ func TestHealthzAndUnknownPath(t *testing.T) {
 
 func TestRequestBodyCap(t *testing.T) {
 	h := newHarness(t, nil, func(c *config.Config) { c.RequestBodyMaxBytes = 200 })
-	big := fmt.Sprintf(`{"model":"pnu-general","messages":[{"role":"user","content":"%s"}]}`,
+	big := fmt.Sprintf(`{"model":"pickle-general","messages":[{"role":"user","content":"%s"}]}`,
 		strings.Repeat("a", 500))
 	status, body := h.chat(t, testToken, big)
 	if status != 400 || errCode(t, body) != "request_too_large" {
@@ -749,7 +749,7 @@ func TestRequestBodyCap(t *testing.T) {
 
 func TestStreamUsageChunkOnlyWhenRequested(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)
 	if status != 200 || !strings.Contains(string(body), `"prompt_tokens":7`) {
 		t.Fatalf("opted-in stream lost its usage chunk: %d %s", status, body)
 	}
@@ -796,7 +796,7 @@ func TestServerBusyDoesNotChargeRpm(t *testing.T) {
 
 func TestNullMaxTokensTreatedAsAbsent(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_tokens":null}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"max_tokens":null}`)
 	if status != 200 {
 		t.Fatalf("null max_tokens refused: %d %s", status, body)
 	}
@@ -812,7 +812,7 @@ func TestNullMaxTokensTreatedAsAbsent(t *testing.T) {
 
 func TestInvalidMaxTokensValue(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_tokens":"lots"}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"max_tokens":"lots"}`)
 	if status != 400 || errCode(t, body) != "invalid_parameter_value" {
 		t.Fatalf("got %d %s", status, body)
 	}
@@ -856,12 +856,12 @@ func TestCapFieldPerUpstream(t *testing.T) {
 func TestSplitEventRewritten(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(u *mockOpts) { u.splitEvent = true })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[]}`)
 	text := string(body)
 	if status != 200 || strings.Contains(text, upstreamModel) {
 		t.Fatalf("split event leaked the upstream model:\n%s", text)
 	}
-	if !strings.Contains(text, `"model":"pnu-general"`) || !strings.Contains(text, "안녕") {
+	if !strings.Contains(text, `"model":"pickle-general"`) || !strings.Contains(text, "안녕") {
 		t.Fatalf("split event lost content:\n%s", text)
 	}
 }
@@ -869,7 +869,7 @@ func TestSplitEventRewritten(t *testing.T) {
 func TestUnparseableChunkDropped(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(u *mockOpts) { u.brokenChunk = true })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[]}`)
 	text := string(body)
 	if status != 200 || strings.Contains(text, upstreamModel) || strings.Contains(text, "{broken") {
 		t.Fatalf("unparseable chunk forwarded:\n%s", text)
@@ -906,7 +906,7 @@ func TestNonStreamWithoutUsageEstimates(t *testing.T) {
 func TestStreamDeadlineReported(t *testing.T) {
 	h := newHarness(t, nil, func(c *config.Config) { c.RequestMaxDuration = 300 * time.Millisecond })
 	h.mock.set(func(u *mockOpts) { u.chunkDelay = 150 * time.Millisecond })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[]}`)
 	text := string(body)
 	if status != 200 {
 		t.Fatalf("stream status %d", status)
@@ -928,7 +928,7 @@ func TestCapFieldTranslation(t *testing.T) {
 		u.CapField = "max_tokens"
 		c.Upstreams["mock"] = u
 	})
-	if status, body := h.chat(t, testToken, `{"model":"pnu-general","messages":[],"max_completion_tokens":100}`); status != 200 {
+	if status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"max_completion_tokens":100}`); status != 200 {
 		t.Fatalf("%d %s", status, body)
 	}
 	sent, _ := h.mock.last()
@@ -944,7 +944,7 @@ func TestCapFieldTranslation(t *testing.T) {
 func TestHeartbeatForwardedContentNotDropped(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(u *mockOpts) { u.heartbeat = true })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[]}`)
 	text := string(body)
 	if status != 200 || !strings.Contains(text, "data: ping") {
 		t.Fatalf("heartbeat not forwarded:\n%s", text)
@@ -959,7 +959,7 @@ func TestHeartbeatForwardedContentNotDropped(t *testing.T) {
 func TestDroppedChunkMarksDegraded(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(u *mockOpts) { u.brokenChunk = true })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[]}`)
 	text := string(body)
 	if status != 200 || strings.Contains(text, upstreamModel) {
 		t.Fatalf("truncated chunk leaked the model or wrong status:\n%s", text)
@@ -974,7 +974,7 @@ func TestDroppedChunkMarksDegraded(t *testing.T) {
 func TestStreamInterruptAnnouncesError(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(u *mockOpts) { u.abortMid = true })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[]}`)
 	text := string(body)
 	if status != 200 {
 		t.Fatalf("stream status %d", status)
@@ -995,11 +995,11 @@ func TestRestrictedModelHiddenAndDenied(t *testing.T) {
 	// allow list; a key that names it may use it.
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.Models = append(d.Models, snapshot.Model{
-			PublicName: "pnu-internal", UpstreamRef: "mock", UpstreamModel: "secret",
+			PublicName: "pickle-internal", UpstreamRef: "mock", UpstreamModel: "secret",
 			Visibility: snapshot.ModelRestricted})
 		d.Keys = append(d.Keys, snapshot.Key{
 			KeyID: "k-priv", TokenHash: snapshot.HashToken("pickle-priv"), Status: snapshot.KeyActive,
-			AllowedModels: []string{"pnu-general", "pnu-internal"}})
+			AllowedModels: []string{"pickle-general", "pickle-internal"}})
 	}, nil)
 
 	// Open key: list excludes the restricted model, chat is denied, retrieve 404.
@@ -1008,17 +1008,17 @@ func TestRestrictedModelHiddenAndDenied(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	raw, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if bytes.Contains(raw, []byte("pnu-internal")) {
+	if bytes.Contains(raw, []byte("pickle-internal")) {
 		t.Fatal("restricted model listed to an open key")
 	}
-	if status, body := h.chat(t, testToken, `{"model":"pnu-internal","messages":[]}`); status != 403 || errCode(t, body) != "model_not_allowed" {
+	if status, body := h.chat(t, testToken, `{"model":"pickle-internal","messages":[]}`); status != 403 || errCode(t, body) != "model_not_allowed" {
 		t.Fatalf("open key reached a restricted model: %d %s", status, body)
 	}
 	// Privileged key: allowed.
 	if status, _ := h.chat(t, "pickle-priv", chatBody); status != 200 {
 		t.Fatalf("privileged key denied a public model: %d", status)
 	}
-	if status, body := h.chat(t, "pickle-priv", `{"model":"pnu-internal","messages":[{"role":"user","content":"hi"}]}`); status != 200 {
+	if status, body := h.chat(t, "pickle-priv", `{"model":"pickle-internal","messages":[{"role":"user","content":"hi"}]}`); status != 200 {
 		t.Fatalf("privileged key denied its restricted model: %d %s", status, body)
 	}
 }
@@ -1034,7 +1034,7 @@ func TestForwardCompatNestedUnknownField(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.json")
 	hash := snapshot.HashToken(testToken)
 	good := `{"formatVersion":1,"generation":1,"serviceEnabled":true,` +
-		`"models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m","futureModelField":true}],` +
+		`"models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m","futureModelField":true}],` +
 		`"keys":[{"keyId":"k","tokenHash":"` + hash + `","status":"ACTIVE","limits":{},"workspaceId":"ws-7"}]}`
 	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
@@ -1051,7 +1051,7 @@ func TestForwardCompatNestedUnknownField(t *testing.T) {
 	if byHash(hash) == nil {
 		t.Fatal("a key carrying an unknown field loaded but no longer authorizes")
 	}
-	if byName("pnu-general") == nil {
+	if byName("pickle-general") == nil {
 		t.Fatal("a model carrying an unknown field loaded but no longer resolves")
 	}
 	if store.RejectedEntries() != 0 {
@@ -1109,7 +1109,7 @@ func TestHealthzDepthAndRequestID(t *testing.T) {
 
 func TestModelRetrieve(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	req, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/pnu-general", nil)
+	req, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/pickle-general", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1120,14 +1120,14 @@ func TestModelRetrieve(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
 		t.Fatal(err)
 	}
-	if m["id"] != "pnu-general" || m["object"] != "model" {
+	if m["id"] != "pickle-general" || m["object"] != "model" {
 		t.Fatalf("unexpected retrieve: %v", m)
 	}
 	if c, _ := m["created"].(float64); c == 0 {
 		t.Fatal("created is 0 (renders as 1970)")
 	}
 	// Unknown model id → 404.
-	req2, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/pnu-none", nil)
+	req2, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/pickle-none", nil)
 	req2.Header.Set("Authorization", "Bearer "+testToken)
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
@@ -1249,7 +1249,7 @@ func TestBodyCaptureOnlyForOptedInKeys(t *testing.T) {
 func TestBodyCaptureStreamAssembles(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].RecordBodies = true }, nil)
 	cb := h.withBodyCapture(t)
-	if status, _ := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`); status != 200 {
+	if status, _ := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`); status != 200 {
 		t.Fatal("stream failed")
 	}
 	got := waitForRecords(t, cb, 1)
@@ -1395,7 +1395,7 @@ func TestUpstreamFallback(t *testing.T) {
 		t.Fatalf("fallback hit %d times", hits)
 	}
 	// The public model name still holds on the fallback's answer.
-	if !bytes.Contains(body, []byte(`"model":"pnu-general"`)) {
+	if !bytes.Contains(body, []byte(`"model":"pickle-general"`)) {
 		t.Fatalf("fallback answer leaked its own model name: %s", body)
 	}
 	// That hiding is exactly why the event has to say which upstream answered:
@@ -1557,7 +1557,7 @@ func TestBodyCaptureCapsTheRequest(t *testing.T) {
 	cb := h.withBodyCapture(t)
 
 	long := strings.Repeat("가", bodies.RequestCapBytes) // multi-byte on purpose
-	body := `{"model":"pnu-general","messages":[{"role":"user","content":"` + long + `"}]}`
+	body := `{"model":"pickle-general","messages":[{"role":"user","content":"` + long + `"}]}`
 	if status, resp := h.chat(t, testToken, body); status != 200 {
 		t.Fatalf("chat failed: %d %s", status, resp)
 	}
@@ -1648,7 +1648,7 @@ func TestRetrySucceedsAndIsCountedExactlyOnce(t *testing.T) {
 func TestStreamWithoutUsageIsEstimated(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(u *mockOpts) { u.noUsage = true })
-	status, body := h.chat(t, testToken, `{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if status != 200 {
 		t.Fatalf("status %d: %s", status, body)
 	}
@@ -1751,7 +1751,7 @@ func TestCapFieldIsNormalizedEvenWithoutAModelMaximum(t *testing.T) {
 			APIKey: upstreamCred, CapField: "max_tokens", // legacy-only server
 		}
 	})
-	body := `{"model":"pnu-general","max_completion_tokens":50,"messages":[{"role":"user","content":"hi"}]}`
+	body := `{"model":"pickle-general","max_completion_tokens":50,"messages":[{"role":"user","content":"hi"}]}`
 	if status, resp := h.chat(t, testToken, body); status != 200 {
 		t.Fatalf("status %d: %s", status, resp)
 	}
@@ -1887,7 +1887,7 @@ func TestClientDisconnectMidStreamIsMeteredAndReleasesSlots(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.gw.URL+"/v1/chat/completions",
-		strings.NewReader(`{"model":"pnu-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"pickle-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,7 +32,7 @@ func TestQuotaExhaustedGovernsOnlyTokenAxis(t *testing.T) {
 		d.Keys[0].QuotaExhausted = true
 	}, nil)
 
-	// TOKEN-axis model (pnu-general has no budgetAxis, which means TOKEN):
+	// TOKEN-axis model (pickle-general has no budgetAxis, which means TOKEN):
 	// the exhausted daily quota refuses it.
 	status, body := h.chat(t, testToken, chatBody)
 	if status != 429 || errCode(t, body) != "quota_exhausted" {
@@ -135,9 +135,16 @@ func TestPassthroughNeverServesSelfServePrefix(t *testing.T) {
 
 	// A typo under the curated prefix must stay a 404 rather than become a
 	// billable request to the commercial provider — case variants included:
-	// the catalog lookup is case-sensitive, so "PNU-general" misses it, and
-	// without a case-insensitive guard it would slip through as billable.
-	for _, name := range []string{"pnu-generall", "PNU-general", "Pnu-x"} {
+	// the catalog lookup is case-sensitive, so "PICKLE-general" misses it, and
+	// without a case-insensitive guard it would slip through as billable. The
+	// retired "pnu-" prefix (renamed 2026-08-25) stays guarded for the same
+	// reason: a stale name the catalog no longer lists must 404, not bill.
+	// (While a catalog row still carries a retired name, the exact match wins
+	// — TestReservedPrefixExactCatalogMatchStillServes.)
+	for _, name := range []string{
+		"pickle-generall", "PICKLE-general", "Pickle-x",
+		"pnu-general", "pnu-generall", "PNU-general",
+	} {
 		status, body := h.chat(t, testToken,
 			`{"model":"`+name+`","messages":[{"role":"user","content":"hi"}]}`)
 		if status != 404 || errCode(t, body) != "model_not_found" {
@@ -145,7 +152,7 @@ func TestPassthroughNeverServesSelfServePrefix(t *testing.T) {
 		}
 	}
 	if h.mock.callCount() != 0 {
-		t.Fatal("a pnu-prefixed unknown name reached the upstream")
+		t.Fatal("a reserved-prefixed unknown name reached the upstream")
 	}
 }
 
@@ -246,7 +253,7 @@ func TestRestrictedKeyListGovernsPassthroughToo(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) {
 		d.PassthroughRef = "mock"
 		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
-		d.Keys[0].AllowedModels = []string{"pnu-general"}
+		d.Keys[0].AllowedModels = []string{"pickle-general"}
 	}, nil)
 	status, body := h.chat(t, testToken, `{"model":"vendor/x","messages":[{"role":"user","content":"hi"}]}`)
 	if status != 403 || errCode(t, body) != "model_not_allowed" {
@@ -268,5 +275,56 @@ func TestCredentialRefMatchIsCaseInsensitive(t *testing.T) {
 	}
 	if _, auth := h.mock.last(); auth != "Bearer "+keyCred {
 		t.Fatalf("call carried %q", auth)
+	}
+}
+
+func TestReservedPrefixRetrieveAgreesWithChat(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.PassthroughRef = "mock"
+		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
+	}, nil)
+
+	get := func(id string) int {
+		req, _ := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models/"+id, nil)
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// Reserved-prefix names the catalog does not list are 404 on the retrieve
+	// surface too — the handler comment says retrieve must agree with chat,
+	// and this enforces it for reserved names.
+	for _, id := range []string{"pickle-none", "pnu-general", "PNU-general"} {
+		if got := get(id); got != 404 {
+			t.Fatalf("reserved name %q retrieve: got %d, want 404", id, got)
+		}
+	}
+	// The same key sees an arbitrary commercial name through passthrough, so
+	// the 404s above are the reservation, not a broken retrieve surface.
+	if got := get("vendor-x"); got != 200 {
+		t.Fatalf("passthrough name retrieve: got %d, want 200", got)
+	}
+}
+
+func TestReservedPrefixExactCatalogMatchStillServes(t *testing.T) {
+	// During a prefix transition the old name may still be a catalog row;
+	// the reservation governs passthrough only, and an exact catalog match
+	// wins. This is what keeps live traffic on the old name working between
+	// the gateway deploy and the catalog rename.
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.PassthroughRef = "mock"
+		d.Models = append(d.Models, snapshot.Model{
+			PublicName: "pnu-general", UpstreamRef: "mock",
+			UpstreamModel: upstreamModel, MaxOutputTokens: 4096,
+		})
+		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
+	}, nil)
+	status, body := h.chat(t, testToken,
+		`{"model":"pnu-general","messages":[{"role":"user","content":"hi"}]}`)
+	if status != 200 {
+		t.Fatalf("catalogued retired-prefix name: got %d %s", status, body)
 	}
 }
