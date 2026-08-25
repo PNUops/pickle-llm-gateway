@@ -39,10 +39,10 @@ const maxPassthroughNameBytes = 256
 // a billable request to the commercial provider.
 func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model {
 	// The prefix guard is case-insensitive even though catalog lookup is not:
-	// "PNU-general" must fail like "pnu-generall" does, not slip past the
-	// guard into a billable request.
+	// "PICKLE-general" must fail like "pickle-generall" does, not slip past
+	// the guard into a billable request. Retired prefixes stay guarded too.
 	if doc.PassthroughRef == "" ||
-		strings.HasPrefix(strings.ToLower(publicName), snapshot.SelfServePrefix) ||
+		snapshot.IsReservedModelName(publicName) ||
 		len(publicName) > maxPassthroughNameBytes {
 		return nil
 	}

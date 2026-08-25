@@ -74,9 +74,30 @@ const (
 	AxisCredit = "CREDIT"
 )
 
-// SelfServePrefix is the reserved prefix for curated self-serve model names.
-// Names under it are never passed through to a commercial upstream.
-const SelfServePrefix = "pnu-"
+// reservedModelPrefixes are the prefixes reserved for curated self-serve
+// model names: the current one first ("pickle-"), then prefixes retired by a
+// rename ("pnu-", retired 2026-08-25) that stay guarded so a stale name in
+// student code keeps failing as a 404 instead of turning into a billable
+// passthrough request. A future rename is a one-line reorder here — prepend
+// the new prefix, keep the old. Every entry must stay lowercase: the guard
+// lowercases the candidate before comparing, so a mixed-case entry would
+// silently never match (a test pins this).
+var reservedModelPrefixes = []string{"pickle-", "pnu-"}
+
+// IsReservedModelName reports whether a public model name sits under a
+// reserved self-serve prefix, current or retired. Such a name is served only
+// by an exact catalog match and never by passthrough. This function is the
+// only door to the list — prefix checks elsewhere would skip the case
+// handling and the retired entries.
+func IsReservedModelName(publicName string) bool {
+	lower := strings.ToLower(publicName)
+	for _, p := range reservedModelPrefixes {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // Model maps one public model name to an upstream target. Students only ever
 // see PublicName; UpstreamRef selects a configured upstream block and

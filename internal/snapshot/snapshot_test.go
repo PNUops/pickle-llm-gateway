@@ -27,7 +27,7 @@ func writeDoc(t *testing.T, path, body string, mod time.Time) {
 const validDoc = `{
   "generation": 1,
   "serviceEnabled": true,
-  "models": [{"publicName": "pnu-general", "upstreamRef": "mock", "upstreamModel": "m1"}],
+  "models": [{"publicName": "pickle-general", "upstreamRef": "mock", "upstreamModel": "m1"}],
   "keys": [{"keyId": "k1", "tokenHash": "%s", "status": "ACTIVE", "limits": {}}]
 }`
 
@@ -59,7 +59,7 @@ func TestOpenAndLookup(t *testing.T) {
 	if lookup(HashToken("wrong")) != nil {
 		t.Fatal("lookup on a wrong hash must miss")
 	}
-	if m := model("pnu-general"); m == nil || m.UpstreamModel != "m1" {
+	if m := model("pickle-general"); m == nil || m.UpstreamModel != "m1" {
 		t.Fatalf("model lookup failed: %+v", m)
 	}
 }
@@ -133,9 +133,9 @@ func TestRefreshKeepsStateOnBrokenFile(t *testing.T) {
 }
 
 func TestKeyAllowsModel(t *testing.T) {
-	pub := &Model{PublicName: "pnu-general"}
-	restricted := &Model{PublicName: "pnu-internal", Visibility: ModelRestricted}
-	other := &Model{PublicName: "pnu-code"}
+	pub := &Model{PublicName: "pickle-general"}
+	restricted := &Model{PublicName: "pickle-internal", Visibility: ModelRestricted}
+	other := &Model{PublicName: "pickle-code"}
 
 	open := Key{}
 	if !open.AllowsModel(pub) {
@@ -144,7 +144,7 @@ func TestKeyAllowsModel(t *testing.T) {
 	if open.AllowsModel(restricted) {
 		t.Fatal("empty allow list must NOT allow a restricted model")
 	}
-	limited := Key{AllowedModels: []string{"pnu-general", "pnu-internal"}}
+	limited := Key{AllowedModels: []string{"pickle-general", "pickle-internal"}}
 	if !limited.AllowsModel(pub) || !limited.AllowsModel(restricted) {
 		t.Fatal("explicit allow list must allow named models, restricted included")
 	}
@@ -158,14 +158,14 @@ func sprintf(format string, args ...any) string { return fmt.Sprintf(format, arg
 func TestBuildRejectsUnknownUpstream(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
-	body := `{"generation":1,"serviceEnabled":true,"models":[{"publicName":"pnu-general","upstreamRef":"opnai","upstreamModel":"m"}],"keys":[]}`
+	body := `{"generation":1,"serviceEnabled":true,"models":[{"publicName":"pickle-general","upstreamRef":"opnai","upstreamModel":"m"}],"keys":[]}`
 	writeDoc(t, path, body, time.Now())
 	// With a known-upstreams set that does not contain the typo, load fails.
 	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"openai"}}); err == nil {
 		t.Fatal("Open accepted a model referencing an unconfigured upstream")
 	}
 	// Correct ref (case-insensitive) loads.
-	body2 := `{"generation":1,"serviceEnabled":true,"models":[{"publicName":"pnu-general","upstreamRef":"OpenAI","upstreamModel":"m"}],"keys":[]}`
+	body2 := `{"generation":1,"serviceEnabled":true,"models":[{"publicName":"pickle-general","upstreamRef":"OpenAI","upstreamModel":"m"}],"keys":[]}`
 	writeDoc(t, path, body2, time.Now())
 	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"openai"}}); err != nil {
 		t.Fatalf("Open rejected a valid upstream ref: %v", err)
@@ -208,7 +208,7 @@ func TestDocumentMissingBothListsIsRefused(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
 	hash := HashToken("live")
 	writeDoc(t, path, fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
-	  "models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
 	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{}}]}`, hash), time.Now())
 	s, err := OpenFile(path, discard(), Options{})
 	if err != nil {
@@ -242,7 +242,7 @@ func TestCachedDocumentStartsTheGatewayWhenTheFirstPollSaysUnchanged(t *testing.
 	cache := filepath.Join(dir, "snapshot.json")
 	hash := HashToken("cached")
 	body := fmt.Sprintf(`{"generation":5,"serviceEnabled":true,
-	  "models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
 	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{}}]}`, hash)
 	if err := os.WriteFile(cache, []byte(body), 0o640); err != nil {
 		t.Fatal(err)

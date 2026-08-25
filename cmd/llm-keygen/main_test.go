@@ -32,7 +32,7 @@ func TestInsertBumpsGenerationAtomically(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
 	doc := snapshot.Document{Generation: 7, ServiceEnabled: true,
-		Models: []snapshot.Model{{PublicName: "pnu-general", UpstreamRef: "mock", UpstreamModel: "m"}}}
+		Models: []snapshot.Model{{PublicName: "pickle-general", UpstreamRef: "mock", UpstreamModel: "m"}}}
 	raw, _ := json.Marshal(doc)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestRevokeMarksTheKeyAndKeepsIt(t *testing.T) {
 func TestServiceSwitchLeavesEverythingElseAlone(t *testing.T) {
 	path := writeDoc(t, snapshot.Document{
 		Generation: 9, ServiceEnabled: true,
-		Models: []snapshot.Model{{PublicName: "pnu-general", UpstreamRef: "mock", UpstreamModel: "m"}},
+		Models: []snapshot.Model{{PublicName: "pickle-general", UpstreamRef: "mock", UpstreamModel: "m"}},
 		Keys:   []snapshot.Key{{KeyID: "k-a", TokenHash: snapshot.HashToken("a"), Status: snapshot.KeyActive}},
 	})
 	if err := setService(path, false); err != nil {
@@ -216,7 +216,7 @@ func TestMaintenancePreservesFieldsItDoesNotKnow(t *testing.T) {
 	raw := `{
   "generation": 3,
   "serviceEnabled": true,
-  "models": [{"publicName": "pnu-general", "upstreamRef": "mock", "upstreamModel": "m", "futureField": 7}],
+  "models": [{"publicName": "pickle-general", "upstreamRef": "mock", "upstreamModel": "m", "futureField": 7}],
   "keys": [{"keyId": "k-a", "tokenHash": "` + snapshot.HashToken("a") + `", "status": "ACTIVE",
             "limits": {}, "owner": "someone", "scopes": ["ws-7"]}]
 }`

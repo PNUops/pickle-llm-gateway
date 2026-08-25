@@ -63,9 +63,12 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 
 문서 최상위의 `passthroughRef`가 설정돼 있으면, 카탈로그에 없는 모델명은 그 업스트림으로
 **이름 그대로** 전달됩니다(패스스루). 패스스루 모델은 항상 CREDIT 축으로 취급되므로 Key
-자격증명이 없으면 거절되고, `pnu-` 접두 이름은 대소문자와 무관하게 패스스루되지 않습니다.
+자격증명이 없으면 거절되고, `pickle-` 접두 이름은 대소문자와 무관하게 패스스루되지 않습니다.
 교내 모델명의 오타가 과금 요청이 되지 않도록 404로 남기기 위해서입니다. 공개 모델명은
-소문자로 쓰고 조회는 대소문자를 구분하며, `pnu-` 접두는 교내(자체 서빙) 모델 전용입니다.
+소문자로 쓰고 조회는 대소문자를 구분하며, `pickle-` 접두는 교내(자체 서빙) 모델 전용입니다.
+과거에 같은 용도로 쓰던 `pnu-` 접두도 예약이 유지되어 패스스루되지 않습니다. API Key
+평문도 같은 `pickle-` 접두를 쓰지만 전달 위치가 다릅니다 — Key는 Authorization 헤더,
+모델명은 요청 본문의 `model` 필드로만 해석되므로 접두가 같아도 서로 혼동되지 않습니다.
 Key별 자격증명 발급과 갱신은 관리 API 모드의 몫입니다. 손으로 관리하는 파일 모드는 토큰
 축 운영을 전제하며, `passthroughRef`를 파일에 쓸 때는 해당 업스트림 env 블록을 먼저
 설정해야 합니다(없으면 문서 적재가 거부됩니다).
@@ -232,7 +235,7 @@ go run ./cmd/llm-gateway
   "passthroughRef": "openrouter",
   "models": [
     {
-      "publicName": "pnu-general",
+      "publicName": "pickle-general",
       "upstreamRef": "main",
       "upstreamModel": "example-model-32b",
       "fallbackRef": "backup",

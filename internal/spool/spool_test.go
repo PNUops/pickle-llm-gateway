@@ -21,7 +21,7 @@ func TestWriteRoundTripAndDailyFiles(t *testing.T) {
 
 	day1 := time.Date(2026, 8, 10, 23, 50, 0, 0, time.UTC)
 	day2 := day1.Add(time.Hour)
-	ev1 := Event{EventUUID: NewEventUUID(), KeyID: "k1", PublicModelName: "pnu-general",
+	ev1 := Event{EventUUID: NewEventUUID(), KeyID: "k1", PublicModelName: "pickle-general",
 		Status: StatusOK, InputTokens: 7, OutputTokens: 5, LatencyMs: 120, TtftMs: 40, RequestedAt: day1}
 	ev2 := Event{EventUUID: NewEventUUID(), KeyID: "k1", Status: StatusRateLimited,
 		ErrorType: "rate_limit_requests", RequestedAt: day2}

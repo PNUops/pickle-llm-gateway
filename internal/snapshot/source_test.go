@@ -66,7 +66,7 @@ func (c *controlPlane) lastRequest(t *testing.T) SyncRequest {
 
 func docAt(gen int64, hash string) string {
 	return fmt.Sprintf(`{"generation":%d,"serviceEnabled":true,`+
-		`"models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],`+
+		`"models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],`+
 		`"keys":[{"keyId":"k","tokenHash":"%s","status":"ACTIVE","limits":{}}]}`, gen, hash)
 }
 
@@ -282,7 +282,7 @@ func TestFallbackRefIsValidatedAtLoad(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
 	body := `{"generation":1,"serviceEnabled":true,` +
-		`"models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m","fallbackRef":"typo"}],"keys":[]}`
+		`"models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m","fallbackRef":"typo"}],"keys":[]}`
 	writeDoc(t, path, body, time.Now())
 	if _, err := OpenFile(path, discard(), Options{KnownUpstreams: []string{"mock"}}); err == nil {
 		t.Fatal("a fallback naming an unconfigured upstream was accepted")
@@ -300,7 +300,7 @@ func TestFallbackRefIsValidatedAtLoad(t *testing.T) {
 func TestTopLevelStrictnessFollowsTheSource(t *testing.T) {
 	withScopes := `{"generation":1,"serviceEnabled":true,` +
 		`"scopes":[{"id":"ws-7","limits":{"rpm":100}}],` +
-		`"models":[{"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"}],"keys":[]}`
+		`"models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],"keys":[]}`
 
 	// File: an unknown member is a typo and must be caught.
 	path := filepath.Join(t.TempDir(), "snapshot.json")
@@ -340,8 +340,8 @@ func TestControlPlaneDropsUnusableEntriesInsteadOfFreezing(t *testing.T) {
 	hash := HashToken("live")
 	doc := fmt.Sprintf(`{"generation":2,"serviceEnabled":true,
 	  "models":[
-	    {"publicName":"pnu-general","upstreamRef":"mock","upstreamModel":"m"},
-	    {"publicName":"pnu-future","upstreamRef":"dgx","upstreamModel":"m"}],
+	    {"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"},
+	    {"publicName":"pickle-future","upstreamRef":"dgx","upstreamModel":"m"}],
 	  "keys":[
 	    {"keyId":"k-live","tokenHash":"%s","status":"ACTIVE","limits":{}},
 	    {"keyId":"k-new","tokenHash":"%s","status":"PENDING_ROTATION","limits":{}}]}`,
@@ -369,10 +369,10 @@ func TestControlPlaneDropsUnusableEntriesInsteadOfFreezing(t *testing.T) {
 	if byHash(HashToken("newstatus")) != nil {
 		t.Fatal("a key whose status this build does not know was served anyway")
 	}
-	if byName("pnu-general") == nil {
+	if byName("pickle-general") == nil {
 		t.Fatal("the usable model was lost")
 	}
-	if byName("pnu-future") != nil {
+	if byName("pickle-future") != nil {
 		t.Fatal("a model naming an upstream this host has no config for was served")
 	}
 
