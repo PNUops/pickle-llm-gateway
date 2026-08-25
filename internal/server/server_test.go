@@ -696,6 +696,12 @@ func TestUpstreamErrorShaping(t *testing.T) {
 		if ev.Status != spool.StatusUpstreamErr {
 			t.Fatalf("event status %s, want UPSTREAM_ERROR", ev.Status)
 		}
+		// A request the upstream answered badly still cost that upstream a
+		// generation slot. An event that names nobody bills it to nobody.
+		if ev.UpstreamRef != "mock" || ev.Attempts != 1 {
+			t.Fatalf("failed request not attributed: upstreamRef=%q attempts=%d",
+				ev.UpstreamRef, ev.Attempts)
+		}
 	}
 }
 
@@ -711,6 +717,12 @@ func TestUpstreamTimeout(t *testing.T) {
 	evs := h.spoolEvents(t)
 	if len(evs) != 1 || evs[0].Status != spool.StatusTimeout {
 		t.Fatalf("unexpected events: %+v", evs)
+	}
+	// The upstream accepted the POST and may be generating right now, which is
+	// exactly the case where knowing who was asked is worth something.
+	if evs[0].UpstreamRef != "mock" || evs[0].Attempts != 1 {
+		t.Fatalf("timed-out request not attributed: upstreamRef=%q attempts=%d",
+			evs[0].UpstreamRef, evs[0].Attempts)
 	}
 }
 
@@ -1439,6 +1451,75 @@ func TestUpstreamRefusalIsNotRetriedOrFailedOver(t *testing.T) {
 	if hits != 0 {
 		t.Fatalf("a refusal was failed over to the fallback %d times", hits)
 	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "mock" || last.Attempts != 1 {
+		t.Fatalf("refused request not attributed: upstreamRef=%q attempts=%d",
+			last.UpstreamRef, last.Attempts)
+	}
+}
+
+// A primary that is down and a fallback that is down too: the event has to say
+// the fallback was the last one asked and count what both of them cost, or the
+// bill for a request that produced nothing lands on the wrong upstream.
+func TestBothUpstreamsFailingStillNamesTheLastOneTried(t *testing.T) {
+	var fallbackCalls int
+	var mu sync.Mutex
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fallbackCalls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer fb.Close()
+
+	h := newHarness(t, func(d *snapshot.Document) { d.Models[0].FallbackRef = "backup" },
+		func(c *config.Config) {
+			c.UpstreamRetries = 1
+			c.Upstreams["backup"] = config.Upstream{Ref: "backup", BaseURL: fb.URL, CapField: "max_completion_tokens"}
+		})
+	h.mock.set(func(u *mockOpts) { u.status = http.StatusBadGateway })
+
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 502 || errCode(t, body) != "upstream_error" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	mu.Lock()
+	fbHits := fallbackCalls
+	mu.Unlock()
+	if h.mock.callCount() != 2 || fbHits != 2 {
+		t.Fatalf("primary called %d times, fallback %d, want two tries each",
+			h.mock.callCount(), fbHits)
+	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "backup" {
+		t.Fatalf("event says upstreamRef=%q, want the last upstream tried", last.UpstreamRef)
+	}
+	if last.Attempts != 4 {
+		t.Fatalf("attempts = %d, want both upstreams' tries summed", last.Attempts)
+	}
+}
+
+// The other direction: a request refused before anything left this host has no
+// upstream to name, and inventing one would bill an idle server for a request
+// it never saw. Both fields stay empty.
+func TestLocalRefusalNamesNoUpstream(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	status, body := h.chat(t, testToken,
+		`{"model":"no-such-model","messages":[{"role":"user","content":"hi"}]}`)
+	if status != 404 || errCode(t, body) != "model_not_found" {
+		t.Fatalf("got %d %s", status, body)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatalf("a local refusal reached the upstream %d times", h.mock.callCount())
+	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "" || last.Attempts != 0 {
+		t.Fatalf("local refusal was attributed to an upstream: upstreamRef=%q attempts=%d",
+			last.UpstreamRef, last.Attempts)
+	}
 }
 
 func TestAdminMetrics(t *testing.T) {
@@ -1507,6 +1588,12 @@ func TestTimeoutIsNotRetried(t *testing.T) {
 	if got != 1 {
 		t.Fatalf("a timed-out completion was sent %d times", got)
 	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "mock" || last.Attempts != 1 {
+		t.Fatalf("timed-out request not attributed: upstreamRef=%q attempts=%d",
+			last.UpstreamRef, last.Attempts)
+	}
 }
 
 // A throttling upstream must not be hammered, and the student should be told
@@ -1540,6 +1627,12 @@ func TestUpstreamThrottleIsNotRetriedAndSaysBusy(t *testing.T) {
 	mu.Unlock()
 	if got != 1 {
 		t.Fatalf("a throttling upstream was called %d times", got)
+	}
+	evs := h.spoolEvents(t)
+	last := evs[len(evs)-1]
+	if last.UpstreamRef != "mock" || last.Attempts != 1 {
+		t.Fatalf("throttled request not attributed: upstreamRef=%q attempts=%d",
+			last.UpstreamRef, last.Attempts)
 	}
 }
 
