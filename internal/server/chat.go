@@ -321,6 +321,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// to the student; once the response starts, it is not.
 	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, key, params, outputCap)
 	ev.TtftMs = time.Since(start).Milliseconds()
+	// Which upstream was reached, and how many tries it took. The response's
+	// own model field is rewritten to the public name before the student sees
+	// it, so without this the accounting cannot tell a free local model from a
+	// paid fallback — and the two are billed to different people. Recorded
+	// before the failure switch below, because a request that died on the way
+	// still spent whatever the upstream had already done for it; both fields
+	// stay empty only when nothing was contacted at all.
+	ev.UpstreamRef = up.Ref
+	ev.Attempts = attempts
 	if attemptErr != nil {
 		switch {
 		case r.Context().Err() != nil:
@@ -350,12 +359,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	// Which upstream answered, and how many tries it took. The response's own
-	// model field is rewritten to the public name before the student sees it,
-	// so without this the accounting cannot tell a free local model from a
-	// paid fallback — and the two are billed to different people.
-	ev.UpstreamRef = up.Ref
-	ev.Attempts = attempts
 
 	// Body capture: only for a key that opted in, and only when the delivery
 	// channel exists — captured text is never written to this host's disk, so
