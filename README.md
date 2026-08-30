@@ -130,7 +130,25 @@ JSONL 파일에 쌓입니다. 이 파일은 **발송 대기함**이기도 합니
 관리 API 모드에서는 같은 값들을 폴링 요청에 실어 보냅니다. 관리 API는 게이트웨이를
 호출하지 않으므로, 이 요청에 없는 사실은 관리 API가 알 방법이 없습니다 — 적용된 세대가
 멈춰 있다는 것만으로는 이유를 알 수 없어서, 마지막 오류와 버린 항목 수, 이 빌드가 읽을 수
-있는 문서 형식 번호, 설정된 업스트림 이름을 함께 보냅니다.
+있는 문서 형식 번호, 설정된 업스트림 이름을 함께 보냅니다. 실제 요청에서 관측한 업스트림별
+마지막 성공·실패와 routing cooldown도 이 자기보고에 포함됩니다.
+
+트래픽이 없을 때의 상태는 별도 active probe가 `GET {BaseURL}/models`로 확인합니다. 사설·
+loopback IP는 60초, 외부 주소와 hostname은 5분 간격이며 timeout은 5초이고 재시도하지
+않습니다. DNS나 proxy 때문에 주소만으로 배치 위치를 알 수 없으면 업스트림별
+`LLMGW_UPSTREAM_<REF>_PROBE_INTERVAL`로 명시합니다. Probe 결과는 실제 요청의 cooldown과
+fallback 순서를 절대 바꾸지 않습니다. 401·403은 서버에 도달했다는 뜻이므로 장애가 아니라
+`AUTH_UNVERIFIED`로 보고하고, 모델 목록을 읽은 경우에만 Pickle public model과 비교합니다.
+Curated upstream은 누락과 추가를 양방향으로 세되, 누락된 public model 이름만 최대 20개
+보내고 예상 밖 vendor model 이름은 보내지 않습니다. 상용 passthrough는 vendor 전체 catalog가
+원래 더 크므로 Pickle이 기대한 model의 누락만 보고 추가 model은 drift로 세지 않습니다.
+업스트림 주소, credential, 응답 본문과 vendor 오류 원문은 보내지 않습니다.
+
+사용량 발송기는 마지막 성공 시각, 대기 event·byte 수와 가장 오래된 미전송 event 시각도
+자기보고합니다. Queue를 완전히 읽은 시각과 이 읽기가 실패한 누적 횟수를 함께 보내므로,
+읽지 못한 spool이 빈 queue처럼 보이지 않습니다. 이 값은 발송 주기에 맞춰 background에서
+갱신되며 sync 요청이 spool 전체를 매번 다시 읽지는 않습니다. 읽기가 실패하면 직전 queue
+값과 관측 시각을 유지하고 실패 횟수만 올립니다.
 
 오류 응답은 OpenAI와 같은 형식이며 메시지는 한국어입니다. 업스트림 오류의 본문과 주소는
 외부 응답에 싣지 않습니다.
@@ -195,6 +213,7 @@ go run ./cmd/llm-gateway
 | `LLMGW_UPSTREAM_<REF>_BASE_URL` | ✔ | 업스트림 주소. `<REF>`는 스냅샷의 `upstreamRef`와 대소문자 무관하게 대응 |
 | `LLMGW_UPSTREAM_<REF>_API_KEY` | | 업스트림 인증 토큰. 비우면 인증 없이 호출 |
 | `LLMGW_UPSTREAM_<REF>_CAP_FIELD` | | 출력 상한을 주입할 필드. 기본 `max_completion_tokens`, 구형 서버는 `max_tokens` 지정 |
+| `LLMGW_UPSTREAM_<REF>_PROBE_INTERVAL` | | `/models` active probe 주기(최소 `10s`). 기본값은 사설·loopback IP `60s`, 외부 주소·hostname `5m`이며 배치 위치를 주소로 판단할 수 없을 때 명시 |
 
 <details>
 <summary>조정 값 (기본값으로 동작)</summary>

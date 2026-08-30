@@ -62,6 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
+	srv.RunUpstreamProbes(ctx)
 
 	// Both channels are constructed before anything reads them. The sync
 	// goroutine's self-report closure captures these variables, and assigning
@@ -85,21 +86,31 @@ func main() {
 		// carrying what the gateway can say about itself. Everything here is a
 		// claim the control plane may display but must not act on.
 		controlSource.SetGauges(func() snapshot.SyncGauges {
+			observationFormat, upstreams := srv.UpstreamObservations()
 			g := snapshot.SyncGauges{
-				InFlight:           srv.InFlight(),
-				MaxInFlight:        cfg.MaxInFlight,
-				UpstreamRefs:       cfg.UpstreamRefs(),
-				RejectedEntries:    store.RejectedEntries(),
-				ReloadFailures:     store.ReloadFailures(),
-				LastError:          store.LastError(),
-				StartedAt:          startedAt,
-				SpoolWriteFailures: srv.SpoolWriteFailures(),
+				InFlight:                  srv.InFlight(),
+				MaxInFlight:               cfg.MaxInFlight,
+				UpstreamRefs:              cfg.UpstreamRefs(),
+				RejectedEntries:           store.RejectedEntries(),
+				ReloadFailures:            store.ReloadFailures(),
+				LastError:                 store.LastError(),
+				StartedAt:                 startedAt,
+				SpoolWriteFailures:        srv.SpoolWriteFailures(),
+				UpstreamObservationFormat: observationFormat,
+				Upstreams:                 upstreams,
 			}
 			if sink != nil {
 				g.BodiesDropped = sink.Dropped()
 			}
 			if rep != nil {
 				g.UsageShipFailures = rep.ShipFailures()
+				queue := rep.QueueGauges()
+				g.LastUsageShipSuccessAt = queue.LastSuccessAt
+				g.UsageQueueObservedAt = queue.QueueObservedAt
+				g.OldestUnshippedEventAt = queue.OldestUnshippedAt
+				g.QueuedUsageEvents = queue.QueuedEvents
+				g.QueuedUsageBytes = queue.QueuedBytes
+				g.UsageQueueScanFailures = queue.QueueScanFailures
 			}
 			return g
 		})

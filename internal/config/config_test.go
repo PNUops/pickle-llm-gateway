@@ -107,6 +107,41 @@ func TestCapFieldParsing(t *testing.T) {
 	}
 }
 
+func TestProbeIntervalDefaultsAndOverride(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_LOCAL_BASE_URL=http://127.0.0.1:8000/v1",
+		"LLMGW_UPSTREAM_PUBLIC_BASE_URL=https://openrouter.example/v1",
+		"LLMGW_UPSTREAM_PROXY_BASE_URL=https://proxy.example/v1",
+		"LLMGW_UPSTREAM_PROXY_PROBE_INTERVAL=75s",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if got := ups["local"].ProbeInterval; got != time.Minute {
+		t.Fatalf("private upstream probe interval = %v, want 1m", got)
+	}
+	if got := ups["public"].ProbeInterval; got != 5*time.Minute {
+		t.Fatalf("public upstream probe interval = %v, want 5m", got)
+	}
+	if got := ups["proxy"].ProbeInterval; got != 75*time.Second {
+		t.Fatalf("explicit probe interval = %v, want 75s", got)
+	}
+	_, errs = upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_BAD_BASE_URL=https://bad.example/v1",
+		"LLMGW_UPSTREAM_BAD_PROBE_INTERVAL=never",
+	})
+	if len(errs) == 0 {
+		t.Fatal("invalid probe interval accepted")
+	}
+	_, errs = upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_FAST_BASE_URL=https://fast.example/v1",
+		"LLMGW_UPSTREAM_FAST_PROBE_INTERVAL=500ms",
+	})
+	if len(errs) == 0 {
+		t.Fatal("too-short probe interval accepted")
+	}
+}
+
 // Every knob the README documents must actually be read; a documented default
 // that cannot be changed is worse than an undocumented one.
 func TestDocumentedBodyKnobsAreRead(t *testing.T) {
