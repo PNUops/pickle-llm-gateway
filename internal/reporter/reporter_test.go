@@ -134,6 +134,52 @@ func TestFlushShipsAndCheckpoints(t *testing.T) {
 	}
 }
 
+func TestQueueGaugesTrackBacklogAndLastSuccess(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	path := filepath.Join(dir, "usage-20260830.jsonl")
+	newer := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+	oldest := newer.Add(-time.Minute)
+	raw := fmt.Sprintf(`{"eventUuid":"a","status":"OK","requestedAt":%q}`+"\n"+
+		`{"eventUuid":"b","status":"OK","requestedAt":%q}`+"\n",
+		newer.Format(time.RFC3339), oldest.Format(time.RFC3339))
+	if err := os.WriteFile(path, []byte(raw), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	r := New(dir, url, "tok", 500, 5*time.Second, discard())
+	r.refreshQueueGauges()
+	g := r.QueueGauges()
+	if g.QueuedEvents != 2 || g.QueuedBytes != int64(len(raw)) ||
+		!g.OldestUnshippedAt.Equal(oldest) || g.QueueObservedAt.IsZero() ||
+		g.QueueScanFailures != 0 {
+		t.Fatalf("initial queue gauges = %+v", g)
+	}
+	if _, err := r.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	g = r.QueueGauges()
+	if g.QueuedEvents != 0 || g.QueuedBytes != 0 || !g.OldestUnshippedAt.IsZero() || g.LastSuccessAt.IsZero() {
+		t.Fatalf("post-flush queue gauges = %+v", g)
+	}
+	got, _ := is.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("delivered events = %v", got)
+	}
+}
+
+func TestQueueGaugeScanFailureDoesNotMasqueradeAsAnEmptyQueue(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".shipped"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := New(dir, "http://unused.invalid", "tok", 500, 5*time.Second, discard())
+	r.refreshQueueGauges()
+	g := r.QueueGauges()
+	if g.QueueScanFailures != 1 || !g.QueueObservedAt.IsZero() {
+		t.Fatalf("failed scan looked observed: %+v", g)
+	}
+}
+
 func TestFlushBatchesAndResumesAfterFailure(t *testing.T) {
 	dir := t.TempDir()
 	is, url := newIngest(t)

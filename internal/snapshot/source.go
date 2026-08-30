@@ -125,6 +125,61 @@ type SyncRequest struct {
 	// outbox at all. Those are gone before shipping ever sees them, so the api
 	// would otherwise just receive quietly incomplete accounting.
 	SpoolWriteFailures int64 `json:"spoolWriteFailures,omitempty"`
+	// UpstreamObservationFormat versions the optional observation block. Its
+	// presence is what lets the control plane distinguish an older gateway
+	// from a newer gateway reporting no upstreams; absence must never be read as
+	// "every upstream was deconfigured".
+	UpstreamObservationFormat int                   `json:"upstreamObservationFormat,omitempty"`
+	Upstreams                 []UpstreamObservation `json:"upstreams"`
+	// Usage queue gauges describe delivery completeness. Loss counters alone
+	// cannot distinguish a quiet gateway from one whose durable outbox is
+	// growing because the control plane is unavailable.
+	LastUsageShipSuccessAt time.Time `json:"lastUsageShipSuccessAt,omitzero"`
+	UsageQueueObservedAt   time.Time `json:"usageQueueObservedAt,omitzero"`
+	OldestUnshippedEventAt time.Time `json:"oldestUnshippedEventAt,omitzero"`
+	QueuedUsageEvents      int64     `json:"queuedUsageEvents,omitempty"`
+	QueuedUsageBytes       int64     `json:"queuedUsageBytes,omitempty"`
+	UsageQueueScanFailures int64     `json:"usageQueueScanFailures,omitempty"`
+}
+
+// UpstreamObservation is one configured upstream's read-only state. Passive
+// request outcomes and active probes are deliberately separate: a probe must
+// never mutate routing cooldown, and a quiet service must not look healthy
+// merely because nobody called it.
+type UpstreamObservation struct {
+	Ref     string                     `json:"ref"`
+	Passive PassiveUpstreamObservation `json:"passive"`
+	Active  ActiveUpstreamObservation  `json:"active"`
+	Catalog CatalogObservation         `json:"catalog"`
+}
+
+type PassiveUpstreamObservation struct {
+	LastAttemptAt       time.Time `json:"lastAttemptAt,omitzero"`
+	LastSuccessAt       time.Time `json:"lastSuccessAt,omitzero"`
+	LastFailureAt       time.Time `json:"lastFailureAt,omitzero"`
+	LastFailureType     string    `json:"lastFailureType,omitempty"`
+	ConsecutiveFailures int       `json:"consecutiveFailures,omitempty"`
+	CooldownUntil       time.Time `json:"cooldownUntil,omitzero"`
+}
+
+type ActiveUpstreamObservation struct {
+	Status              string    `json:"status"`
+	IntervalSeconds     int64     `json:"intervalSeconds,omitempty"`
+	LastAttemptAt       time.Time `json:"lastAttemptAt,omitzero"`
+	LastSuccessAt       time.Time `json:"lastSuccessAt,omitzero"`
+	LastFailureAt       time.Time `json:"lastFailureAt,omitzero"`
+	LastFailureType     string    `json:"lastFailureType,omitempty"`
+	ConsecutiveFailures int       `json:"consecutiveFailures,omitempty"`
+	LatencyMs           int64     `json:"latencyMs,omitempty"`
+	ModelCount          int       `json:"modelCount,omitempty"`
+}
+
+type CatalogObservation struct {
+	Status               string   `json:"status"`
+	ExpectedModelCount   int      `json:"expectedModelCount,omitempty"`
+	MissingModelCount    int      `json:"missingModelCount,omitempty"`
+	UnexpectedModelCount int      `json:"unexpectedModelCount,omitempty"`
+	MissingPublicModels  []string `json:"missingPublicModels,omitempty"`
 }
 
 // SyncGauges are the live numbers the poll reports. They come from components
@@ -132,16 +187,24 @@ type SyncRequest struct {
 // body sink), so they arrive through one closure set at startup rather than by
 // threading dependencies through the store.
 type SyncGauges struct {
-	InFlight           int
-	MaxInFlight        int
-	UpstreamRefs       []string
-	RejectedEntries    int
-	ReloadFailures     int64
-	LastError          string
-	BodiesDropped      int64
-	UsageShipFailures  int64
-	SpoolWriteFailures int64
-	StartedAt          time.Time
+	InFlight                  int
+	MaxInFlight               int
+	UpstreamRefs              []string
+	RejectedEntries           int
+	ReloadFailures            int64
+	LastError                 string
+	BodiesDropped             int64
+	UsageShipFailures         int64
+	SpoolWriteFailures        int64
+	StartedAt                 time.Time
+	UpstreamObservationFormat int
+	Upstreams                 []UpstreamObservation
+	LastUsageShipSuccessAt    time.Time
+	UsageQueueObservedAt      time.Time
+	OldestUnshippedEventAt    time.Time
+	QueuedUsageEvents         int64
+	QueuedUsageBytes          int64
+	UsageQueueScanFailures    int64
 }
 
 // maxReportedError bounds LastError. The text is a Go error string, so it is
@@ -289,6 +352,14 @@ func (s *HTTPSource) fetch(ctx context.Context, served int64) ([]byte, bool, err
 		req.UsageShipFailures = g.UsageShipFailures
 		req.SpoolWriteFailures = g.SpoolWriteFailures
 		req.StartedAt = g.StartedAt
+		req.UpstreamObservationFormat = g.UpstreamObservationFormat
+		req.Upstreams = g.Upstreams
+		req.LastUsageShipSuccessAt = g.LastUsageShipSuccessAt
+		req.UsageQueueObservedAt = g.UsageQueueObservedAt
+		req.OldestUnshippedEventAt = g.OldestUnshippedEventAt
+		req.QueuedUsageEvents = g.QueuedUsageEvents
+		req.QueuedUsageBytes = g.QueuedUsageBytes
+		req.UsageQueueScanFailures = g.UsageQueueScanFailures
 	}
 	body, err := json.Marshal(req)
 	if err != nil {

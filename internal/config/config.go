@@ -6,6 +6,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -28,6 +30,11 @@ type Upstream struct {
 	// (the default); servers that only honor the legacy field are configured
 	// with max_tokens here, otherwise the cap would be silently ignored.
 	CapField string
+	// ProbeInterval controls the read-only GET /models observation loop. A
+	// private or loopback literal defaults to the on-prem cadence; a public
+	// address or hostname defaults to the external cadence. Operators can set
+	// it explicitly when DNS or a proxy hides that topology.
+	ProbeInterval time.Duration
 }
 
 // SnapshotSource names where the authorization document comes from.
@@ -298,8 +305,10 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			ref, field = strings.TrimSuffix(rest, "_API_KEY"), "key"
 		case strings.HasSuffix(rest, "_CAP_FIELD"):
 			ref, field = strings.TrimSuffix(rest, "_CAP_FIELD"), "cap"
+		case strings.HasSuffix(rest, "_PROBE_INTERVAL"):
+			ref, field = strings.TrimSuffix(rest, "_PROBE_INTERVAL"), "probe"
 		default:
-			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY or _CAP_FIELD)")
+			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY, _CAP_FIELD or _PROBE_INTERVAL)")
 			continue
 		}
 		if ref == "" {
@@ -316,6 +325,13 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			u.APIKey = val
 		case "cap":
 			u.CapField = val
+		case "probe":
+			d, err := time.ParseDuration(val)
+			if err != nil || d < 10*time.Second {
+				errs = append(errs, name+" must be at least 10s (e.g. 60s)")
+				continue
+			}
+			u.ProbeInterval = d
 		}
 		ups[id] = u
 	}
@@ -324,6 +340,9 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			errs = append(errs, "upstream "+id+" is missing "+envPrefix+"UPSTREAM_"+strings.ToUpper(id)+"_BASE_URL")
 			delete(ups, id)
 			continue
+		}
+		if u.ProbeInterval == 0 {
+			u.ProbeInterval = defaultProbeInterval(u.BaseURL)
 		}
 		switch u.CapField {
 		case "":
@@ -336,6 +355,32 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		}
 	}
 	return ups, errs
+}
+
+const (
+	onPremProbeInterval   = time.Minute
+	externalProbeInterval = 5 * time.Minute
+)
+
+// defaultProbeInterval applies the product's two observation cadences without
+// doing DNS at startup. Literal private/loopback/link-local addresses and
+// localhost are on-prem; public literals and hostnames are external. A local
+// hostname or a proxy that hides the destination uses the explicit per-
+// upstream override instead of making startup depend on name resolution.
+func defaultProbeInterval(baseURL string) time.Duration {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return externalProbeInterval
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" {
+		return onPremProbeInterval
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()) {
+		return onPremProbeInterval
+	}
+	return externalProbeInterval
 }
 
 func getenv(name, def string) string {

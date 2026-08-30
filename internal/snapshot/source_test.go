@@ -1,9 +1,11 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -414,6 +416,7 @@ func TestHalfDocumentIsRefused(t *testing.T) {
 // generation standing still; these fields are what says why.
 func TestSyncRequestCarriesTheSelfReport(t *testing.T) {
 	var got SyncRequest
+	observed := time.Date(2026, 8, 30, 2, 3, 4, 0, time.UTC)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
 		fmt.Fprint(w, `{"generation":1,"serviceEnabled":true,"models":[],"keys":[]}`)
@@ -425,7 +428,20 @@ func TestSyncRequestCarriesTheSelfReport(t *testing.T) {
 			InFlight: 3, MaxInFlight: 16,
 			UpstreamRefs:    []string{"mock"},
 			RejectedEntries: 2, ReloadFailures: 5,
-			LastError: "unknown status\n\"PENDING\"",
+			LastError:                 "unknown status\n\"PENDING\"",
+			UpstreamObservationFormat: 1,
+			Upstreams: []UpstreamObservation{{
+				Ref:    "mock",
+				Active: ActiveUpstreamObservation{Status: "OK", LastSuccessAt: observed},
+				Catalog: CatalogObservation{Status: "MISMATCH",
+					MissingModelCount: 1, MissingPublicModels: []string{"pickle-general"}},
+			}},
+			LastUsageShipSuccessAt: observed,
+			UsageQueueObservedAt:   observed.Add(time.Second),
+			OldestUnshippedEventAt: observed.Add(-time.Minute),
+			QueuedUsageEvents:      7,
+			QueuedUsageBytes:       4096,
+			UsageQueueScanFailures: 2,
 		}
 	})
 	if _, _, err := src.Load(context.Background(), 0); err != nil {
@@ -446,5 +462,33 @@ func TestSyncRequestCarriesTheSelfReport(t *testing.T) {
 	}
 	if strings.ContainsAny(got.LastError, "\n\r") {
 		t.Fatalf("lastError carried control characters into someone else's log: %q", got.LastError)
+	}
+	if got.UpstreamObservationFormat != 1 || len(got.Upstreams) != 1 || got.Upstreams[0].Catalog.MissingModelCount != 1 {
+		t.Fatalf("upstream observations were lost: format=%d upstreams=%+v", got.UpstreamObservationFormat, got.Upstreams)
+	}
+	if got.LastUsageShipSuccessAt != observed || got.UsageQueueObservedAt != observed.Add(time.Second) ||
+		got.OldestUnshippedEventAt != observed.Add(-time.Minute) || got.QueuedUsageEvents != 7 ||
+		got.QueuedUsageBytes != 4096 || got.UsageQueueScanFailures != 2 {
+		t.Fatalf("usage queue gauges were lost: %+v", got)
+	}
+}
+
+func TestObservationFormatOneSerializesAnAuthoritativeEmptyUpstreamList(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		fmt.Fprint(w, `{"generation":1,"serviceEnabled":true,"models":[],"keys":[]}`)
+	}))
+	defer srv.Close()
+	src := NewHTTPSource(srv.URL, "tok", filepath.Join(t.TempDir(), "cache.json"), 5*time.Second)
+	src.SetGauges(func() SyncGauges {
+		return SyncGauges{UpstreamObservationFormat: 1, Upstreams: []UpstreamObservation{}}
+	})
+	if _, _, err := src.Load(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"upstreamObservationFormat":1`)) ||
+		!bytes.Contains(body, []byte(`"upstreams":[]`)) {
+		t.Fatalf("format-1 empty upstream list lost authority: %s", body)
 	}
 }

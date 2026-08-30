@@ -74,10 +74,37 @@ type Reporter struct {
 	// this reporter therefore skipped. Those events are gone: reported so the
 	// loss is a number somewhere rather than only a log line.
 	shipFailures atomic.Int64
+
+	// gaugeMu guards the cached delivery-completeness view. Building it scans
+	// the unshipped portions of the outbox, so the reporter refreshes it on its
+	// own interval instead of making the five-second sync poll walk disk.
+	gaugeMu           sync.Mutex
+	gauges            Gauges
+	queueScanFailures atomic.Int64
+}
+
+// Gauges is the reporter's cached view of its durable outbox.
+type Gauges struct {
+	LastSuccessAt     time.Time
+	QueueObservedAt   time.Time
+	OldestUnshippedAt time.Time
+	QueuedEvents      int64
+	QueuedBytes       int64
+	QueueScanFailures int64
 }
 
 // ShipFailures is how many batches were dropped after a permanent refusal.
 func (r *Reporter) ShipFailures() int64 { return r.shipFailures.Load() }
+
+// QueueGauges returns a copy without disk IO. Run refreshes it before its
+// first wait and after every shipping pass, successful or not.
+func (r *Reporter) QueueGauges() Gauges {
+	r.gaugeMu.Lock()
+	defer r.gaugeMu.Unlock()
+	g := r.gauges
+	g.QueueScanFailures = r.queueScanFailures.Load()
+	return g
+}
 
 // New builds a reporter over the spool directory.
 func New(spoolDir, baseURL, token string, batchSize int, timeout time.Duration, log *slog.Logger) *Reporter {
@@ -96,6 +123,7 @@ func New(spoolDir, baseURL, token string, batchSize int, timeout time.Duration, 
 // control plane is unavailable. A failure never touches the request path: the
 // spool keeps growing and the next pass picks up where this one stopped.
 func (r *Reporter) Run(ctx context.Context, interval time.Duration) {
+	r.refreshQueueGauges()
 	backoff := interval
 	const maxBackoff = 5 * time.Minute
 	for {
@@ -124,6 +152,7 @@ func (r *Reporter) Run(ctx context.Context, interval time.Duration) {
 // events went out. It stops at the first failure so the checkpoint never runs
 // ahead of what the control plane accepted.
 func (r *Reporter) Flush(ctx context.Context) (int, error) {
+	defer r.refreshQueueGauges()
 	r.mu.Lock()
 	err := r.loadCheckpoint()
 	r.mu.Unlock()
@@ -342,7 +371,97 @@ func (r *Reporter) post(ctx context.Context, events []json.RawMessage) error {
 			msg:    fmt.Sprintf("reporter: control plane returned HTTP %d", resp.StatusCode),
 		}
 	}
+	r.gaugeMu.Lock()
+	r.gauges.LastSuccessAt = time.Now().UTC()
+	r.gaugeMu.Unlock()
 	return nil
+}
+
+// refreshQueueGauges scans only the unshipped suffix of each day file. It is
+// not on the request path or the sync path, and runs at the usage reporter's
+// cadence; a large backlog therefore costs one background scan rather than one
+// scan per five-second heartbeat.
+func (r *Reporter) refreshQueueGauges() {
+	r.mu.Lock()
+	if err := r.loadCheckpoint(); err != nil {
+		r.mu.Unlock()
+		r.queueScanFailures.Add(1)
+		return
+	}
+	offsets := make(map[string]int64, len(r.ckpt.Offsets))
+	maps.Copy(offsets, r.ckpt.Offsets)
+	r.mu.Unlock()
+
+	files, err := filepath.Glob(filepath.Join(r.dir, "usage-*.jsonl"))
+	if err != nil {
+		r.queueScanFailures.Add(1)
+		return
+	}
+	sort.Strings(files)
+	var queuedEvents, queuedBytes int64
+	var oldest time.Time
+	complete := true
+	for _, path := range files {
+		day := dayOf(path)
+		if day == "" {
+			continue
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			complete = false
+			continue
+		}
+		off := offsets[day]
+		if fi, err := f.Stat(); err == nil {
+			if fi.Size() > off {
+				queuedBytes += fi.Size() - off
+			}
+		} else {
+			complete = false
+		}
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			complete = false
+			f.Close()
+			continue
+		}
+		br := bufio.NewReaderSize(f, 64<<10)
+		for {
+			line, err := br.ReadBytes('\n')
+			if err != nil {
+				if err != io.EOF {
+					complete = false
+				}
+				break // a final partial append is not an event yet
+			}
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) == 0 {
+				continue
+			}
+			if !json.Valid(trimmed) {
+				complete = false
+				continue
+			}
+			queuedEvents++
+			var event struct {
+				RequestedAt time.Time `json:"requestedAt"`
+			}
+			if json.Unmarshal(trimmed, &event) == nil && !event.RequestedAt.IsZero() &&
+				(oldest.IsZero() || event.RequestedAt.Before(oldest)) {
+				oldest = event.RequestedAt
+			}
+		}
+		f.Close()
+	}
+	if !complete {
+		r.queueScanFailures.Add(1)
+		return
+	}
+	r.gaugeMu.Lock()
+	r.gauges.QueueObservedAt = time.Now().UTC()
+	r.gauges.OldestUnshippedAt = oldest
+	r.gauges.QueuedEvents = queuedEvents
+	r.gauges.QueuedBytes = queuedBytes
+	r.gaugeMu.Unlock()
 }
 
 // loadCheckpoint reads the persisted offsets once. Callers hold r.mu.

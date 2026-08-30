@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 type attemptError struct {
 	err     error
 	timeout bool
+	kind    string
 	// throttled marks an upstream that asked us to slow down (429). It is not
 	// retried on the same upstream, and the student sees "busy" rather than a
 	// generic upstream failure.
@@ -33,20 +35,96 @@ type attemptError struct {
 // being tried first. It is advisory: an upstream in cooldown is skipped only
 // while something else can serve the request.
 type upstreamHealth struct {
-	mu        sync.Mutex
-	failures  map[string]int
-	coolUntil map[string]time.Time
-	now       func() time.Time
+	mu           sync.Mutex
+	failures     map[string]int
+	coolUntil    map[string]time.Time
+	observations map[string]*runtimeObservation
+	now          func() time.Time
 }
+
+type runtimeObservation struct {
+	passive snapshot.PassiveUpstreamObservation
+	active  snapshot.ActiveUpstreamObservation
+	catalog snapshot.CatalogObservation
+}
+
+const (
+	failureTimeout         = "TIMEOUT"
+	failureTransport       = "TRANSPORT_ERROR"
+	failureThrottled       = "THROTTLED"
+	failureCredential      = "CREDENTIAL_ERROR"
+	failureKeyThrottled    = "KEY_THROTTLED"
+	failureKeyCredential   = "KEY_CREDENTIAL_ERROR"
+	failureClientCanceled  = "CLIENT_CANCELED"
+	failureRequestRejected = "REQUEST_REJECTED"
+	failureCreditExhausted = "CREDIT_EXHAUSTED"
+	failureUpstream        = "UPSTREAM_ERROR"
+	failureVendorRejected  = "VENDOR_REJECTED"
+	failureInvalidResponse = "INVALID_RESPONSE"
+	activeUnknown          = "UNKNOWN"
+	activeOK               = "OK"
+	activeAuthUnverified   = "AUTH_UNVERIFIED"
+	activeFailed           = "FAILED"
+	catalogUnknown         = "UNKNOWN"
+	catalogMatch           = "MATCH"
+	catalogMismatch        = "MISMATCH"
+	catalogNotApplicable   = "NOT_APPLICABLE"
+)
 
 func newUpstreamHealth(now func() time.Time) *upstreamHealth {
 	if now == nil {
 		now = time.Now
 	}
 	return &upstreamHealth{
-		failures:  map[string]int{},
-		coolUntil: map[string]time.Time{},
-		now:       now,
+		failures:     map[string]int{},
+		coolUntil:    map[string]time.Time{},
+		observations: map[string]*runtimeObservation{},
+		now:          now,
+	}
+}
+
+func (h *upstreamHealth) observation(ref string) *runtimeObservation {
+	ref = strings.ToLower(ref)
+	o := h.observations[ref]
+	if o == nil {
+		o = &runtimeObservation{
+			active:  snapshot.ActiveUpstreamObservation{Status: activeUnknown},
+			catalog: snapshot.CatalogObservation{Status: catalogUnknown},
+		}
+		h.observations[ref] = o
+	}
+	return o
+}
+
+func (h *upstreamHealth) recordAttempt(ref string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.observation(ref).passive.LastAttemptAt = h.now()
+}
+
+func (h *upstreamHealth) recordPassiveFailure(ref, kind string) {
+	if !passiveFailureAffectsAvailability(kind) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	o := &h.observation(ref).passive
+	o.LastFailureAt = h.now()
+	o.LastFailureType = kind
+	o.ConsecutiveFailures++
+}
+
+// Per-request refusals and per-key commercial credentials say nothing about
+// whether the shared upstream is available. Their usage event is the
+// diagnostic record; keeping them in this shared passive state would mix an
+// unrelated last type with an older availability-failure streak.
+func passiveFailureAffectsAvailability(kind string) bool {
+	switch kind {
+	case failureRequestRejected, failureCreditExhausted,
+		failureKeyCredential, failureKeyThrottled, failureClientCanceled:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -62,7 +140,11 @@ func (h *upstreamHealth) cooling(ref string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	until, ok := h.coolUntil[ref]
-	return ok && h.now().Before(until)
+	if ok && !h.now().Before(until) {
+		delete(h.coolUntil, ref)
+		return false
+	}
+	return ok
 }
 
 func (h *upstreamHealth) recordFailure(ref string) bool {
@@ -82,6 +164,9 @@ func (h *upstreamHealth) recordSuccess(ref string) {
 	defer h.mu.Unlock()
 	delete(h.failures, ref)
 	delete(h.coolUntil, ref)
+	o := &h.observation(ref).passive
+	o.LastSuccessAt = h.now()
+	o.ConsecutiveFailures = 0
 }
 
 // callUpstream sends the request to the model's upstream, retrying a transient
@@ -151,11 +236,13 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 		}
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
+			s.health.recordAttempt(ref)
 			resp, ae := s.attempt(ctx, up, body, cred, model.CreditAxis())
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
 			}
+			s.health.recordPassiveFailure(ref, ae.kind)
 			last = ae
 			if ae.refusal != nil {
 				// The upstream understood and refused: another upstream would
@@ -227,7 +314,7 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 	creditAxis bool) (*http.Response, *attemptError) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, &attemptError{err: err}
+		return nil, &attemptError{err: err, kind: failureInvalidResponse}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cred != "" {
@@ -235,7 +322,15 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, &attemptError{err: err, timeout: isTimeout(err)}
+		if errors.Is(err, context.Canceled) || ctx.Err() == context.Canceled {
+			return nil, &attemptError{err: err, kind: failureClientCanceled}
+		}
+		timedOut := isTimeout(err)
+		kind := failureTransport
+		if timedOut {
+			kind = failureTimeout
+		}
+		return nil, &attemptError{err: err, timeout: timedOut, kind: kind}
 	}
 	if resp.StatusCode == http.StatusOK {
 		return resp, nil
@@ -247,17 +342,25 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		// The request itself is wrong; no other upstream will like it better.
-		return nil, &attemptError{refusal: &errUpstreamRejected}
+		return nil, &attemptError{refusal: &errUpstreamRejected, kind: failureRequestRejected}
 	case http.StatusTooManyRequests:
 		// The upstream is throttling us. Retrying immediately makes it worse,
 		// and the student should be told the service is busy rather than that
 		// something broke. A fallback upstream is still worth trying, so this
 		// is a throttle, not a refusal.
-		return nil, &attemptError{err: errUpstreamThrottled, throttled: true}
+		kind := failureThrottled
+		if creditAxis {
+			kind = failureKeyThrottled
+		}
+		return nil, &attemptError{err: errUpstreamThrottled, throttled: true, kind: kind}
 	case http.StatusUnauthorized, http.StatusForbidden:
 		// Our credential, not the student's problem — and not something a
 		// retry fixes. Fall through to another upstream if one exists.
-		return nil, &attemptError{err: errUpstreamAuth}
+		kind := failureCredential
+		if creditAxis {
+			kind = failureKeyCredential
+		}
+		return nil, &attemptError{err: errUpstreamAuth, kind: kind}
 	case http.StatusPaymentRequired:
 		if creditAxis {
 			// The money ran out on this key's own budget. This is the money
@@ -265,7 +368,7 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 			// nothing, another upstream would answer the same, and cooling
 			// the upstream down for it would let one exhausted key reorder
 			// everybody else's traffic. Refuse it in the student's own words.
-			return nil, &attemptError{refusal: &errCreditExhausted}
+			return nil, &attemptError{refusal: &errCreditExhausted, kind: failureCreditExhausted}
 		}
 		// A TOKEN-axis model runs on the gateway's own account, so a 402
 		// there is the platform's bill, not the student's — telling them to
@@ -273,9 +376,13 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 		// not own. Treat it as the upstream fault it is, which also keeps
 		// the model's fallback in play: that fallback exists for exactly
 		// "the primary cannot serve right now".
-		return nil, &attemptError{err: errUpstreamStatus}
+		return nil, &attemptError{err: errUpstreamStatus, kind: failureVendorRejected}
 	default:
-		return nil, &attemptError{err: errUpstreamStatus}
+		kind := failureVendorRejected
+		if resp.StatusCode >= http.StatusInternalServerError {
+			kind = failureUpstream
+		}
+		return nil, &attemptError{err: errUpstreamStatus, kind: kind}
 	}
 }
 
