@@ -17,11 +17,12 @@ import (
 // ingestServer stands in for the control plane's usage endpoint, recording
 // what it was sent so a test can assert delivery and re-delivery.
 type ingestServer struct {
-	mu       sync.Mutex
-	received []string // eventUuid, in arrival order
-	batches  int
-	status   int
-	auth     string
+	mu        sync.Mutex
+	received  []string // eventUuid, in arrival order
+	rawEvents []string
+	batches   int
+	status    int
+	auth      string
 }
 
 func (s *ingestServer) handler(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +50,7 @@ func (s *ingestServer) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(raw, &ev)
 		s.received = append(s.received, ev.EventUUID)
+		s.rawEvents = append(s.rawEvents, string(raw))
 	}
 	s.mu.Unlock()
 	if status != 0 {
@@ -56,6 +58,12 @@ func (s *ingestServer) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *ingestServer) rawSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.rawEvents...)
 }
 
 func (s *ingestServer) snapshot() ([]string, int) {
@@ -131,6 +139,39 @@ func TestFlushShipsAndCheckpoints(t *testing.T) {
 	got, _ = is.snapshot()
 	if len(got) != 4 || got[3] != "d" {
 		t.Fatalf("unexpected delivery: %v", got)
+	}
+}
+
+func TestFlushPreservesOptionalBudgetAxisAndLegacyEvents(t *testing.T) {
+	dir := t.TempDir()
+	is, url := newIngest(t)
+	path := filepath.Join(dir, "usage-20260810.jsonl")
+	raw := `{"eventUuid":"new","budgetAxis":"CREDIT","status":"OK"}` + "\n" +
+		`{"eventUuid":"old","status":"OK"}` + "\n"
+	if err := os.WriteFile(path, []byte(raw), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(dir, url, "tok", 500, 5*time.Second, discard())
+	if sent, err := r.Flush(context.Background()); err != nil || sent != 2 {
+		t.Fatalf("sent=%d err=%v", sent, err)
+	}
+	got := is.rawSnapshot()
+	if len(got) != 2 {
+		t.Fatalf("received %d events, want 2", len(got))
+	}
+	var newer, older map[string]any
+	if err := json.Unmarshal([]byte(got[0]), &newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(got[1]), &older); err != nil {
+		t.Fatal(err)
+	}
+	if newer["budgetAxis"] != "CREDIT" {
+		t.Fatalf("new event budgetAxis = %v", newer["budgetAxis"])
+	}
+	if _, present := older["budgetAxis"]; present {
+		t.Fatal("legacy event gained a budgetAxis during shipment")
 	}
 }
 

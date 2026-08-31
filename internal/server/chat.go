@@ -223,6 +223,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev.PublicModelName = publicModel
+	// Copy the effective axis out of the request's snapshot. A catalog row
+	// written before budgetAxis existed has always meant TOKEN, while a
+	// synthesized passthrough model is explicitly CREDIT. Recording the
+	// normalized value here keeps later catalog changes from reclassifying the
+	// event and leaves requests with no valid route unclassified.
+	switch model.BudgetAxis {
+	case "", snapshot.AxisToken:
+		ev.BudgetAxis = snapshot.AxisToken
+	case snapshot.AxisCredit:
+		ev.BudgetAxis = snapshot.AxisCredit
+	}
 	if !key.AllowsModel(model) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
 		return

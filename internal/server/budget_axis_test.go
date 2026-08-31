@@ -47,6 +47,13 @@ func TestQuotaExhaustedGovernsOnlyTokenAxis(t *testing.T) {
 	if _, auth := h.mock.last(); auth != "Bearer "+keyCred {
 		t.Fatalf("credit-axis call carried %q, want the key's own credential", auth)
 	}
+	events := h.spoolEvents(t)
+	if len(events) != 2 {
+		t.Fatalf("spooled %d events, want TOKEN and CREDIT requests", len(events))
+	}
+	if events[0].BudgetAxis != snapshot.AxisToken || events[1].BudgetAxis != snapshot.AxisCredit {
+		t.Fatalf("request-time budget axes = %v, want TOKEN then CREDIT", []string{events[0].BudgetAxis, events[1].BudgetAxis})
+	}
 }
 
 func TestCreditModelRequiresKeyCredential(t *testing.T) {
@@ -106,8 +113,8 @@ func TestPassthroughRoutesUnknownModels(t *testing.T) {
 	// attributable even though the catalog never listed it.
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.PublicModelName != "vendor/some-model" || last.Status != "OK" {
-		t.Fatalf("event recorded %q/%q", last.PublicModelName, last.Status)
+	if last.PublicModelName != "vendor/some-model" || last.BudgetAxis != snapshot.AxisCredit || last.Status != "OK" {
+		t.Fatalf("event recorded model=%q budgetAxis=%q status=%q", last.PublicModelName, last.BudgetAxis, last.Status)
 	}
 }
 
@@ -202,6 +209,13 @@ func TestUnknownModelStays404WithoutPassthrough(t *testing.T) {
 	status, body := h.chat(t, testToken, `{"model":"vendor/x","messages":[{"role":"user","content":"hi"}]}`)
 	if status != 404 || errCode(t, body) != "model_not_found" {
 		t.Fatalf("unknown model with no passthroughRef: got %d %s", status, body)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 1 {
+		t.Fatalf("spooled %d events for unknown model, want 1", len(events))
+	}
+	if events[0].BudgetAxis != "" {
+		t.Fatalf("unknown model event has budgetAxis %q", events[0].BudgetAxis)
 	}
 }
 

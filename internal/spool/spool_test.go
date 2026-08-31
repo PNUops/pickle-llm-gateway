@@ -21,7 +21,7 @@ func TestWriteRoundTripAndDailyFiles(t *testing.T) {
 
 	day1 := time.Date(2026, 8, 10, 23, 50, 0, 0, time.UTC)
 	day2 := day1.Add(time.Hour)
-	ev1 := Event{EventUUID: NewEventUUID(), KeyID: "k1", PublicModelName: "pickle-general",
+	ev1 := Event{EventUUID: NewEventUUID(), KeyID: "k1", PublicModelName: "pickle-general", BudgetAxis: "TOKEN",
 		Status: StatusOK, InputTokens: 7, OutputTokens: 5, LatencyMs: 120, TtftMs: 40, RequestedAt: day1}
 	ev2 := Event{EventUUID: NewEventUUID(), KeyID: "k1", Status: StatusRateLimited,
 		ErrorType: "rate_limit_requests", RequestedAt: day2}
@@ -48,7 +48,7 @@ func TestWriteRoundTripAndDailyFiles(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.EventUUID != ev1.EventUUID || got.InputTokens != 7 || got.OutputTokens != 5 || got.Status != StatusOK {
+	if got.EventUUID != ev1.EventUUID || got.BudgetAxis != "TOKEN" || got.InputTokens != 7 || got.OutputTokens != 5 || got.Status != StatusOK {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }
@@ -57,7 +57,7 @@ func TestWriteRoundTripAndDailyFiles(t *testing.T) {
 // response content, so the marshaled key set is pinned here. Adding a field
 // means deciding, explicitly, that it is not content.
 func TestEventCarriesOnlyAccountingFields(t *testing.T) {
-	ev := Event{EventUUID: "u", KeyID: "k", PublicModelName: "m", Status: StatusOK,
+	ev := Event{EventUUID: "u", KeyID: "k", PublicModelName: "m", BudgetAxis: "CREDIT", Status: StatusOK,
 		ErrorType: "e", InputTokens: 1, OutputTokens: 2, Estimated: true,
 		LatencyMs: 3, TtftMs: 4, RequestedAt: time.Now()}
 	raw, err := json.Marshal(ev)
@@ -70,13 +70,37 @@ func TestEventCarriesOnlyAccountingFields(t *testing.T) {
 	}
 	allowed := map[string]bool{
 		"eventUuid": true, "generation": true, "keyId": true, "publicModelName": true,
-		"status": true, "errorType": true, "inputTokens": true, "outputTokens": true,
+		"budgetAxis": true, "status": true, "errorType": true, "inputTokens": true, "outputTokens": true,
 		"estimated": true, "latencyMs": true, "ttftMs": true, "requestedAt": true,
 	}
 	for k := range m {
 		if !allowed[k] {
 			t.Fatalf("event carries unexpected field %q", k)
 		}
+	}
+}
+
+func TestEventWithoutBudgetAxisKeepsTheFieldAbsent(t *testing.T) {
+	// Existing spool files predate budgetAxis. They remain valid accounting
+	// events, and a request that never resolved a route has the same shape.
+	old := []byte(`{"eventUuid":"old","status":"BAD_REQUEST","inputTokens":0,"outputTokens":0,"latencyMs":1,"requestedAt":"2026-08-10T00:00:00Z"}`)
+	var ev Event
+	if err := json.Unmarshal(old, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.BudgetAxis != "" {
+		t.Fatalf("old event gained budgetAxis %q", ev.BudgetAxis)
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := fields["budgetAxis"]; present {
+		t.Fatal("empty budgetAxis was serialized")
 	}
 }
 
