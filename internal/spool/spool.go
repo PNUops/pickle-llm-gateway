@@ -37,6 +37,11 @@ type Event struct {
 	Generation      int64  `json:"generation,omitempty"`
 	KeyID           string `json:"keyId,omitempty"`
 	PublicModelName string `json:"publicModelName,omitempty"`
+	// BudgetAxis snapshots the TOKEN/CREDIT route decision from the model in
+	// force for this request. It stays empty when no valid model or passthrough
+	// route was resolved, so older spool lines and local unknown-model refusals
+	// omit the additive field.
+	BudgetAxis string `json:"budgetAxis,omitempty"`
 	// UpstreamRef names the last upstream the request was sent to, and
 	// Attempts how many tries it took. The public model name deliberately hides
 	// which server answered, so without these a fallback to a second upstream —
