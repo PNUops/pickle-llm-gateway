@@ -138,7 +138,11 @@ func FromEnv() (*Config, error) {
 		// sustained ~2,000 req/s. So this default is conservative by a wide
 		// margin and the binding constraint is the container, not the request.
 		// Raise it — with the container's memory, the unit's MemoryMax,
-		// GOMEMLIMIT and LimitNOFILE together — for a larger host.
+		// MemoryHigh, GOMEMLIMIT and LimitNOFILE together — for a larger host.
+		// The ceilings that matter answer to upstreamResponseCapBytes, not to
+		// this default: a response near that cap costs roughly 13 MB to hold,
+		// decode and re-serialise, so raising the cap moves how many such
+		// responses it takes to exhaust the container.
 		MaxInFlight:        16,
 		UpstreamRetries:    1,
 		DefaultRpm:         20,
