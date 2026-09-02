@@ -124,6 +124,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ev.ErrorType = e.code
 		record()
 	}
+	// Same refusal to the caller, a different name in the usage record. Used
+	// where two distinct causes deliberately share one public error code and
+	// the accounting still has to tell them apart.
+	refuseAs := func(e apiError, status, errorType string) {
+		writeAPIError(w, e)
+		ev.Status = status
+		ev.ErrorType = errorType
+		record()
+	}
 
 	// One snapshot view per request: every check below reads this state, so a
 	// concurrent reload can never mix generations within a request.
@@ -243,6 +252,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// answer to the per-key upstream credential, whose issuer holds the money
 	// limit — a key granted no money budget simply carries no credential.
 	if model.CreditAxis() {
+		// The allow list is checked before the credential, and the order is the
+		// answer the caller gets. A key restricted to some models still holds a
+		// funded credential, so testing the credential first would answer
+		// "no money budget" to somebody who has one — sending them to apply for
+		// what they already have. What they actually need is a different model,
+		// or an administrator who widens the list.
+		if !key.AllowsCreditModel(model) {
+			// Same public code as the catalogue fence, different advice (see
+			// errors.go). The spool gets its own error type so the two stay
+			// countable apart — otherwise nobody can tell how many callers hit
+			// this one.
+			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
+				"credit_model_not_allowed")
+			return
+		}
 		if key.CredentialFor(model.UpstreamRef) == "" {
 			// Same missing credential, two different answers. A budget that
 			// was granted and is still being applied ends by itself, so the

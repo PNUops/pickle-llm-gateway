@@ -187,11 +187,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		// actually call it (credential for the passthrough upstream) — for
 		// anyone else an arbitrary name is a 404, same as before.
 		if m == nil {
-			if p := passthroughModel(&doc, id); p != nil && key.CredentialFor(p.UpstreamRef) != "" {
+			if p := passthroughModel(&doc, id); p != nil && key.CredentialFor(p.UpstreamRef) != "" &&
+				key.AllowsCreditModel(p) {
 				m = p
 			}
 		}
-		if m == nil || !key.AllowsModel(m) {
+		// The money fence applies here too, and it answers 404 rather than 403
+		// like chat does: this surface already refuses to confirm that a model
+		// it will not serve exists, and a restricted key learning which names
+		// are real would undo that.
+		if m == nil || !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
 			writeAPIError(w, errModelNotFound)
 			return
 		}
@@ -206,7 +211,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}{Object: "list", Data: []modelEntry{}}
 	for i := range doc.Models {
 		m := &doc.Models[i]
-		if !key.AllowsModel(m) {
+		if !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
 			continue
 		}
 		list.Data = append(list.Data, entryFor(m))

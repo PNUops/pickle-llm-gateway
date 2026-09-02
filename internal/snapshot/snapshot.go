@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -140,13 +141,27 @@ const (
 // for this key, which is what makes per-key money limits enforceable by the
 // upstream that holds the money.
 type Key struct {
-	KeyID          string     `json:"keyId"`
-	TokenHash      string     `json:"tokenHash"`
-	Status         string     `json:"status"`
-	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`
-	AllowedModels  []string   `json:"allowedModels,omitempty"`
-	Limits         Limits     `json:"limits"`
-	QuotaExhausted bool       `json:"quotaExhausted,omitempty"`
+	KeyID         string     `json:"keyId"`
+	TokenHash     string     `json:"tokenHash"`
+	Status        string     `json:"status"`
+	ExpiresAt     *time.Time `json:"expiresAt,omitempty"`
+	AllowedModels []string   `json:"allowedModels,omitempty"`
+	// CreditAllowedModels fences the money axis, and only the money axis. A
+	// TOKEN-axis model is reachable whatever this holds: self-serving capacity
+	// answers to its own daily quota, and refusing it here would restrict
+	// something the control plane did not mean to restrict.
+	//
+	// Empty means unrestricted, the same as the field above, but the two never
+	// substitute for each other — AllowedModels curates which catalogue models
+	// a key sees at all, and filling it locks a key out of self-serving models
+	// as a side effect. That is why the money fence is a second field rather
+	// than a reuse of the first.
+	//
+	// Entries are exact public names or a single vendor prefix ("openai/*"),
+	// lower-cased at load so a stored capital cannot silently match nothing.
+	CreditAllowedModels []string `json:"creditAllowedModels,omitempty"`
+	Limits              Limits   `json:"limits"`
+	QuotaExhausted      bool     `json:"quotaExhausted,omitempty"`
 	// UpstreamCredentials maps an upstream ref (lowercased at load) to the
 	// bearer this key must use there. CREDIT-axis models require an entry for
 	// the serving upstream — there is deliberately no fallback to the
@@ -203,6 +218,57 @@ func (k *Key) AllowsModel(m *Model) bool {
 	}
 	return false
 }
+
+// AllowsCreditModel reports whether the key may spend money on the model.
+//
+// TOKEN-axis models return true unconditionally, which is the whole point of
+// the field: the list is a money fence, and a self-serving model has no money
+// to fence. Keeping that guard inside this function rather than at the three
+// call sites means a caller cannot forget the axis and fence the wrong one.
+//
+// An empty list is unrestricted — the amount granted stays the only bound, as
+// it was before this field existed.
+func (k *Key) AllowsCreditModel(m *Model) bool {
+	if !m.CreditAxis() || len(k.CreditAllowedModels) == 0 {
+		return true
+	}
+	name := strings.ToLower(m.PublicName)
+	for _, pattern := range k.CreditAllowedModels {
+		if MatchesCreditModel(pattern, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchesCreditModel reports whether one already-normalized allow-list pattern
+// covers a lower-cased public model name.
+//
+// Two shapes and no others: an exact name, or one vendor opened by a trailing
+// "/*". A bare "*" matches nothing on purpose — "everything" is spelled by an
+// empty list, and a second spelling of the same state is how a state count
+// grows past what anyone reasons about.
+func MatchesCreditModel(pattern, lowerName string) bool {
+	// A bare "*" is refused here as well as at load. The loader already drops a
+	// key carrying one, so this is the second lock on the same door — and the
+	// cheaper one to reason about, since a caller may send "*" as a model name
+	// and passthrough would happily synthesize a model called exactly that.
+	if pattern == "" || pattern == "*" {
+		return false
+	}
+	if prefix, ok := strings.CutSuffix(pattern, "/*"); ok {
+		return prefix != "" && strings.HasPrefix(lowerName, prefix+"/") &&
+			len(lowerName) > len(prefix)+1
+	}
+	return pattern == lowerName
+}
+
+// creditModelPattern is the shape the control plane is expected to have
+// normalized to. The gateway checks rather than trusts: a pattern it cannot act
+// on would otherwise be dropped from the list, and dropping the last entry of a
+// list turns a fence into no fence at all.
+var creditModelPattern = regexp.MustCompile(
+	`^[a-z0-9][a-z0-9._:-]*(/([a-z0-9][a-z0-9._:-]*|\*))?$`)
 
 // state is one loaded document plus the lookup maps derived from it.
 type state struct {
@@ -594,6 +660,41 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 		}
 		if credProblem != "" {
 			if derr := drop("%s", credProblem); derr != nil {
+				return nil, derr
+			}
+			continue
+		}
+		// The money fence is lower-cased once here, like credential refs above,
+		// so every later comparison is against a name lowered the same way.
+		//
+		// A pattern this build cannot act on drops the whole key rather than
+		// just that entry, and the asymmetry is deliberate: dropping entries
+		// shrinks a list, and a list shrunk to nothing is not a tighter fence
+		// but no fence at all — a key would silently regain every commercial
+		// model. Dropping the key denies service to one key and says so in the
+		// reject count, which is the failure this loader is built to prefer.
+		listProblem := ""
+		if len(k.CreditAllowedModels) > 0 {
+			norm := make([]string, 0, len(k.CreditAllowedModels))
+			for _, pattern := range k.CreditAllowedModels {
+				lower := strings.ToLower(strings.TrimSpace(pattern))
+				if lower == "" || !creditModelPattern.MatchString(lower) {
+					listProblem = fmt.Sprintf(
+						"key %s: creditAllowedModels entry %q is not a usable pattern",
+						k.KeyID, pattern)
+					break
+				}
+				norm = append(norm, lower)
+			}
+			// A blank entry is refused rather than skipped, for the same reason
+			// a malformed one is: skip them all and a list that said something
+			// becomes a list that says nothing, which here means unrestricted.
+			// The first version of this loop skipped blanks and would have let
+			// ["  "] widen a fenced key to every commercial model.
+			k.CreditAllowedModels = norm
+		}
+		if listProblem != "" {
+			if derr := drop("%s", listProblem); derr != nil {
 				return nil, derr
 			}
 			continue
