@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 )
 
 type apiError struct {
@@ -31,7 +32,13 @@ var (
 	errQuotaExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "quota_exhausted",
 		"사용량 한도를 모두 사용했습니다. 한도는 기간이 지나면 초기화되며, 증액이 필요하면 콘솔에서 신청해주세요."}
 	errCreditUnavailable = apiError{http.StatusForbidden, "permission_error", "credit_unavailable",
-		"이 API Key에는 상용 모델을 쓸 금액 한도가 연결되어 있지 않습니다. 금액 한도가 부여된 뒤 다시 시도해주세요."}
+		"이 API Key에는 상용 모델을 쓸 금액 한도가 없습니다. 콘솔에서 한도를 신청해주세요."}
+	// 503 rather than 403 on purpose: nothing about the request is wrong and
+	// the state ends on its own, so the honest answer is "not yet", which is
+	// also the one OpenAI-compatible clients retry without being told. The
+	// budget was granted; only its upstream key is still being created.
+	errCreditPending = apiError{http.StatusServiceUnavailable, "server_error", "credit_pending",
+		"승인된 금액 한도를 이 API Key에 적용하는 중입니다. 적용이 끝나면 자동으로 사용할 수 있으니 잠시 후 다시 시도해주세요."}
 	errCreditExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "credit_exhausted",
 		"상용 모델에 부여된 금액 한도를 모두 사용했습니다. 증액이 필요하면 콘솔에서 신청해주세요."}
 	errServiceDisabled = apiError{http.StatusServiceUnavailable, "server_error", "service_disabled",
@@ -68,6 +75,23 @@ var (
 		"지원하지 않는 HTTP 메서드입니다."}
 )
 
+// retryAfterSeconds is the Retry-After each error carries, keyed by the code
+// above. Only a refusal that ends without anyone acting belongs here: waiting
+// has to be the actual remedy, or the header sends a client back into a wall
+// on a schedule. Everything absent sends no header, which is the honest
+// answer for a refusal a person has to resolve.
+//
+// It lives beside the catalogue rather than inside apiError because the codes
+// are already the stable machine identifiers and every other error would have
+// to carry a zero it never uses.
+var retryAfterSeconds = map[string]int{
+	// Provisioning is attempted the moment the budget lands and normally
+	// finishes well inside this. The sweep that retries a failed attempt runs
+	// on a far longer period, so this fits the common case, not the degraded
+	// one — a client that keeps getting 503 is seeing a real fault.
+	"credit_pending": 10,
+}
+
 // Internal sentinels for upstream failure reasons. They never reach a client;
 // the client sees the shaped envelope above.
 var (
@@ -95,6 +119,9 @@ func errMissingParam(name string) apiError {
 
 func writeAPIError(w http.ResponseWriter, e apiError) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if seconds := retryAfterSeconds[e.code]; seconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	}
 	w.WriteHeader(e.status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
