@@ -55,12 +55,33 @@ SystemCallArchitectures=native
 # far above the in-flight cap rather than just above it.
 LimitNOFILE=65535
 TasksMax=512
-MemoryMax=1G
+# The ceilings answer to the response read cap, not to normal traffic. A
+# response near that cap costs about 13 MB to buffer, decode and re-serialise,
+# so what the ladder below has to survive is a broken or hostile upstream
+# returning those in bulk — normal load sits two orders of magnitude under it.
+# Raising the in-flight cap moved that failure closer, which is why these grew
+# with it rather than after it.
+#
+# MemoryMax stays below the container's own limit on purpose, and the gap is
+# not spare capacity — it decides which process dies. Were the two equal, the
+# container's cgroup would hit its limit at the same moment and its OOM killer
+# would choose among everything in the container, systemd and journald
+# included: nothing left to restart the daemon, and nothing left to record why.
+# Below it, the daemon always reaches its own ceiling first and dies alone.
+# The gap only has to cover the rest of the container, which measured 12 MB
+# idle plus page cache, so 512 MB is already generous.
+MemoryMax=3584M
+# A rung below the kill, so pressure from such an upstream shows up as
+# throttling and reclaim in the logs while the service still answers. Without
+# it the first symptom is a SIGKILL, and a restart takes every in-memory
+# rate-limit bucket with it — an OOM loop is a limit bypass.
+MemoryHigh=3072M
 # Go sizes its heap from the machine, not from the cgroup, so without this it
 # grows toward twice the live heap and the cgroup kills the process before the
-# collector runs. Kept below MemoryMax so the collector gets to act first; a
-# restart would otherwise wipe every in-memory rate-limit bucket along with it.
-Environment=GOMEMLIMIT=768MiB
+# collector runs. Kept below both rungs so the collector acts first. Note it
+# governs the Go heap only: socket buffers count against MemoryMax and are
+# invisible here, which is part of why the gap to MemoryMax is wide.
+Environment=GOMEMLIMIT=2560MiB
 
 [Install]
 WantedBy=multi-user.target
