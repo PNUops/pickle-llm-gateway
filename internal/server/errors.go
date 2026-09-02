@@ -45,8 +45,13 @@ var (
 		"LLM API 서비스가 점검 중입니다. 잠시 후 다시 시도해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
 		"요청한 모델이 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
+	// The message deliberately does not send the caller to GET /v1/models. That
+	// surface lists the served catalogue, and a commercial model reached through
+	// passthrough is never in it — so for a key restricted to commercial models
+	// the old advice pointed at a list that could not contain the answer. The
+	// console shows the key's own allow list, which can.
 	errModelNotAllowed = apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key로는 요청한 모델을 사용할 수 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
+		"이 API Key로는 요청한 모델을 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
 	errRateRequests = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_requests",
 		"분당 요청 횟수 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateTokens = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_tokens",
