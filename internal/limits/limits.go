@@ -1,7 +1,10 @@
 // Package limits enforces the per-key short-window limits: requests per
-// minute, tokens per minute, and concurrent requests. All state is in memory
-// on this one gateway process; the counters restart with it, which for
-// minute-scale windows only ever errs briefly in the caller's favor.
+// minute, tokens per minute, and concurrent requests. All three guard
+// self-hosted serving capacity, so the caller applies them only once the
+// request's budget axis is known and only on the TOKEN axis; a commercial
+// call never reaches this package. All state is in memory on this one gateway
+// process; the counters restart with it, which for minute-scale windows only
+// ever errs briefly in the caller's favor.
 package limits
 
 import (
@@ -94,6 +97,9 @@ type Decision struct {
 // Acquire admits or refuses one request for the key. On admission it charges
 // one request against the rpm bucket and takes a concurrency slot. rpm, tpm
 // and conc are the key's resolved limits (already defaulted by the caller).
+// Call it only for requests that draw on self-hosted serving capacity — the
+// caller decides that from the model's budget axis, which it cannot know
+// before the request body has been parsed.
 func (l *Limiter) Acquire(keyID string, rpm, tpm, conc int) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -185,10 +185,13 @@ type Key struct {
 	RecordBodies bool `json:"recordBodies,omitempty"`
 }
 
-// Limits are the short-window limits the gateway enforces locally. A zero
-// value means "not set here" and falls back to the gateway-wide default;
-// long-window quotas are decided by whoever produces the document and arrive
-// as the QuotaExhausted flag.
+// Limits are the short-window limits the gateway enforces locally. All three
+// govern TOKEN-axis models only, for the same reason QuotaExhausted does: they
+// ration self-hosted serving capacity, and a CREDIT-axis call spends the money
+// budget its own upstream credential carries instead. A zero value means "not
+// set here" and falls back to the gateway-wide default; long-window quotas are
+// decided by whoever produces the document and arrive as the QuotaExhausted
+// flag.
 type Limits struct {
 	Rpm         int `json:"rpm,omitempty"`
 	Tpm         int `json:"tpm,omitempty"`

@@ -171,26 +171,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errServerBusy, spool.StatusRateLimited)
 		return
 	}
-	rpm, tpm, conc := s.keyLimits(key)
-	adm := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
-	if adm.Reason != limits.OK {
-		// Tell the client when to come back rather than leaving it to guess;
-		// SDK retry helpers read this header.
-		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(adm.RetryAfter.Seconds()))))
-		switch adm.Reason {
-		case limits.Rpm:
-			refuse(errRateRequests, spool.StatusRateLimited)
-		case limits.Tpm:
-			refuse(errRateTokens, spool.StatusRateLimited)
-		default:
-			refuse(errRateConcurrency, spool.StatusRateLimited)
-		}
-		return
-	}
-	defer adm.Release()
-	w.Header().Set("X-RateLimit-Limit-Requests", strconv.Itoa(rpm))
-	w.Header().Set("X-RateLimit-Remaining-Requests", strconv.Itoa(adm.RemainingRequests))
-
+	// The per-key limits are applied further down, once the model has told us
+	// the budget axis. They all protect self-hosted serving capacity, which a
+	// commercial call never touches — see the TOKEN branch below.
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.RequestBodyMaxBytes)
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -248,9 +231,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Budget-axis enforcement, now that the model (and so the axis) is known.
-	// TOKEN models answer to the document's daily-quota flag; CREDIT models
-	// answer to the per-key upstream credential, whose issuer holds the money
-	// limit — a key granted no money budget simply carries no credential.
+	//
+	// charge meters this request against the key's tpm bucket. It is a no-op
+	// on the CREDIT axis and stays that way for the rest of the handler, so
+	// commercial traffic can neither be refused by that bucket nor push it
+	// into debt — either one would let a commercial call spend self-hosted
+	// serving capacity it never used. Assigning (not declaring) it inside the
+	// branch below is deliberate: a `:=` there would shadow this one and leave
+	// every TOKEN request unmetered, which is the exact defect this ordering
+	// was written to fix.
+	charge := func(int) {}
 	if model.CreditAxis() {
 		// The allow list is checked before the credential, and the order is the
 		// answer the caller gets. A key restricted to some models still holds a
@@ -267,6 +257,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				"credit_model_not_allowed")
 			return
 		}
+		// Past the fence, the credential is the whole of the money axis: its
+		// issuer holds the limit, so a key granted no money budget simply
+		// carries none. No per-key limit of ours applies on this side.
 		if key.CredentialFor(model.UpstreamRef) == "" {
 			// Same missing credential, two different answers. A budget that
 			// was granted and is still being applied ends by itself, so the
@@ -280,9 +273,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			refuse(errCreditUnavailable, spool.StatusAuthRejected)
 			return
 		}
-	} else if key.QuotaExhausted {
-		refuse(errQuotaExhausted, spool.StatusRateLimited)
-		return
+	} else {
+		// Every per-key limit below guards self-hosted serving capacity, so
+		// all of them wait until the axis is known. Admission comes before the
+		// daily quota, as it always has: a key that exhausted its allowance is
+		// the one most likely to be sitting in a retry loop, and leaving it
+		// unmetered by rpm would remove the only brake on that loop.
+		rpm, tpm, conc := s.keyLimits(key)
+		adm := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
+		if adm.Reason != limits.OK {
+			// Tell the client when to come back rather than leaving it to
+			// guess; SDK retry helpers read this header.
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(adm.RetryAfter.Seconds()))))
+			switch adm.Reason {
+			case limits.Rpm:
+				refuse(errRateRequests, spool.StatusRateLimited)
+			case limits.Tpm:
+				refuse(errRateTokens, spool.StatusRateLimited)
+			default:
+				refuse(errRateConcurrency, spool.StatusRateLimited)
+			}
+			return
+		}
+		defer adm.Release()
+		w.Header().Set("X-RateLimit-Limit-Requests", strconv.Itoa(rpm))
+		w.Header().Set("X-RateLimit-Remaining-Requests", strconv.Itoa(adm.RemainingRequests))
+		if key.QuotaExhausted {
+			refuse(errQuotaExhausted, spool.StatusRateLimited)
+			return
+		}
+		keyID := key.KeyID
+		charge = func(tokens int) { s.limiter.ChargeTokens(keyID, tpm, tokens) }
 	}
 	// Output length. A JSON null is what SDKs send for "unset" and is treated
 	// as absent; an explicit value above the model cap is refused. Whatever the
@@ -418,14 +439,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, key.KeyID, tpm, &ev, record, len(messagesRaw), capture)
+		s.finishNonStream(w, resp, model.PublicName, charge, &ev, record, len(messagesRaw), capture)
 		return
 	}
 	s.finishStream(w, resp, streamArgs{
 		capture:      capture,
 		publicName:   model.PublicName,
 		keyID:        key.KeyID,
-		tpm:          tpm,
+		charge:       charge,
 		inputBytes:   len(messagesRaw),
 		forwardUsage: studentWantsUsage,
 		clientCtx:    r.Context(),
@@ -455,7 +476,7 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 // cost is a multiple of this, times the in-flight cap.
 const upstreamResponseCapBytes = 8 << 20
 
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, keyID string, tpm int, ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
+func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -471,7 +492,7 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		// an input-side estimate so a client looping large failing requests is
 		// still rate-limited rather than metered as free.
 		s.settleUsage(ev, usage{}, false, inputBytes, 0)
-		s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
+		charge(ev.InputTokens + ev.OutputTokens)
 		record()
 		return
 	}
@@ -485,6 +506,17 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		writeAPIError(w, errUpstream)
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_invalid_response"
+		// Charge the minute bucket but leave the event's token counts at zero.
+		// The bucket is in-memory and minute-scale, so charging it is only
+		// rate limiting: without it a client looping against an upstream that
+		// answers garbage pays nothing and can repeat without bound. The event
+		// is the accounting record, and the api's daily-allowance query counts
+		// tokens without looking at status — writing an estimate there would
+		// spend a student's daily quota on an upstream fault they cannot
+		// influence, which is the same principle that puts the gateway-wide
+		// cap ahead of every per-key charge.
+		in, _ := estimateTokens(inputBytes, 0)
+		charge(in)
 		record()
 		return
 	}
@@ -520,6 +552,16 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		writeAPIError(w, errUpstream)
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_invalid_response"
+		// Defensive only, and no test covers it: everything a UseNumber decode
+		// produces marshals again, so nothing a valid decode above can yield
+		// reaches here. Kept for the same reason as the decode failure, and
+		// charged the same way — bucket yes, accounting record no.
+		if haveUsage {
+			charge(u.PromptTokens + u.CompletionTokens)
+		} else {
+			in, outTok := estimateTokens(inputBytes, contentChars)
+			charge(in + outTok)
+		}
 		record()
 		return
 	}
@@ -531,7 +573,7 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		ev.Status = spool.StatusOK
 	}
 	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
-	s.limiter.ChargeTokens(keyID, tpm, ev.InputTokens+ev.OutputTokens)
+	charge(ev.InputTokens + ev.OutputTokens)
 	s.bodies.Offer(capture)
 	if capture != nil {
 		s.metrics.bodiesCaptured.Add(1)
@@ -540,9 +582,11 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 }
 
 type streamArgs struct {
-	publicName   string
+	publicName string
+	// keyID is for logging only; metering goes through charge, which already
+	// knows the key and whether this request's axis is metered at all.
 	keyID        string
-	tpm          int
+	charge       func(int)
 	inputBytes   int
 	forwardUsage bool
 	capture      *bodies.Record // nil unless the key opted into body capture
@@ -698,7 +742,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		ev.Status = spool.StatusOK
 	}
 	s.settleUsage(ev, u, haveUsage, a.inputBytes, contentChars)
-	s.limiter.ChargeTokens(a.keyID, a.tpm, ev.InputTokens+ev.OutputTokens)
+	a.charge(ev.InputTokens + ev.OutputTokens)
 	if a.capture != nil {
 		a.capture.Response, a.capture.ResponseTruncated = capString(answer.String())
 		s.bodies.Offer(a.capture)
@@ -812,9 +856,16 @@ func (s *Server) settleUsage(ev *spool.Event, u usage, haveUsage bool, inputByte
 		ev.OutputTokens = u.CompletionTokens
 		return
 	}
-	ev.InputTokens = inputBytes / 4
-	ev.OutputTokens = contentChars / 3
+	ev.InputTokens, ev.OutputTokens = estimateTokens(inputBytes, contentChars)
 	ev.Estimated = true
+}
+
+// estimateTokens is the byte-based fallback when no upstream usage arrived.
+// It is separate from settleUsage because the rate limiter sometimes needs the
+// estimate without it reaching the accounting record — see the response paths
+// that charge the bucket but leave the event's token counts at zero.
+func estimateTokens(inputBytes, contentChars int) (in, out int) {
+	return inputBytes / 4, contentChars / 3
 }
 
 func isTimeout(err error) bool {

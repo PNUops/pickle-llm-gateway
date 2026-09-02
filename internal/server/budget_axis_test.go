@@ -1,4 +1,4 @@
-// Budget axes and per-key upstream credentials: the daily token quota governs
+// Budget axes and per-key upstream credentials: every per-key limit governs
 // only TOKEN-axis models, CREDIT-axis models require the key's own upstream
 // credential (never the gateway-wide env one), and uncatalogued model names
 // pass through to the document's passthrough upstream on the CREDIT axis.
@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 )
 
@@ -378,5 +380,264 @@ func TestReservedPrefixExactCatalogMatchStillServes(t *testing.T) {
 		`{"model":"pnu-general","messages":[{"role":"user","content":"hi"}]}`)
 	if status != 200 {
 		t.Fatalf("catalogued retired-prefix name: got %d %s", status, body)
+	}
+}
+
+// The per-key short-window limits ration self-hosted serving capacity, so
+// since 2026-09-02 they govern TOKEN-axis requests only. A commercial call
+// neither answers to them nor charges them, which is what the tests below
+// pin — separately, because each of the three failed differently before.
+
+func TestCreditAxisIgnoresRequestAndTokenLimits(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		d.Keys[0].Limits.Rpm = 1
+		d.Keys[0].Limits.Tpm = 10
+	}, nil)
+
+	// Sequential calls: the first would exhaust rpm and the first response
+	// would put the tpm bucket into debt, refusing everything after it.
+	for i := range 3 {
+		status, body := h.chat(t, testToken, creditChatBody)
+		if status != 200 {
+			t.Fatalf("credit-axis call %d refused by a self-serve limit: %d %s", i, status, body)
+		}
+	}
+}
+
+func TestCreditAxisIgnoresConcurrencyLimit(t *testing.T) {
+	// Sequential calls can never reach a concurrency limit — in-flight goes
+	// 0→1→0 around each one — so this needs two requests genuinely overlapping.
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		d.Keys[0].Limits.Concurrency = 1
+	}, nil)
+	h.mock.set(func(u *mockOpts) { u.delay = 400 * time.Millisecond })
+
+	codes := make(chan int, 2)
+	for range 2 {
+		go func() { codes <- h.chatStatus(testToken, creditChatBody) }()
+		time.Sleep(50 * time.Millisecond)
+	}
+	for range 2 {
+		if got := <-codes; got != 200 {
+			t.Fatalf("overlapping credit-axis call refused: %d", got)
+		}
+	}
+}
+
+func TestCreditAxisUsageDoesNotChargeTheTokenBucket(t *testing.T) {
+	// The refusal moving off the credit axis is only half the fix. If the
+	// commercial response still charged the shared per-key tpm bucket, the
+	// bucket would sit in debt and refuse the *next* self-serve call — the
+	// original symptom, minus the error code. There are three charge sites;
+	// the streaming one is exercised below.
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			h := newHarness(t, func(d *snapshot.Document) {
+				creditDoc(d)
+				d.Keys[0].Limits.Tpm = 10
+			}, nil)
+			body := creditChatBody
+			if stream {
+				body = `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"stream":true}`
+			}
+			for i := range 3 {
+				if status, out := h.chat(t, testToken, body); status != 200 {
+					t.Fatalf("credit-axis call %d: %d %s", i, status, out)
+				}
+			}
+			// The token-axis model shares the key and so the bucket.
+			if status, out := h.chat(t, testToken, chatBody); status != 200 {
+				t.Fatalf("token-axis call after credit-axis traffic: %d %s", status, out)
+			}
+		})
+	}
+}
+
+func TestTokenAxisStillAnswersToEveryShortWindowLimit(t *testing.T) {
+	// The other half: nothing about the self-serve axis loosened. Each limit
+	// refuses on its own code and carries Retry-After, as before.
+	t.Run("rpm", func(t *testing.T) {
+		h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Rpm = 1 }, nil)
+		if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+			t.Fatalf("first call: %d", status)
+		}
+		status, hdr, body := h.chatHeaders(t, testToken, chatBody)
+		if status != 429 || errCode(t, body) != "rate_limit_requests" {
+			t.Fatalf("second call: %d %s", status, body)
+		}
+		if hdr.Get("Retry-After") == "" {
+			t.Fatal("rpm refusal carried no Retry-After")
+		}
+	})
+	t.Run("tpm", func(t *testing.T) {
+		h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Tpm = 10 }, nil)
+		if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+			t.Fatalf("first call: %d", status)
+		}
+		status, hdr, body := h.chatHeaders(t, testToken, chatBody)
+		if status != 429 || errCode(t, body) != "rate_limit_tokens" {
+			t.Fatalf("second call: %d %s", status, body)
+		}
+		if hdr.Get("Retry-After") == "" {
+			t.Fatal("tpm refusal carried no Retry-After")
+		}
+	})
+	t.Run("concurrency", func(t *testing.T) {
+		h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Concurrency = 1 }, nil)
+		h.mock.set(func(u *mockOpts) { u.delay = 400 * time.Millisecond })
+		codes := make(chan int, 2)
+		bodies := make(chan []byte, 2)
+		for range 2 {
+			go func() {
+				status, raw := h.chatRaw(testToken, chatBody)
+				codes <- status
+				bodies <- raw
+			}()
+			time.Sleep(50 * time.Millisecond)
+		}
+		got := map[int]int{}
+		var refused []byte
+		for range 2 {
+			c := <-codes
+			b := <-bodies
+			got[c]++
+			if c == 429 {
+				refused = b
+			}
+		}
+		if got[200] != 1 || got[429] != 1 {
+			t.Fatalf("overlapping token-axis calls: %v", got)
+		}
+		if code := errCode(t, refused); code != "rate_limit_concurrency" {
+			t.Fatalf("refused with %q, want rate_limit_concurrency", code)
+		}
+	})
+}
+
+func TestRateLimitHeadersAreForTheSelfServeAxisOnly(t *testing.T) {
+	// The remaining-requests header reports the rpm budget, and the credit
+	// axis no longer has one. Reporting a number that governs nothing would
+	// be worse than reporting none.
+	h := newHarness(t, creditDoc, nil)
+
+	status, hdr, body := h.chatHeaders(t, testToken, chatBody)
+	if status != 200 {
+		t.Fatalf("token-axis call: %d %s", status, body)
+	}
+	if hdr.Get("X-RateLimit-Limit-Requests") == "" || hdr.Get("X-RateLimit-Remaining-Requests") == "" {
+		t.Fatalf("token-axis response lost its rate-limit headers: %v", hdr)
+	}
+
+	status, hdr, body = h.chatHeaders(t, testToken, creditChatBody)
+	if status != 200 {
+		t.Fatalf("credit-axis call: %d %s", status, body)
+	}
+	if got := hdr.Get("X-RateLimit-Limit-Requests"); got != "" {
+		t.Fatalf("credit-axis response advertised a request ceiling %q", got)
+	}
+	if got := hdr.Get("X-RateLimit-Remaining-Requests"); got != "" {
+		t.Fatalf("credit-axis response advertised a remaining count %q", got)
+	}
+}
+
+func TestAdmissionRunsBeforeTheDailyQuota(t *testing.T) {
+	// Order inside the self-serve branch, which nothing pinned before. A key
+	// that exhausted its daily allowance is the one most likely to be in a
+	// retry loop; if the quota answered first it would never charge rpm and
+	// that loop would have no brake at all. The key holds a credential so the
+	// early both-axes-closed refusal does not fire.
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		d.Keys[0].QuotaExhausted = true
+		d.Keys[0].Limits.Rpm = 1
+	}, nil)
+
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 429 || errCode(t, body) != "quota_exhausted" {
+		t.Fatalf("first call: %d %s", status, body)
+	}
+	// The refusal above still spent the single request in the rpm bucket.
+	status, body = h.chat(t, testToken, chatBody)
+	if status != 429 || errCode(t, body) != "rate_limit_requests" {
+		t.Fatalf("second call: %d %s, want rate_limit_requests (admission before quota)", status, body)
+	}
+}
+
+func TestSelfServeRefusalsNameTheModelAndAxis(t *testing.T) {
+	// Moving admission after model resolution changed what a refusal records.
+	// These rows used to carry neither field, which is what made the live
+	// incident hard to read; the accounting now says which model was asked
+	// for and on which axis.
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Rpm = 1 }, nil)
+	if status, _ := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatal("first call should pass")
+	}
+	if status, _ := h.chat(t, testToken, chatBody); status != 429 {
+		t.Fatal("second call should be refused")
+	}
+	events := h.spoolEvents(t)
+	last := events[len(events)-1]
+	if last.ErrorType != "rate_limit_requests" {
+		t.Fatalf("last event is %q", last.ErrorType)
+	}
+	if last.PublicModelName != "pickle-general" || last.BudgetAxis != snapshot.AxisToken {
+		t.Fatalf("refusal recorded model=%q axis=%q, want the requested model on the TOKEN axis",
+			last.PublicModelName, last.BudgetAxis)
+	}
+}
+
+func TestUnparseableUpstreamResponseChargesTheBucketButNotTheRecord(t *testing.T) {
+	// A response that is not JSON is an upstream fault the student cannot
+	// influence. It must still cost minute-scale budget, or looping against a
+	// broken upstream is free; it must not reach the accounting record, or the
+	// api's daily-allowance query — which counts tokens without looking at
+	// status — spends the student's quota on that fault.
+	//
+	// The prompt is 51 bytes of messages, so the input-side estimate is 12
+	// tokens, which is why the limit below is 10.
+	h := newHarness(t, func(d *snapshot.Document) { d.Keys[0].Limits.Tpm = 10 }, nil)
+	h.mock.set(func(u *mockOpts) { u.rawResp = "this is not json" })
+
+	if status, body := h.chat(t, testToken, chatBody); status != 502 {
+		t.Fatalf("first call: %d %s", status, body)
+	}
+	events := h.spoolEvents(t)
+	last := events[len(events)-1]
+	if last.ErrorType != "upstream_invalid_response" {
+		t.Fatalf("last event is %q", last.ErrorType)
+	}
+	if last.InputTokens != 0 || last.OutputTokens != 0 || last.Estimated {
+		t.Fatalf("upstream fault reached the accounting record: in=%d out=%d estimated=%t",
+			last.InputTokens, last.OutputTokens, last.Estimated)
+	}
+	// The bucket did take the charge, so the next request is refused.
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 429 || errCode(t, body) != "rate_limit_tokens" {
+		t.Fatalf("second call: %d %s, want the bucket to have been charged", status, body)
+	}
+}
+
+func TestOneKeyCanHoldEveryGatewaySlot(t *testing.T) {
+	// Accepted consequence of the axis split, pinned so it is a decision and
+	// not a surprise. With no per-key concurrency on the credit axis, the
+	// gateway-wide cap is all that stands between one commercial client and
+	// everybody else — including self-serve traffic, which is what the axis
+	// split exists to protect. A queue or a per-key share of the cap would
+	// flip this test, and that is the point of having it.
+	h := newHarness(t, creditDoc, func(c *config.Config) { c.MaxInFlight = 1 })
+	h.mock.set(func(u *mockOpts) { u.delay = 400 * time.Millisecond })
+
+	held := make(chan int, 1)
+	go func() { held <- h.chatStatus(testToken, creditChatBody) }()
+	time.Sleep(100 * time.Millisecond)
+
+	status, body := h.chat(t, testToken, chatBody)
+	if status != 503 || errCode(t, body) != "server_busy" {
+		t.Fatalf("self-serve call while a commercial one held the only slot: %d %s", status, body)
+	}
+	if got := <-held; got != 200 {
+		t.Fatalf("the holding call ended %d", got)
 	}
 }

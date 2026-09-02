@@ -59,11 +59,11 @@ var (
 		"model_not_allowed",
 		"이 API Key로는 요청한 상용 모델을 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
 	errRateRequests = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_requests",
-		"분당 요청 횟수 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
+		"교내 서빙 모델의 분당 요청 횟수 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateTokens = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_tokens",
-		"분당 토큰 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
+		"교내 서빙 모델의 분당 토큰 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateConcurrency = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_concurrency",
-		"동시 요청 수 한도를 초과했습니다. 진행 중인 요청이 끝난 뒤 다시 시도해주세요."}
+		"교내 서빙 모델의 동시 요청 수 한도를 초과했습니다. 진행 중인 요청이 끝난 뒤 다시 시도해주세요."}
 	errServerBusy = apiError{http.StatusServiceUnavailable, "server_error", "server_busy",
 		"요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요."}
 	errRequestTooLarge = apiError{http.StatusBadRequest, "invalid_request_error", "request_too_large",
