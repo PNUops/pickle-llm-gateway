@@ -463,7 +463,7 @@ func TestTokenAxisStillAnswersToEveryShortWindowLimit(t *testing.T) {
 		if status, _ := h.chat(t, testToken, chatBody); status != 200 {
 			t.Fatalf("first call: %d", status)
 		}
-		status, hdr, body := h.chatHeaders(t, testToken, chatBody)
+		status, body, hdr := h.chatHeaders(t, testToken, chatBody)
 		if status != 429 || errCode(t, body) != "rate_limit_requests" {
 			t.Fatalf("second call: %d %s", status, body)
 		}
@@ -476,7 +476,7 @@ func TestTokenAxisStillAnswersToEveryShortWindowLimit(t *testing.T) {
 		if status, _ := h.chat(t, testToken, chatBody); status != 200 {
 			t.Fatalf("first call: %d", status)
 		}
-		status, hdr, body := h.chatHeaders(t, testToken, chatBody)
+		status, body, hdr := h.chatHeaders(t, testToken, chatBody)
 		if status != 429 || errCode(t, body) != "rate_limit_tokens" {
 			t.Fatalf("second call: %d %s", status, body)
 		}
@@ -522,7 +522,7 @@ func TestRateLimitHeadersAreForTheSelfServeAxisOnly(t *testing.T) {
 	// be worse than reporting none.
 	h := newHarness(t, creditDoc, nil)
 
-	status, hdr, body := h.chatHeaders(t, testToken, chatBody)
+	status, body, hdr := h.chatHeaders(t, testToken, chatBody)
 	if status != 200 {
 		t.Fatalf("token-axis call: %d %s", status, body)
 	}
@@ -530,7 +530,7 @@ func TestRateLimitHeadersAreForTheSelfServeAxisOnly(t *testing.T) {
 		t.Fatalf("token-axis response lost its rate-limit headers: %v", hdr)
 	}
 
-	status, hdr, body = h.chatHeaders(t, testToken, creditChatBody)
+	status, body, hdr = h.chatHeaders(t, testToken, creditChatBody)
 	if status != 200 {
 		t.Fatalf("credit-axis call: %d %s", status, body)
 	}

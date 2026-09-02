@@ -289,30 +289,6 @@ func (h *harness) chatHeaders(t *testing.T, token, body string) (int, []byte, ht
 	return resp.StatusCode, out, resp.Header
 }
 
-// chatHeaders is chat with the response headers kept. The other helpers drop
-// them, so a test about which headers a request earns cannot use those.
-func (h *harness) chatHeaders(t *testing.T, token, body string) (int, http.Header, []byte) {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	out, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp.StatusCode, resp.Header, out
-}
-
 func errCode(t *testing.T, body []byte) string {
 	t.Helper()
 	var e struct {
