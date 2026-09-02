@@ -244,6 +244,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// limit — a key granted no money budget simply carries no credential.
 	if model.CreditAxis() {
 		if key.CredentialFor(model.UpstreamRef) == "" {
+			// Same missing credential, two different answers. A budget that
+			// was granted and is still being applied ends by itself, so the
+			// caller is told to wait and the status says so; anything else
+			// needs a person to act, and saying "wait" there would be a
+			// promise nothing keeps.
+			if key.CreditPending {
+				refuse(errCreditPending, spool.StatusAuthRejected)
+				return
+			}
 			refuse(errCreditUnavailable, spool.StatusAuthRejected)
 			return
 		}

@@ -154,6 +154,15 @@ type Key struct {
 	// behalf of a key that was never granted one. Absent or empty means the
 	// key cannot reach CREDIT-axis models at all.
 	UpstreamCredentials map[string]string `json:"upstreamCredentials,omitempty"`
+	// CreditPending distinguishes the one reason a CREDIT credential can be
+	// missing that ends by itself: the key was granted a money budget and its
+	// upstream key has not been created yet. Absence alone cannot tell that
+	// from "never granted", and the two need opposite answers — apply for a
+	// budget, or wait for the one you have. The control plane sets it only
+	// for the healing case; every other missing-credential state, a
+	// credential the control plane could not decrypt included, arrives false
+	// so nobody is told to wait for something that is not coming.
+	CreditPending bool `json:"creditPending,omitempty"`
 	// RecordBodies opts this key into prompt and response capture. It is the
 	// key owner's choice, expressed in the control plane and carried here; the
 	// default is off, so a key says nothing about bodies unless someone asked

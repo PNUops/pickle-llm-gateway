@@ -73,6 +73,44 @@ func TestCreditModelRequiresKeyCredential(t *testing.T) {
 	}
 }
 
+// A granted budget whose upstream key has not been created yet is the one
+// missing-credential state that ends by itself, so it gets its own answer: a
+// 503 a client may retry, rather than a 403 telling it to go ask for a budget
+// it already has.
+func TestCreditPendingIsToldApartFromNoBudget(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		d.Keys[0].UpstreamCredentials = nil
+		d.Keys[0].CreditPending = true
+	}, nil)
+
+	status, body, header := h.chatHeaders(t, testToken, creditChatBody)
+	if status != 503 || errCode(t, body) != "credit_pending" {
+		t.Fatalf("pending credit budget: got %d %s", status, body)
+	}
+	if got := header.Get("Retry-After"); got != "10" {
+		t.Fatalf("Retry-After = %q, want 10", got)
+	}
+	// Still a local refusal. Being nearly ready is not being ready, and the
+	// env credential must not stand in for the key's own.
+	if h.mock.callCount() != 0 {
+		t.Fatalf("the upstream was called %d times for a pending key", h.mock.callCount())
+	}
+}
+
+// The flag only ever explains a missing credential. A key that has one is
+// serving, whatever the control plane last said about provisioning.
+func TestCreditPendingDoesNotBlockAKeyThatHasItsCredential(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		d.Keys[0].CreditPending = true
+	}, nil)
+
+	if status, body := h.chat(t, testToken, creditChatBody); status != 200 {
+		t.Fatalf("credit call refused despite a credential: %d %s", status, body)
+	}
+}
+
 func TestCreditModelNeverFallsBackToEnvCredential(t *testing.T) {
 	h := newHarness(t, creditDoc, nil)
 	status, _ := h.chat(t, testToken, creditChatBody)

@@ -261,6 +261,14 @@ func (h *harness) writeSnapshot(t *testing.T, doc snapshot.Document) {
 
 func (h *harness) chat(t *testing.T, token, body string) (int, []byte) {
 	t.Helper()
+	status, out, _ := h.chatHeaders(t, token, body)
+	return status, out
+}
+
+// chatHeaders is chat with the response headers kept, for the refusals whose
+// header is part of the answer.
+func (h *harness) chatHeaders(t *testing.T, token, body string) (int, []byte, http.Header) {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +286,7 @@ func (h *harness) chat(t *testing.T, token, body string) (int, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resp.StatusCode, out
+	return resp.StatusCode, out, resp.Header
 }
 
 func errCode(t *testing.T, body []byte) string {
