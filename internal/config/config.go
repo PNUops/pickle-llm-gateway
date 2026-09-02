@@ -130,10 +130,15 @@ func FromEnv() (*Config, error) {
 		RequestBodyMaxBytes:  2 << 20,
 		UpstreamHeaderWait:   60 * time.Second,
 		RequestMaxDuration:   10 * time.Minute,
-		// Sized for the gateway LXC's memory (512 MB): each in-flight request
-		// can transiently hold a few MB of request/response buffers, so the
-		// default stays well under the unit's MemoryMax. Raise it (and the
-		// LXC memory + MemoryMax together) for a larger host.
+		// Sized for a 512 MB gateway container, which is the smallest one this
+		// daemon is expected to run in. Measured 2026-09-02 against this
+		// binary: an in-flight request costs about 75 KB with a typical
+		// response and about 240 KB with a 128 KB one (32k output tokens, the
+		// realistic ceiling), plus exactly two file descriptors; a single core
+		// sustained ~2,000 req/s. So this default is conservative by a wide
+		// margin and the binding constraint is the container, not the request.
+		// Raise it — with the container's memory, the unit's MemoryMax,
+		// GOMEMLIMIT and LimitNOFILE together — for a larger host.
 		MaxInFlight:        16,
 		UpstreamRetries:    1,
 		DefaultRpm:         20,
