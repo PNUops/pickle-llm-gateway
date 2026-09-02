@@ -101,6 +101,27 @@ func TestUnusableCreditPatternDropsTheKey(t *testing.T) {
 	}
 }
 
+// A blank entry is refused, not skipped. Skipping is what an earlier version of
+// the loader did, and it turned ["  "] — a list that says something — into an
+// empty list, which says the opposite: unrestricted. The fence has to fail
+// closed on every unusable shape, not only the ones that look wrong.
+func TestBlankCreditPatternDropsTheKey(t *testing.T) {
+	for _, entry := range []string{`""`, `"   "`} {
+		hash := HashToken("blank" + entry)
+		body := fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
+		  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
+		  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
+		           "creditAllowedModels":[%s]}]}`, hash, entry)
+		s := openDoc(t, body)
+
+		_, byHash, _ := s.Current()
+		if byHash(hash) != nil {
+			t.Fatalf("key carrying a blank entry %s was served; skipping the entry "+
+				"would leave the list empty, which means unrestricted", entry)
+		}
+	}
+}
+
 // Patterns are lower-cased once at load so every later comparison is against a
 // name lowered the same way. A control plane that skipped normalization must
 // still get a working fence rather than one that matches nothing.

@@ -259,12 +259,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// what they already have. What they actually need is a different model,
 		// or an administrator who widens the list.
 		if !key.AllowsCreditModel(model) {
-			// The public code is the existing one: from the caller's side the
-			// fact is the same, "this key cannot call this model", and a second
-			// code would be one more string every SDK and demo has to learn.
-			// The spool gets its own error type so the two fences stay countable
-			// apart — otherwise nobody can tell how many callers hit this one.
-			refuseAs(errModelNotAllowed, spool.StatusBadRequest, "credit_model_not_allowed")
+			// Same public code as the catalogue fence, different advice (see
+			// errors.go). The spool gets its own error type so the two stay
+			// countable apart — otherwise nobody can tell how many callers hit
+			// this one.
+			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
+				"credit_model_not_allowed")
 			return
 		}
 		if key.CredentialFor(model.UpstreamRef) == "" {

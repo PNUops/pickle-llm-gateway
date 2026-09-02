@@ -54,8 +54,13 @@ func TestCreditAllowlistRefusesModelsOutsideIt(t *testing.T) {
 	if h.mock.callCount() != 1 {
 		t.Fatalf("upstream was called %d times, want only the allowed call", h.mock.callCount())
 	}
-	// Both fences answer model_not_allowed to the caller, so the usage record is
-	// the only place they can be counted apart.
+	// The two fences share a public code but not their advice: this one points
+	// at the console, because /v1/models cannot list a commercial model.
+	if !strings.Contains(string(body), "콘솔의 키 상세") {
+		t.Fatalf("money-fence refusal did not point at the console: %s", body)
+	}
+	// Sharing the code means the usage record is the only place they can be
+	// counted apart.
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
 	if last.ErrorType != "credit_model_not_allowed" {

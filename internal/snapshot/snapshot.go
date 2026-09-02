@@ -678,10 +678,7 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			norm := make([]string, 0, len(k.CreditAllowedModels))
 			for _, pattern := range k.CreditAllowedModels {
 				lower := strings.ToLower(strings.TrimSpace(pattern))
-				if lower == "" {
-					continue
-				}
-				if !creditModelPattern.MatchString(lower) {
+				if lower == "" || !creditModelPattern.MatchString(lower) {
 					listProblem = fmt.Sprintf(
 						"key %s: creditAllowedModels entry %q is not a usable pattern",
 						k.KeyID, pattern)
@@ -689,6 +686,11 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 				}
 				norm = append(norm, lower)
 			}
+			// A blank entry is refused rather than skipped, for the same reason
+			// a malformed one is: skip them all and a list that said something
+			// becomes a list that says nothing, which here means unrestricted.
+			// The first version of this loop skipped blanks and would have let
+			// ["  "] widen a fenced key to every commercial model.
 			k.CreditAllowedModels = norm
 		}
 		if listProblem != "" {
