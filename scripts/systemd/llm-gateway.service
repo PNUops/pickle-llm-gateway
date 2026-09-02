@@ -47,9 +47,20 @@ RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
-LimitNOFILE=1024
-TasksMax=64
-MemoryMax=256M
+# Resource ceilings, sized from the 2026-09-02 in-flight measurement rather
+# than from a guess. An in-flight request costs about 240 KB at the realistic
+# response ceiling and exactly two file descriptors; 1,024 of them peaked at
+# 248 MB and 2,061 descriptors, and thread use plateaus in the low tens.
+# LimitNOFILE is the value that actually bounds concurrency here, so it is set
+# far above the in-flight cap rather than just above it.
+LimitNOFILE=65535
+TasksMax=512
+MemoryMax=1G
+# Go sizes its heap from the machine, not from the cgroup, so without this it
+# grows toward twice the live heap and the cgroup kills the process before the
+# collector runs. Kept below MemoryMax so the collector gets to act first; a
+# restart would otherwise wipe every in-memory rate-limit bucket along with it.
+Environment=GOMEMLIMIT=768MiB
 
 [Install]
 WantedBy=multi-user.target

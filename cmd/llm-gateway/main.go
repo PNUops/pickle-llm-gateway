@@ -120,10 +120,12 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		// Bound the request-read phase. Slots (gateway-wide in-flight + per-key
-		// concurrency) are taken before the body is read, so an unbounded read
-		// would let a slow client hold them for as long as nginx allows; chat
-		// bodies are small, so a request that cannot be read in 30s is stuck.
+		// Bound the request-read phase. The gateway-wide in-flight slot is
+		// taken before the body is read (the per-key limits cannot be, since
+		// they depend on the budget axis and the axis is in the body), so an
+		// unbounded read would let a slow client hold that slot for as long as
+		// nginx allows; chat bodies are small, so a request that cannot be
+		// read in 30s is stuck.
 		ReadTimeout: 30 * time.Second,
 	}
 
