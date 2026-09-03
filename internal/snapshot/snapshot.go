@@ -270,8 +270,18 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 // normalized to. The gateway checks rather than trusts: a pattern it cannot act
 // on would otherwise be dropped from the list, and dropping the last entry of a
 // list turns a fence into no fence at all.
+//
+// The leading `~` admits the vendor's floating aliases (`~anthropic/claude-
+// sonnet-latest`, which always resolves to the newest model of that family).
+// They route today — passthrough forwards the name verbatim — so a fence that
+// could not spell them was the one place a restricted key was narrower than an
+// unrestricted one for no stated reason. `~vendor/*` and `vendor/*` stay
+// separate prefixes, which falls out of the matcher below rather than being
+// special-cased: an alias points at a model that changes under it, so a fence
+// naming the vendor must not silently pick up a moving target the approver
+// never chose.
 var creditModelPattern = regexp.MustCompile(
-	`^[a-z0-9][a-z0-9._:-]*(/([a-z0-9][a-z0-9._:-]*|\*))?$`)
+	`^~?[a-z0-9][a-z0-9._:-]*(/([a-z0-9][a-z0-9._:-]*|\*))?$`)
 
 // state is one loaded document plus the lookup maps derived from it.
 type state struct {

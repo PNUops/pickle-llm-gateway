@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -31,6 +32,20 @@ func TestMatchesCreditModel(t *testing.T) {
 		{"", "openai/gpt-4o", false},
 		// A name with no vendor segment still works as an exact entry.
 		{"some-model", "some-model", true},
+		// Floating aliases. The vendor ships ~vendor/model-latest entries
+		// that always resolve to the newest model of a family, and they
+		// route through passthrough today, so the fence has to be able to
+		// name them.
+		{"~anthropic/claude-sonnet-latest", "~anthropic/claude-sonnet-latest", true},
+		{"~anthropic/*", "~anthropic/claude-sonnet-latest", true},
+		// The two namespaces stay apart in both directions. An alias points
+		// at a model that changes under it, so opening a vendor must not
+		// open its aliases, and opening the aliases must not open the vendor.
+		{"anthropic/*", "~anthropic/claude-sonnet-latest", false},
+		{"~anthropic/*", "anthropic/claude-sonnet-4", false},
+		// The tilde is a prefix on the entry, not a wildcard of its own.
+		{"~", "~anthropic/claude", false},
+		{"~/*", "~anthropic/claude", false},
 	} {
 		if got := MatchesCreditModel(tc.pattern, tc.name); got != tc.want {
 			t.Fatalf("MatchesCreditModel(%q, %q) = %v, want %v",
@@ -98,6 +113,35 @@ func TestUnusableCreditPatternDropsTheKey(t *testing.T) {
 	}
 	if s.RejectedEntries() == 0 {
 		t.Fatal("the drop was not counted")
+	}
+}
+
+// The vendor's floating aliases survive the load. This is the half of the fix
+// the matcher table cannot show: MatchesCreditModel never sees the pattern
+// check, so a case added there passes whether or not the loader accepts the
+// entry. Before the pattern admitted a leading tilde, this document lost the
+// key entirely and the student's calls stopped authenticating.
+func TestFloatingAliasSurvivesLoad(t *testing.T) {
+	hash := HashToken("alias")
+	body := fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
+	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
+	           "creditAllowedModels":["~anthropic/claude-sonnet-latest","~openai/*"]}]}`, hash)
+	s := openDoc(t, body)
+
+	_, byHash, _ := s.Current()
+	key := byHash(hash)
+	if key == nil {
+		t.Fatal("a key fenced to a floating alias was dropped at load; the vendor " +
+			"lists these and passthrough routes them, so the fence must spell them")
+	}
+	if s.RejectedEntries() != 0 {
+		t.Fatalf("a usable pattern was counted as rejected: %d", s.RejectedEntries())
+	}
+	for _, want := range []string{"~anthropic/claude-sonnet-latest", "~openai/*"} {
+		if !slices.Contains(key.CreditAllowedModels, want) {
+			t.Fatalf("entry %q did not survive the load: %v", want, key.CreditAllowedModels)
+		}
 	}
 }
 
