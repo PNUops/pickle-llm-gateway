@@ -89,9 +89,18 @@ var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 // reserved self-serve prefix, current or retired. Such a name is served only
 // by an exact catalog match and never by passthrough. This function is the
 // only door to the list — prefix checks elsewhere would skip the case
-// handling and the retired entries.
+// handling, the retired entries, and the tilde below.
+//
+// A leading tilde is stripped before comparing. The vendor marks its floating
+// aliases that way, so the character is meaningful upstream and a caller can
+// spell `~pickle-general`; without stripping, that walked past this guard and
+// was synthesized as a passthrough model. Nothing is billed for it — no such
+// model exists upstream, so the call dies there — but the guard exists so that
+// a typo in a curated name stays a 404 instead of leaving for an upstream at
+// all, and one character defeated it.
 func IsReservedModelName(publicName string) bool {
 	lower := strings.ToLower(publicName)
+	lower = strings.TrimPrefix(lower, "~")
 	for _, p := range reservedModelPrefixes {
 		if strings.HasPrefix(lower, p) {
 			return true

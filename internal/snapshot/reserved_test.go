@@ -23,8 +23,20 @@ func TestReservedModelPrefixInvariants(t *testing.T) {
 		if !IsReservedModelName(strings.ToUpper(p) + "anything") {
 			t.Fatalf("uppercase variant of reserved prefix %q escaped the guard", p)
 		}
+		// The vendor marks floating aliases with a leading tilde, so the
+		// character is spellable and used. Before it was stripped here, one
+		// character turned a curated name into a passthrough candidate.
+		if !IsReservedModelName("~" + p + "anything") {
+			t.Fatalf("tilde-prefixed variant of reserved prefix %q escaped the guard", p)
+		}
+		if !IsReservedModelName("~" + strings.ToUpper(p) + "anything") {
+			t.Fatalf("tilde plus uppercase variant of %q escaped the guard", p)
+		}
 	}
-	for _, name := range []string{"gpt-4o", "vendor/x", "picklegeneral", "pnux", ""} {
+	// A tilde on a name that is not reserved stays not reserved: the vendor's
+	// real aliases must keep routing.
+	for _, name := range []string{"gpt-4o", "vendor/x", "picklegeneral", "pnux", "",
+		"~anthropic/claude-sonnet-latest", "~", "~picklegeneral"} {
 		if IsReservedModelName(name) {
 			t.Fatalf("non-reserved name %q wrongly reserved", name)
 		}
