@@ -54,10 +54,28 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 	}
 }
 
-// allowedParams are the top-level request fields the gateway forwards. An
-// unknown field is refused rather than silently forwarded, so replacing the
-// upstream can never silently change what student code is allowed to send.
-var allowedParams = map[string]bool{
+// tokenAxisParams are the top-level request fields the gateway forwards for a
+// self-hosted model. An unknown field is refused rather than silently
+// forwarded, so replacing the upstream can never silently change what student
+// code is allowed to send.
+//
+// `reasoning_effort` is absent from this list on purpose, and so are
+// `chat_template_kwargs` and `thinking_token_budget`: all three are the
+// enforcement point for one service decision, that thinking is off by default
+// on the self-hosted side with no per-request opt-in. The serving process does
+// not refuse them — measured, same request with and only without the field:
+//
+//	reasoning_effort "low" → 200, content null, reasoning "Here's a thinking process:..."
+//	field absent           → 200, content "Hello! How can I help you today", reasoning null
+//
+// so the field works, moves the answer out of `content`, and this list is the
+// only thing standing between a caller and thinking. Opening it is a service
+// decision, not a consistency fix: completion tokens go up by orders of
+// magnitude when thinking is on, and that lands on the shared token allowance.
+// (The often-quoted ratio from the benchmark round is an estimate, not a
+// measurement — its thinking-off side was converted from a different
+// checkpoint. Do not restate it as measured.)
+var tokenAxisParams = map[string]bool{
 	"model":                 true,
 	"messages":              true,
 	"stream":                true,
@@ -75,6 +93,43 @@ var allowedParams = map[string]bool{
 	"tools":                 true,
 	"tool_choice":           true,
 	"parallel_tool_calls":   true,
+}
+
+// creditAxisParams is tokenAxisParams plus the fields only a paid model takes.
+// Built in init so the shared part cannot drift between the two.
+//
+// `reasoning_effort` and `verbosity` are documented Chat Completions fields on
+// the commercial side, and agent tools set them on their own from model
+// metadata — so refusing them outright made every reasoning-capable paid model
+// unusable through this gateway, with nothing the caller could do about it.
+//
+// They stay closed on the self-hosted side for three reasons, none of which is
+// that the serving process would fail on them. Thinking there is disabled as a
+// server default and re-opening it is a service decision, not a per-request
+// one; a field that changes nothing would still read to the caller as if it
+// had; and a model whose fallback points at a commercial upstream would have
+// that upstream honour the field, putting reasoning tokens on the self-hosted
+// allowance. The axis is a property of the model, not of the upstream that
+// happens to answer.
+var creditAxisParams = map[string]bool{}
+
+func init() {
+	for name := range tokenAxisParams {
+		creditAxisParams[name] = true
+	}
+	creditAxisParams["reasoning_effort"] = true
+	creditAxisParams["verbosity"] = true
+}
+
+// allowedParamsFor answers which set governs this request. The caller must
+// have resolved the model first: the axis is a fact about the model the
+// request names, which lives inside the body, so nothing before the parse can
+// know it.
+func allowedParamsFor(model *snapshot.Model) map[string]bool {
+	if model.CreditAxis() {
+		return creditAxisParams
+	}
+	return tokenAxisParams
 }
 
 type usage struct {
@@ -190,12 +245,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errBadJSON, spool.StatusBadRequest)
 		return
 	}
-	for name := range params {
-		if !allowedParams[name] {
-			refuse(errUnsupportedParam(name), spool.StatusBadRequest)
-			return
-		}
-	}
 	var publicModel string
 	if raw, ok := params["model"]; !ok || json.Unmarshal(raw, &publicModel) != nil || publicModel == "" {
 		refuse(errMissingParam("model"), spool.StatusBadRequest)
@@ -225,6 +274,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ev.BudgetAxis = snapshot.AxisToken
 	case snapshot.AxisCredit:
 		ev.BudgetAxis = snapshot.AxisCredit
+	}
+	// The parameter surface is the first thing the axis decides. It runs here
+	// rather than before the model is read because the axis cannot be known
+	// any earlier, and it runs before the permission fences so that a
+	// malformed request still answers 400 rather than 403.
+	allowed := allowedParamsFor(model)
+	for name := range params {
+		if allowed[name] {
+			continue
+		}
+		if creditAxisParams[name] {
+			// Known field, wrong axis. Same public code as any other rejected
+			// field — one more code is one more thing every SDK has to learn
+			// for a fact it already handles — but different advice, and its
+			// own spool type so the two stay countable apart.
+			refuseAs(errParamNeedsCreditModel(name), spool.StatusBadRequest,
+				"credit_only_parameter")
+			return
+		}
+		refuse(errUnsupportedParam(name), spool.StatusBadRequest)
+		return
 	}
 	if !key.AllowsModel(model) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)

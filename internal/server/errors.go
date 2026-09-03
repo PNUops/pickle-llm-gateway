@@ -113,6 +113,15 @@ var (
 	errUpstreamThrottled    = errors.New("upstream is throttling this gateway")
 )
 
+// The same public code as an outright unknown field, because to an SDK the
+// fact is identical: this request may not carry that field. What differs is
+// what the caller can do about it, and that belongs in the message.
+func errParamNeedsCreditModel(name string) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
+		"자체 서빙 모델은 이 파라미터를 지원하지 않습니다: " + name +
+			". 유료 모델에서만 사용할 수 있습니다."}
+}
+
 func errUnsupportedParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
 		"지원하지 않는 파라미터입니다: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해주세요."}

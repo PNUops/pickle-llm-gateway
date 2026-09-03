@@ -302,6 +302,22 @@ func errCode(t *testing.T, body []byte) string {
 	return e.Error.Code
 }
 
+// errMessage is the human half of the envelope. A test asserts on it only
+// where the advice is the point — two refusals can share a code and still have
+// to say different things.
+func errMessage(t *testing.T, body []byte) string {
+	t.Helper()
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		t.Fatalf("not an error envelope: %s", body)
+	}
+	return e.Error.Message
+}
+
 // chatStatus is a goroutine-safe variant of chat that returns the status code
 // (or -1 on transport error) without calling t.Fatal off the test goroutine.
 func (h *harness) chatStatus(token, body string) int {
