@@ -83,6 +83,26 @@ var (
 	}
 )
 
+// endpointNames are the words a refusal uses for a capability. The token is
+// carried alongside the Korean name because the token is what the contract
+// enumerates and what the approval screen lists, so a student reading a
+// refusal and the person granting it are naming the same thing.
+var endpointNames = map[string]string{
+	snapshot.EndpointImages:     "이미지",
+	snapshot.EndpointEmbeddings: "임베딩",
+}
+
+// endpointLabel renders one capability for a message. A token with no name
+// here still reads sensibly, which matters because the vocabulary belongs to
+// the control plane and may gain an entry before this map does.
+func endpointLabel(capability string) string {
+	name, ok := endpointNames[capability]
+	if !ok {
+		return capability
+	}
+	return name + "(" + capability + ")"
+}
+
 // handlePassthrough builds the handler for one route. The fence order it runs
 // is the order the caller needs the answers in, and it is not the same as
 // chat's: the endpoint fence comes first because a key that was never granted
@@ -148,7 +168,8 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// The endpoint fence. Empty grants nothing, so this is the check that
 		// keeps the surface shut for every key that exists today.
 		if !key.AllowsEndpoint(route.capability) {
-			refuse(errEndpointNotAllowed, spool.StatusAuthRejected)
+			refuse(errEndpointNotAllowed(endpointLabel(route.capability)),
+				spool.StatusAuthRejected)
 			return
 		}
 		// Granted, but the document names nobody to serve it. That is a

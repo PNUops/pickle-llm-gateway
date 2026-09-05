@@ -58,13 +58,6 @@ var (
 	errCreditModelNotAllowed = apiError{http.StatusForbidden, "permission_error",
 		"model_not_allowed",
 		"이 API Key로는 요청한 유료 모델을 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
-	// The endpoint fence. 403 with a name of its own rather than a 404,
-	// deliberately: the passthrough paths are public documentation, so hiding
-	// their existence would buy nothing and would leave a student unable to
-	// tell "my key was not granted this" from "this service has no such path"
-	// — two states with completely different next actions.
-	errEndpointNotAllowed = apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
-		"이 API Key로는 이 경로를 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 경로를 확인해주세요."}
 	errRateRequests = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_requests",
 		"자체 서빙 모델의 분당 요청 횟수 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateTokens = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_tokens",
@@ -145,6 +138,25 @@ func errUnsupportedParam(name string) apiError {
 func errInvalidParamValue(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
 		"파라미터 값이 올바르지 않습니다: " + name}
+}
+
+// The endpoint fence. 403 with a code of its own rather than a 404,
+// deliberately: the passthrough paths are public documentation, so hiding
+// their existence would buy nothing and would leave a student unable to tell
+// "my key was not granted this" from "this service has no such path" — two
+// states with completely different next actions.
+//
+// It names the capability rather than the path, because the grant is a
+// capability and that is the word an approver's screen shows; a student
+// quoting this refusal is then asking for the thing that can actually be
+// given. And it says how to get it. This is the one fence on the surface a
+// student cannot work around on their own — a refused model can be swapped
+// for another, a refused capability only an approver can grant — so a message
+// that only said no would leave them with nowhere to go.
+func errEndpointNotAllowed(label string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
+		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
+			"콘솔에서 이 기능을 신청하면 승인 후 사용할 수 있습니다."}
 }
 
 // Refused here rather than left to the response cap. Past the cap the caller

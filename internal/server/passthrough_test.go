@@ -83,8 +83,18 @@ func TestPassthroughRefusalIsNamedNotHidden(t *testing.T) {
 	if status != http.StatusForbidden {
 		t.Fatalf("status: %d %s", status, body)
 	}
-	if msg := errMessage(t, body); !strings.Contains(msg, "콘솔") {
-		t.Fatalf("the refusal has to say where to look: %s", msg)
+	msg := errMessage(t, body)
+	// The capability, not the path: the grant is a capability and that is the
+	// word the approver's screen shows.
+	if !strings.Contains(msg, "이미지") || !strings.Contains(msg, "images") {
+		t.Fatalf("the refusal has to name the capability: %s", msg)
+	}
+	if strings.Contains(msg, "/v1/images") {
+		t.Fatalf("the refusal must not name the path: %s", msg)
+	}
+	// And how to get it. This is the one fence a student cannot work around.
+	if !strings.Contains(msg, "신청") {
+		t.Fatalf("the refusal has to say what to do: %s", msg)
 	}
 	// The path a key was never granted is a different answer from one this
 	// service does not serve at all.
@@ -719,5 +729,46 @@ func TestPassthroughResponseCapIsNamed(t *testing.T) {
 	h.mock.set(func(o *mockOpts) { o.rawResp = "" })
 	if status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody); status != 200 {
 		t.Fatalf("under the cap: %d %s", status, body)
+	}
+}
+
+// Each capability is refused in its own words, so a student asking an approver
+// names the thing that can actually be granted.
+func TestPassthroughRefusalNamesTheCapability(t *testing.T) {
+	h := newHarness(t, passthroughDoc(), nil)
+	for _, tc := range []struct {
+		method, path, body, want string
+	}{
+		{http.MethodPost, "/v1/images", imageBody, "이미지(images)"},
+		{http.MethodGet, "/v1/images/models", "", "이미지(images)"},
+		{http.MethodPost, "/v1/embeddings",
+			`{"model":"openai/text-embedding-3-large","input":"hi"}`, "임베딩(embeddings)"},
+	} {
+		_, body := h.passthrough(t, tc.method, tc.path, testToken, tc.body)
+		if msg := errMessage(t, body); !strings.Contains(msg, tc.want) {
+			t.Fatalf("%s: want %q in %q", tc.path, tc.want, msg)
+		}
+	}
+	// A capability the control plane may add before this build names it still
+	// reads sensibly rather than rendering an empty gap.
+	if got := endpointLabel("audio"); got != "audio" {
+		t.Fatalf("unnamed capability: %q", got)
+	}
+}
+
+// The old vocabulary must not spread into the strings this round adds. The
+// display terms are 유료 모델 and 자체 서빙 모델; 상용 모델 is retired, and the
+// axis words belong to the design docs, not to anything a student reads.
+func TestPassthroughMessagesUseCurrentVocabulary(t *testing.T) {
+	for _, e := range []apiError{
+		errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages)),
+		errPassthroughTooManyItems(4),
+		errPassthroughResponseTooLarge,
+	} {
+		for _, retired := range []string{"상용 모델", "예산 축", "금액 축"} {
+			if strings.Contains(e.message, retired) {
+				t.Fatalf("%s carries retired vocabulary %q: %s", e.code, retired, e.message)
+			}
+		}
 	}
 }
