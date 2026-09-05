@@ -387,11 +387,11 @@ go run ./cmd/llm-gateway
 | `LLMGW_UPSTREAM_HEADER_WAIT` | `60s` | 업스트림 응답 시작 대기 상한 |
 | `LLMGW_REQUEST_MAX_DURATION` | `10m` | 요청 한 건의 전체 시간 상한 |
 | `LLMGW_MAX_IN_FLIGHT` | `16` | 게이트웨이 전체 동시 요청 상한 (호스트 메모리에 맞춰 조정) |
-| `LLMGW_PASSTHROUGH_REQUEST_BODY_MAX_BYTES` | `8388608` | 패스스루 경로의 요청 본문 크기 상한 |
+| `LLMGW_PASSTHROUGH_REQUEST_BODY_MAX_BYTES` | `16777216` | 패스스루 경로의 요청 본문 크기 상한 |
 | `LLMGW_PASSTHROUGH_RESPONSE_MAX_BYTES` | `33554432` | 패스스루 경로의 업스트림 응답 크기 상한 |
 | `LLMGW_PASSTHROUGH_HEADER_WAIT` | `180s` | 패스스루 경로의 업스트림 응답 시작 대기 상한. 이미지 생성은 스트리밍이 아니라 생성이 끝나야 헤더가 옵니다 |
 | `LLMGW_PASSTHROUGH_MAX_IN_FLIGHT` | `16` | 패스스루 경로 전용 동시 요청 상한. 채팅 슬롯과 별개입니다 |
-| `LLMGW_PASSTHROUGH_MAX_N` | `4` | 패스스루 요청 한 건이 요청할 수 있는 `n`의 상한 |
+| `LLMGW_PASSTHROUGH_MAX_N` | `4` | 패스스루 요청 한 건이 요청할 수 있는 `n`의 상한. 크기는 응답 상한이 먼저 봅니다 |
 | `LLMGW_DEFAULT_RPM` | `20` | Key에 한도가 없을 때의 분당 요청 수 (자체 서빙 모델 한정) |
 | `LLMGW_DEFAULT_TPM` | `20000` | Key에 한도가 없을 때의 분당 토큰 수 (자체 서빙 모델 한정) |
 | `LLMGW_DEFAULT_CONCURRENCY` | `2` | Key에 한도가 없을 때의 동시 요청 수 (자체 서빙 모델 한정) |
@@ -425,9 +425,18 @@ go run ./cmd/llm-gateway
 약 366 MiB입니다.
 
 응답 상한과 헤더 대기와 슬롯 수는 이 실측으로 정한 값입니다. 응답 상한 8 MiB로는 4K가
-아예 안 들어오고, 4K 생성이 32초라 채팅 기본값 60초는 여유가 두 배도 안 됩니다. 요청 본문
-상한과 `n` 상한은 아직 잠정입니다. 이미지 편집의 참조 이미지가 URL로 오는지 data URL로
-오는지가 미확인이고, 그 답이 이 둘을 정합니다. 호스트에 맞는 실제 값은 배포 환경에서 정하며, 유닛의
+아예 안 들어오고, 4K 생성이 32초라 채팅 기본값 60초는 여유가 두 배도 안 됩니다.
+
+요청 본문 상한 16 MiB는 이미지 편집의 참조 이미지가 **URL이든 data URL이든 둘 다** 되게
+잡은 값입니다. base64로 부풀린 뒤 약 12 MB 이미지까지 들어가므로 4K 참조 이미지 한 장이
+data URL로 와도 됩니다. 32 MiB로 올리면 천장이 2,432 MiB가 되어 여유가 거의 없습니다.
+
+`n` 상한 4는 실효 상한이 아니라 여유값입니다. 4K 넉 장이면 52 MiB라 응답 상한 32 MiB가
+먼저 겁니다. `n`이 막는 것은 명백히 말이 안 되는 수이고, 크기는 응답 상한이 봅니다.
+
+**엣지가 게이트웨이보다 위에 있어야 합니다.** 엣지 nginx의 `client_max_body_size`가 요청
+본문 상한보다 낮으면 3 MB 넘는 요청이 nginx 413으로 막히고 게이트웨이의 한국어 오류는
+나가지 못합니다. 호스트에 맞는 실제 값은 배포 환경에서 정하며, 유닛의
 `MemoryHigh`와 `GOMEMLIMIT`을 함께 조정하세요.
 
 스냅샷 문서 예시:

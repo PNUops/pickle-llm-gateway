@@ -86,7 +86,7 @@ type Config struct {
 	//
 	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
 	//
-	// which at the defaults below is about 1,280 MiB. That is the number to
+	// which at the defaults below is about 1,664 MiB. That is the number to
 	// check a host against, and it is the whole reason this pool is separate:
 	// it holds whatever the chat pool is sized to, so raising one cannot move
 	// the other's arithmetic. The same caps applied to the gateway-wide pool
@@ -97,13 +97,23 @@ type Config struct {
 	// (base64 expands the image 1.333x), so sixteen concurrent 4K generations
 	// sit at about 366 MiB.
 	//
-	// The three values the measurement decided are the response cap, the
-	// header wait and the slot count. An 8 MiB response cap could not hold a
-	// 4K image at all, and 32 MiB leaves room above one; a 4K generation takes
-	// 32 seconds and is not streamed, so the 60s chat header wait has under
-	// twice the margin while 180s has room. The request cap and the `n` bound
-	// stay provisional: whether an edit's reference image arrives as a URL or
-	// as a data URL is still unanswered, and that is what would size them.
+	// The response cap, the header wait and the slot count come from that
+	// measurement. An 8 MiB response cap could not hold a 4K image at all, and
+	// 32 MiB leaves room above one; a 4K generation takes 32 seconds and is
+	// not streamed, so the 60s chat header wait has under twice the margin
+	// while 180s has room.
+	//
+	// The request cap supports both shapes an image edit can take, rather than
+	// asking which one to expect: 16 MiB holds roughly a 12 MB image once
+	// base64 has expanded it, so a 4K reference image fits as a data URL and a
+	// plain URL costs nothing. It is where the supported range and the safety
+	// margin meet — 32 MiB would put the ceiling at 2,432 MiB and leave almost
+	// none.
+	//
+	// The bound on `n` is a sanity check and not the effective limit. Four 4K
+	// images are 52 MiB, so the response cap refuses them first; `n` is there
+	// to reject a number that is plainly nonsense before it costs an upstream
+	// call, and size is the response cap's question to answer.
 	//
 	// The deployed environment remains the authority — a host with a different
 	// memory budget wants different numbers, and the unit's MemoryHigh and
@@ -197,7 +207,7 @@ func FromEnv() (*Config, error) {
 		// still provisional. The header wait is the value images actually
 		// need: a generation is not streamed, so the upstream sends no headers
 		// until it has finished producing the image.
-		PassthroughRequestBodyMaxBytes: 8 << 20,
+		PassthroughRequestBodyMaxBytes: 16 << 20,
 		PassthroughResponseMaxBytes:    32 << 20,
 		PassthroughHeaderWait:          180 * time.Second,
 		PassthroughMaxInFlight:         16,

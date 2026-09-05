@@ -270,7 +270,7 @@ func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PassthroughRequestBodyMaxBytes != 8<<20 || cfg.PassthroughResponseMaxBytes != 32<<20 {
+	if cfg.PassthroughRequestBodyMaxBytes != 16<<20 || cfg.PassthroughResponseMaxBytes != 32<<20 {
 		t.Fatalf("byte defaults: %d %d", cfg.PassthroughRequestBodyMaxBytes, cfg.PassthroughResponseMaxBytes)
 	}
 	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 16 {
