@@ -161,17 +161,41 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 
 // The vendor's server tools are the sixth channel, and they arrive inside
 // `tools` rather than beside it. A tool runs on the vendor's side during the
-// completion and several of them call a model of their own: the advisor takes
-// `parameters.model` and its documentation says that may be any model on the
-// platform, with a tilde floating alias as the first example. Image generation
-// takes one too and runs on the chat path, which is how it reaches past the
-// capability fence that governs the image routes.
+// completion, and of the twelve it offers, four take a model of their own:
+// advisor consults a stronger model mid-generation, subagent delegates to a
+// smaller worker, fusion runs a panel plus an analyst, and image_generation
+// produces an image. The advisor's documentation says its model may be any
+// model on the platform and gives a tilde floating alias as the first example —
+// the shape closed everywhere else this round.
+//
+// image_generation is the one that matters most, because it runs on the chat
+// path and so reaches past the capability fence that governs the image routes.
+// Note that the vendor's overview table lists its second model as "None" while
+// its own detail page documents parameters.model with a default; the detail
+// page is the specific one and is what this follows. Somebody reading only the
+// overview will think this tool takes no model.
 //
 // These are judged rather than blocked, and judged by the same function the
 // fallback candidates go through — a tool that names a model this key may
 // already use is not a problem, and this way there is one rule with one more
 // place that applies it rather than a second rule to keep in step. A tool that
 // names no model passes untouched.
+//
+// WHAT THIS DELIBERATELY DOES NOT CATCH, so that it does not read as an
+// oversight: a tool of the vendor's that this build does not know, naming its
+// model through a parameter this build does not know, is forwarded unjudged.
+// Refusing unknown tools was considered and declined (operator, 2026-09-06).
+// The money is still bounded either way — the key's own credit limit is what
+// caps it, so nobody can spend past what was approved — and what leaks is only
+// which model that approved amount is spent on. While the deny list is a cost
+// control, that is the caller's own balance draining faster, and a caller who
+// gets this far is doing it on purpose.
+//
+// THE CONDITION THAT REVERSES IT: the moment a deny list carries policy rather
+// than cost — a vendor nobody may use, a model excluded for a reason that is
+// not price — the "their own balance" argument stops holding, because the harm
+// is then no longer the caller's to absorb. Revisit this the first time a deny
+// list is used that way.
 const toolsField = "tools"
 
 // serverToolPrefix marks the vendor's own tools. A caller's function tool
@@ -185,8 +209,8 @@ const serverToolPrefix = "openrouter:"
 const imageGenerationTool = "openrouter:image_generation"
 
 // toolModelParams are the parameters through which a server tool names the
-// model it will call. A tool of the vendor's that names one some other way
-// still slips past, which is the open half of this channel.
+// model it will call. A tool naming one some other way is forwarded unjudged —
+// see the decision recorded above; that is a choice, not a gap nobody noticed.
 var toolModelParams = []string{"model", "analysis_models"}
 
 // fenceServerTools judges every model a server tool names, and applies the
