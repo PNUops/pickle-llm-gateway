@@ -308,3 +308,86 @@ func TestSelfHostedRefusesCandidateModels(t *testing.T) {
 		t.Fatal("reached the upstream")
 	}
 }
+
+// A router name is not a model: the vendor resolves it at request time and
+// bills whatever it picked, so no list here can bound it. A key that carries a
+// fence has had a decision made about which models it may reach, and this name
+// walks around that decision.
+//
+// The reachable shape is the one the plan calls the representative use — allow
+// open, deny the expensive names — because an empty allow list admits the
+// router and the deny list never matches it.
+func TestRouterModelRefusedOnFencedKey(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fence func(*snapshot.Key)
+	}{
+		{"deny list only", func(k *snapshot.Key) { k.CreditDeniedModels = []string{"openai/*-pro"} }},
+		{"allow list only", func(k *snapshot.Key) { k.CreditAllowedModels = []string{"openrouter/*"} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, func(d *snapshot.Document) {
+				creditPassthroughDoc(d)
+				tc.fence(&d.Keys[0])
+			}, nil)
+			body := `{"model":"openrouter/auto","messages":[{"role":"user","content":"hi"}]}`
+			status, resp := h.chat(t, testToken, body)
+			if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+				t.Fatalf("%d %s", status, resp)
+			}
+			// The advice differs from the ordinary fence refusal: the remedy is
+			// to name a model, not to go and read a list.
+			if msg := errMessage(t, resp); !strings.Contains(msg, "직접 지정") {
+				t.Fatalf("message does not say what to do: %s", msg)
+			}
+			if h.mock.callCount() != 0 {
+				t.Fatal("a router name reached the upstream on a fenced key")
+			}
+			evs := h.spoolEvents(t)
+			if len(evs) != 1 || evs[0].ErrorType != "router_model_not_allowed" {
+				t.Fatalf("spooled %+v", evs)
+			}
+		})
+	}
+}
+
+// A key with no fence at all is bounded only by the money it was granted, so
+// the router takes nothing away from it and stays available.
+func TestRouterModelAllowedOnUnfencedKey(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	body := `{"model":"openrouter/auto","messages":[{"role":"user","content":"hi"}]}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("%d %s", status, resp)
+	}
+}
+
+// The router cannot ride in as a fallback candidate either, on a fenced key.
+func TestRouterModelRefusedAsCandidate(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditDeniedModels = []string{"openai/*-pro"}
+	}, nil)
+	body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` +
+		`"models":["openrouter/auto"]}`
+	status, resp := h.chat(t, testToken, body)
+	if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+		t.Fatalf("%d %s", status, resp)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("a router candidate reached the upstream")
+	}
+}
+
+// The tilde form the vendor uses for floating aliases must not walk past it.
+func TestRouterNameVariantsAreCaught(t *testing.T) {
+	for _, name := range []string{"openrouter/auto", "OpenRouter/Auto", "~openrouter/auto"} {
+		if !snapshot.IsRouterModelName(name) {
+			t.Fatalf("%q was not recognised as a router name", name)
+		}
+	}
+	for _, name := range []string{"openai/gpt-5", "openrouter/auto-x", ""} {
+		if snapshot.IsRouterModelName(name) {
+			t.Fatalf("%q was wrongly treated as a router name", name)
+		}
+	}
+}

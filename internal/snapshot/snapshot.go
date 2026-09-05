@@ -99,6 +99,31 @@ const (
 // silently never match (a test pins this).
 var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 
+// routerModelNames are public names that are not models. The vendor resolves
+// each to some other model at request time, by its own criteria, and bills the
+// request as whatever it picked — its documentation says the response's model
+// field is how you find out which one answered.
+//
+// That makes them unfenceable by the money lists, which judge the one name a
+// request asked for. Unlike a fallback candidate list there is nothing to walk:
+// the choice does not exist until the vendor makes it.
+//
+// The list follows the vendor and is the cost of closing this. Today it holds
+// one entry; a new router is a line here, the same maintenance the reserved
+// prefixes above already carry. Missing an entry fails open, so a name that
+// looks like a router and is not listed is worth adding before it is needed.
+var routerModelNames = map[string]bool{
+	"openrouter/auto": true,
+}
+
+// IsRouterModelName reports whether a public name selects a model rather than
+// naming one. The leading tilde is stripped for the same reason it is above:
+// the vendor marks floating aliases that way and a caller may spell one.
+func IsRouterModelName(publicName string) bool {
+	lower := strings.TrimPrefix(strings.ToLower(publicName), "~")
+	return routerModelNames[lower]
+}
+
 // IsReservedModelName reports whether a public model name sits under a
 // reserved self-serve prefix, current or retired. Such a name is served only
 // by an exact catalog match and never by passthrough. This function is the
@@ -305,11 +330,31 @@ func (k *Key) AllowsModel(m *Model) bool {
 // Each list empty means that half restricts nothing, so a key with neither is
 // bounded only by the amount granted, as it was before these fields existed.
 // A denial wins: it is checked after the allowance and can only take away.
+// HasCreditFence reports whether anyone has made a decision about which paid
+// models this key may reach. A key with neither list is bounded only by the
+// amount it was granted.
+func (k *Key) HasCreditFence() bool {
+	return len(k.CreditAllowedModels) > 0 || len(k.CreditDeniedModels) > 0
+}
+
 func (k *Key) AllowsCreditModel(m *Model) bool {
 	if !m.CreditAxis() {
 		return true
 	}
 	name := strings.ToLower(m.PublicName)
+	// A router name sidesteps both lists: whichever model it resolves to is
+	// what gets billed, and that model is chosen after this fence has run. A
+	// key carrying no fence loses nothing by being refused one — its money is
+	// the only bound it ever had — but a key carrying one has had a decision
+	// made about which models it may reach, and the name that can walk around
+	// that decision is exactly the one that must not be the exception.
+	//
+	// This lives inside the fence rather than at its call sites so that no
+	// caller can consult the lists without it. The call sites read the same
+	// two predicates again only to choose a clearer message, never to decide.
+	if k.HasCreditFence() && IsRouterModelName(name) {
+		return false
+	}
 	if len(k.CreditAllowedModels) > 0 && !matchesAnyCreditModel(k.CreditAllowedModels, name) {
 		return false
 	}

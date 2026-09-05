@@ -133,6 +133,17 @@ func errParamNeedsCreditModel(name string) apiError {
 			". 유료 모델에서만 사용할 수 있습니다."}
 }
 
+// A router name on a key that carries a model fence. The generic refusal is
+// wrong here: the caller did not ask for a model somebody excluded, they asked
+// for a name that picks one later, and the remedy is to name a model rather
+// than to go and read a list.
+func errRouterModelNotAllowed(name string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 자동 선택 모델(" + name + ")을 쓸 수 없습니다. " +
+			"어떤 모델이 답할지 미리 알 수 없어 허용 여부를 판단할 수 없기 때문입니다. " +
+			"모델 이름을 직접 지정해주세요."}
+}
+
 // A fallback candidate the key may not be billed for. It names the entry
 // because the caller sent a list and cannot otherwise tell which one is the
 // problem, and the name is echoed back only when it is short enough to be a

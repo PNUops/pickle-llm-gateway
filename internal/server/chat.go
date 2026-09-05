@@ -54,6 +54,18 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 	}
 }
 
+// `route` is deliberately not fenced, and this is inference rather than a
+// verified fact. The vendor's current fallback and routing documents do not
+// mention the field at all — not in the examples, not in the settings tables —
+// so it reads as a retired one. The reasoning for leaving it open is that it
+// selects AMONG candidates and `models` is the only candidate list, so fencing
+// every entry of that list bounds whatever `route` can reach, and `route` with
+// no `models` has nothing to select from.
+//
+// Recorded as inference on purpose. A note that claimed this was checked would
+// be read as settled by the next person, and an unverified vendor behaviour
+// treated as settled is exactly what defeated this fence once already.
+//
 // candidateModelsField is the request field that names models the vendor may
 // serve INSTEAD of the one in `model`. The vendor's own documentation is
 // explicit that any error can trigger a fallback to the next entry and that
@@ -397,6 +409,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// errors.go). The spool gets its own error type so the two stay
 			// countable apart — otherwise nobody can tell how many callers hit
 			// this one.
+			//
+			// Re-reading the two predicates here decides only which message to
+			// send; the refusal itself was already decided above, and this
+			// branch cannot admit anything the fence turned away.
+			if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
+				refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
+					"router_model_not_allowed")
+				return
+			}
 			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
 				"credit_model_not_allowed")
 			return
