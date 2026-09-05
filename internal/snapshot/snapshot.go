@@ -166,11 +166,27 @@ type Key struct {
 	// as a side effect. That is why the money fence is a second field rather
 	// than a reuse of the first.
 	//
-	// Entries are exact public names or a single vendor prefix ("openai/*"),
-	// lower-cased at load so a stored capital cannot silently match nothing.
+	// Entries are exact public names, a whole vendor ("openai/*"), or a model
+	// segment opened at one end ("openai/gpt-5-*", "openai/*-pro"), lower-cased
+	// at load so a stored capital cannot silently match nothing.
 	CreditAllowedModels []string `json:"creditAllowedModels,omitempty"`
-	Limits              Limits   `json:"limits"`
-	QuotaExhausted      bool     `json:"quotaExhausted,omitempty"`
+	// CreditDeniedModels carves models back out of whatever the field above
+	// leaves open, and takes the same entry shapes and the same matcher. It is
+	// the money axis only, for the reason given above.
+	//
+	// A denial wins over an allowance. The two are not symmetric statements
+	// about the same list: an allow list says which models an approver chose,
+	// and a deny list says which ones nobody may reach whatever else was
+	// chosen — the price outliers, mostly. Reading them the other way round
+	// would let a wide allowance quietly reopen exactly the models a later
+	// decision closed.
+	//
+	// Empty means this axis restricts nothing, like the field above, so a key
+	// carrying neither list is unfenced and a key carrying only this one is
+	// fenced out of just these names.
+	CreditDeniedModels []string `json:"creditDeniedModels,omitempty"`
+	Limits             Limits   `json:"limits"`
+	QuotaExhausted     bool     `json:"quotaExhausted,omitempty"`
 	// UpstreamCredentials maps an upstream ref (lowercased at load) to the
 	// bearer this key must use there. CREDIT-axis models require an entry for
 	// the serving upstream — there is deliberately no fallback to the
@@ -231,35 +247,50 @@ func (k *Key) AllowsModel(m *Model) bool {
 	return false
 }
 
-// AllowsCreditModel reports whether the key may spend money on the model.
+// AllowsCreditModel reports whether the key may spend money on the model. It is
+// the one entry point for both money lists, so a caller reaches the whole fence
+// by asking this single question and cannot consult half of it.
 //
 // TOKEN-axis models return true unconditionally, which is the whole point of
-// the field: the list is a money fence, and a self-serving model has no money
-// to fence. Keeping that guard inside this function rather than at the three
+// the fields: the lists are a money fence, and a self-serving model has no
+// money to fence. Keeping that guard inside this function rather than at the
 // call sites means a caller cannot forget the axis and fence the wrong one.
 //
-// An empty list is unrestricted — the amount granted stays the only bound, as
-// it was before this field existed.
+// Each list empty means that half restricts nothing, so a key with neither is
+// bounded only by the amount granted, as it was before these fields existed.
+// A denial wins: it is checked after the allowance and can only take away.
 func (k *Key) AllowsCreditModel(m *Model) bool {
-	if !m.CreditAxis() || len(k.CreditAllowedModels) == 0 {
+	if !m.CreditAxis() {
 		return true
 	}
 	name := strings.ToLower(m.PublicName)
-	for _, pattern := range k.CreditAllowedModels {
-		if MatchesCreditModel(pattern, name) {
+	if len(k.CreditAllowedModels) > 0 && !matchesAnyCreditModel(k.CreditAllowedModels, name) {
+		return false
+	}
+	return !matchesAnyCreditModel(k.CreditDeniedModels, name)
+}
+
+// matchesAnyCreditModel reports whether any pattern in one already-normalized
+// list covers the name. An empty list matches nothing, which is what lets each
+// caller above read "empty" as its own kind of no-restriction.
+func matchesAnyCreditModel(patterns []string, lowerName string) bool {
+	for _, pattern := range patterns {
+		if MatchesCreditModel(pattern, lowerName) {
 			return true
 		}
 	}
 	return false
 }
 
-// MatchesCreditModel reports whether one already-normalized allow-list pattern
-// covers a lower-cased public model name.
+// MatchesCreditModel reports whether one already-normalized pattern covers a
+// lower-cased public model name. Both money lists are matched by this function,
+// so an entry means the same thing whichever list it sits in — a rule that
+// allowed differently from how it denied would be two rules to keep in step.
 //
-// Two shapes and no others: an exact name, or one vendor opened by a trailing
-// "/*". A bare "*" matches nothing on purpose — "everything" is spelled by an
-// empty list, and a second spelling of the same state is how a state count
-// grows past what anyone reasons about.
+// Four shapes for the model segment: an exact name, a whole vendor ("openai/*"),
+// a trailing star ("openai/gpt-5-*") and a leading star ("openai/*-pro"). The
+// vendor itself never takes a star, because vendor names prefix one another
+// (meta and meta-llama), so "openai*" would silently reach a neighbour.
 func MatchesCreditModel(pattern, lowerName string) bool {
 	// A bare "*" is refused here as well as at load. The loader already drops a
 	// key carrying one, so this is the second lock on the same door — and the
@@ -268,11 +299,51 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 	if pattern == "" || pattern == "*" {
 		return false
 	}
-	if prefix, ok := strings.CutSuffix(pattern, "/*"); ok {
-		return prefix != "" && strings.HasPrefix(lowerName, prefix+"/") &&
-			len(lowerName) > len(prefix)+1
+	vendor, seg, hasVendor := strings.Cut(pattern, "/")
+	if !hasVendor {
+		// A name with no vendor segment ("pickle-general") is an exact entry.
+		return pattern == lowerName
 	}
-	return pattern == lowerName
+	rest, ok := strings.CutPrefix(lowerName, vendor+"/")
+	if !ok || rest == "" {
+		return false
+	}
+	switch {
+	case seg == "*":
+		return true
+	case strings.HasPrefix(seg, "*"):
+		// A leading star names a family by its ending, and the endings that
+		// matter carry variant suffixes: ":batch" is half price and ":free" is
+		// free, but both are the same model as the bare name. Matching the
+		// variant-stripped base as well as the whole name is what keeps
+		// "openai/*-pro" from fencing gpt-5-pro and paying full price for
+		// gpt-5-pro:batch, which is the same model at another rate.
+		tail := seg[1:]
+		base, _, _ := strings.Cut(rest, ":")
+		return strings.HasSuffix(rest, tail) || strings.HasSuffix(base, tail)
+		// Deliberately no "is it my own name" case here: nothing says
+		// "openai/*-pro" was meant to reach a model called plainly "pro".
+	case strings.HasSuffix(seg, "*"):
+		// A trailing star is a prefix, and a prefix already covers the variant
+		// suffixes, so it needs none of the handling above. The star also
+		// stands for nothing at all, as a glob's does: "openai/gpt-5*" reaches
+		// gpt-5 itself. Requiring at least one character made the wider-looking
+		// pattern the narrower one — "openai/gpt-5-*" reached gpt-5 through the
+		// separator rule below while "openai/gpt-5*" did not.
+		stem := seg[:len(seg)-1]
+		if strings.HasPrefix(rest, stem) {
+			return true
+		}
+		// "openai/gpt-5-*" is written to name the gpt-5 family, and the family
+		// includes gpt-5 itself; the separator the author typed before the star
+		// is the only thing standing in the way.
+		if last := stem[len(stem)-1]; last == '-' || last == '.' || last == ':' {
+			return rest == stem[:len(stem)-1]
+		}
+		return false
+	default:
+		return rest == seg
+	}
 }
 
 // creditModelPattern is the shape the control plane is expected to have
@@ -289,8 +360,13 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 // special-cased: an alias points at a model that changes under it, so a fence
 // naming the vendor must not silently pick up a moving target the approver
 // never chose.
+//
+// The model segment takes one star and only at an end: a star in the middle
+// ("openai/*gpt*") describes a set nobody can predict the size of, and a
+// leading star whose tail is empty or ends in a separator ("openai/*-") ends
+// up naming most of a vendor by accident.
 var creditModelPattern = regexp.MustCompile(
-	`^~?[a-z0-9][a-z0-9._:-]*(/([a-z0-9][a-z0-9._:-]*|\*))?$`)
+	`^~?[a-z0-9][a-z0-9._:-]*(/([a-z0-9][a-z0-9._:-]*\*?|\*[a-z0-9._:-]*[a-z0-9]|\*))?$`)
 
 // state is one loaded document plus the lookup maps derived from it.
 type state struct {
@@ -686,34 +762,17 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			}
 			continue
 		}
-		// The money fence is lower-cased once here, like credential refs above,
-		// so every later comparison is against a name lowered the same way.
-		//
-		// A pattern this build cannot act on drops the whole key rather than
-		// just that entry, and the asymmetry is deliberate: dropping entries
-		// shrinks a list, and a list shrunk to nothing is not a tighter fence
-		// but no fence at all — a key would silently regain every commercial
-		// model. Dropping the key denies service to one key and says so in the
-		// reject count, which is the failure this loader is built to prefer.
-		listProblem := ""
-		if len(k.CreditAllowedModels) > 0 {
-			norm := make([]string, 0, len(k.CreditAllowedModels))
-			for _, pattern := range k.CreditAllowedModels {
-				lower := strings.ToLower(strings.TrimSpace(pattern))
-				if lower == "" || !creditModelPattern.MatchString(lower) {
-					listProblem = fmt.Sprintf(
-						"key %s: creditAllowedModels entry %q is not a usable pattern",
-						k.KeyID, pattern)
-					break
-				}
-				norm = append(norm, lower)
-			}
-			// A blank entry is refused rather than skipped, for the same reason
-			// a malformed one is: skip them all and a list that said something
-			// becomes a list that says nothing, which here means unrestricted.
-			// The first version of this loop skipped blanks and would have let
-			// ["  "] widen a fenced key to every commercial model.
-			k.CreditAllowedModels = norm
+		// Both money lists are lower-cased once here, like credential refs
+		// above, so every later comparison is against a name lowered the same
+		// way. A blank entry is refused rather than skipped, for the same
+		// reason a malformed one is; the first version of this loop skipped
+		// blanks, and ["  "] widened a fenced key instead of failing.
+		var listProblem string
+		k.CreditAllowedModels, listProblem = normalizeCreditPatterns(
+			k.CreditAllowedModels, k.KeyID, "creditAllowedModels")
+		if listProblem == "" {
+			k.CreditDeniedModels, listProblem = normalizeCreditPatterns(
+				k.CreditDeniedModels, k.KeyID, "creditDeniedModels")
 		}
 		if listProblem != "" {
 			if derr := drop("%s", listProblem); derr != nil {
@@ -745,6 +804,36 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 	st.rejected = len(dropped)
 	st.dropReasons = dropped
 	return st, nil
+}
+
+// normalizeCreditPatterns lower-cases and trims one money list, returning the
+// normalized entries and "" — or the untouched list and why the whole key has
+// to go, because one entry is a pattern this build cannot act on.
+//
+// The key goes rather than the entry, and that holds for both lists even
+// though the reasoning runs in opposite directions. Drop an entry from the
+// allow list and the list shrinks toward empty, which means unrestricted: the
+// key silently regains every commercial model. Drop an entry from the deny
+// list and the list shrinks toward empty too, which there means nothing is
+// denied: the model somebody closed is silently open again. Same conclusion,
+// mirrored reasons — which is why the simplification of skipping just the
+// unreadable entry is wrong for both, and would be tempting on each of them
+// separately. Dropping the key denies service to one key, counts it, and logs
+// why, which is the failure this loader is built to prefer.
+func normalizeCreditPatterns(patterns []string, keyID, field string) ([]string, string) {
+	if len(patterns) == 0 {
+		return patterns, ""
+	}
+	norm := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		lower := strings.ToLower(strings.TrimSpace(pattern))
+		if lower == "" || !creditModelPattern.MatchString(lower) {
+			return patterns, fmt.Sprintf(
+				"key %s: %s entry %q is not a usable pattern", keyID, field, pattern)
+		}
+		norm = append(norm, lower)
+	}
+	return norm, ""
 }
 
 // modelProblem returns why a model entry cannot be used, or "" when it can.

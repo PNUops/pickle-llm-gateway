@@ -312,12 +312,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// was written to fix.
 	charge := func(int) {}
 	if model.CreditAxis() {
-		// The allow list is checked before the credential, and the order is the
-		// answer the caller gets. A key restricted to some models still holds a
-		// funded credential, so testing the credential first would answer
-		// "no money budget" to somebody who has one — sending them to apply for
-		// what they already have. What they actually need is a different model,
-		// or an administrator who widens the list.
+		// The model lists are checked before the credential, and the order is
+		// the answer the caller gets. A key restricted to some models still
+		// holds a funded credential, so testing the credential first would
+		// answer "no money budget" to somebody who has one — sending them to
+		// apply for what they already have. What they actually need is a
+		// different model, or an administrator who widens the fence.
+		//
+		// One call covers both the allow list and the deny list; AllowsCreditModel
+		// is the whole fence, so nothing here has to know which half refused.
+		// The caller is not told either, deliberately: naming the list would
+		// disclose its contents to somebody who is not the approver, and the
+		// two refusals ask the same thing of them anyway.
 		if !key.AllowsCreditModel(model) {
 			// Same public code as the catalogue fence, different advice (see
 			// errors.go). The spool gets its own error type so the two stay

@@ -10,7 +10,9 @@ import (
 )
 
 // The matcher decides what a key may spend money on, so its shape is pinned
-// here at the definition rather than only through the server tests.
+// here at the definition rather than only through the server tests. Both money
+// lists run through this one function, so every row below holds for a pattern
+// written as an allowance and for the same pattern written as a denial.
 func TestMatchesCreditModel(t *testing.T) {
 	for _, tc := range []struct {
 		pattern, name string
@@ -20,6 +22,37 @@ func TestMatchesCreditModel(t *testing.T) {
 		{"openai/gpt-4o-mini", "openai/gpt-4o", false},
 		{"openai/*", "openai/gpt-4o", true},
 		{"openai/*", "openai/a/b", true},
+		// A trailing star is a prefix over the model segment.
+		{"openai/gpt-5-*", "openai/gpt-5-pro", true},
+		// The separator the author typed before the star is not a reason to
+		// leave the family's own name out of the family.
+		{"openai/gpt-5-*", "openai/gpt-5", true},
+		// ...but only that exact name. A variant of it does not begin with
+		// "gpt-5-" and is not "gpt-5" either.
+		{"openai/gpt-5-*", "openai/gpt-5:batch", false},
+		// Written without the separator, the prefix covers the variants.
+		{"openai/gpt-5*", "openai/gpt-5:batch", true},
+		// The star stands for nothing at all as readily as for something, the
+		// way a glob's does. Without this the wider-looking pattern was the
+		// narrower one: "openai/gpt-5-*" reaches gpt-5 through the separator
+		// rule, so "openai/gpt-5*" not reaching it read as a bug to anyone
+		// writing the two side by side.
+		{"openai/gpt-5*", "openai/gpt-5", true},
+		{"openai/gpt-5-*", "openai/gpt-4o", false},
+		// A leading star names a family by how its names end.
+		{"openai/*-pro", "openai/gpt-5-pro", true},
+		// Variant recognition. ":batch" is the same model at half price and
+		// ":free" the same model at none; a fence that missed them would be
+		// paying full rate for the model it thought it had priced.
+		{"openai/*-pro", "openai/gpt-5-pro:batch", true},
+		{"openai/*-pro", "openai/gpt-5-pro:free", true},
+		{"openai/*-pro", "openai/gpt-5-nano", false},
+		// A leading star does not reach the tail standing on its own: nothing
+		// says "*-pro" was meant to name a model called plainly "pro".
+		{"openai/*-pro", "openai/pro", false},
+		// The vendor is matched whatever the model segment says.
+		{"openai/*-pro", "anthropic/claude-opus-pro", false},
+		{"pickle-general", "pickle-general", true},
 		{"openai/*", "anthropic/claude", false},
 		// One vendor, not every vendor whose name begins the same way.
 		{"openai/*", "openai-mirror/gpt-4o", false},
@@ -28,6 +61,10 @@ func TestMatchesCreditModel(t *testing.T) {
 		// A bare star matches nothing on purpose: "everything" is an empty
 		// list, and a second spelling of one state is how state counts grow.
 		{"*", "openai/gpt-4o", false},
+		// Including against the name "*" itself. A caller can send any string
+		// as a model name, and passthrough would synthesize a model called
+		// exactly that, so reading the pattern as a name here is the one way a
+		// bare star could still match something.
 		{"*", "*", false},
 		{"", "openai/gpt-4o", false},
 		// A name with no vendor segment still works as an exact entry.
@@ -70,7 +107,14 @@ func TestCreditPatternsMatchWhateverTheCase(t *testing.T) {
 			t.Fatalf("pattern %q did not match %q sent in mixed case", tc.pattern, tc.sent)
 		}
 	}
-	for _, bad := range []string{"*", "OpenAI/*", "openai/*x", "a/b/*", "", " openai/*"} {
+	// The shapes the pattern check drops, and with them the key that carried
+	// one. A star on the vendor would reach the vendors whose names merely
+	// begin the same way; a star loose in the middle, or one with nothing but
+	// a separator after it, describes a set nobody can size by reading it.
+	for _, bad := range []string{
+		"*", "openai*", "openai/*gpt*", "openai/**", "openai/*-", "",
+		"OpenAI/*", "a/b/*", " openai/*",
+	} {
 		if creditModelPattern.MatchString(bad) {
 			t.Fatalf("pattern %q should be refused by the shape check", bad)
 		}
