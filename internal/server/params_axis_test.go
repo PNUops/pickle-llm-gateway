@@ -291,3 +291,20 @@ func TestUnreadableCandidateListIsRefused(t *testing.T) {
 		t.Fatalf("null candidates: %d %s", status, resp)
 	}
 }
+
+// The candidate fence is a money-axis rule and needs to be nowhere else: a
+// self-hosted request never forwards `models` at all, because the field is not
+// on that axis's allowlist. Pinned so that widening the allowlist later cannot
+// quietly open a fallback path with no fence behind it.
+func TestSelfHostedRefusesCandidateModels(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	body := `{"model":"pickle-general","messages":[{"role":"user","content":"hi"}],` +
+		`"models":["openai/gpt-5"]}`
+	status, resp := h.chat(t, testToken, body)
+	if status != 400 || errCode(t, resp) != "unsupported_parameter" {
+		t.Fatalf("%d %s", status, resp)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("reached the upstream")
+	}
+}
