@@ -90,7 +90,8 @@ Key에는 CREDIT 축 전용 허용 목록 `creditAllowedModels`가 있습니다.
 접두를 여는 `openai/gpt-5-*`, 접미를 여는 `openai/*-pro`. 별은 모델 세그먼트의 양 끝에만
 올 수 있고 하나만 씁니다. 벤더 자리에는 못 옵니다(`openai*`는 거부). 벤더 이름끼리 접두가
 겹치는 경우가 있어서(`meta`와 `meta-llama`), 벤더에 별을 허용하면 옆 벤더까지 열립니다.
-`openai/gpt-5-*`처럼 구분자로 끝나는 접두는 그 계열의 이름인 `openai/gpt-5` 자체도
+별은 빈 문자열도 먹으므로 `openai/gpt-5*`는 `openai/gpt-5` 자체를 포함하고,
+`openai/gpt-5-*`처럼 구분자로 끝나는 접두도 그 계열의 이름인 `openai/gpt-5`를
 포함합니다. `openai/*-pro`처럼 접미를 여는 항목은 `:batch`나 `:free` 같은 변형 꼬리를 뗀
 이름으로도 견주므로 `openai/gpt-5-pro:batch`에 맞습니다. 같은 모델의 다른 요금이지 다른
 모델이 아니기 때문입니다. 반대로 접미 항목이 꼬리만 남은 이름(`openai/pro`)까지 잡지는
