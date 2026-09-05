@@ -95,41 +95,29 @@ var tokenAxisParams = map[string]bool{
 	"parallel_tool_calls":   true,
 }
 
-// creditAxisParams is tokenAxisParams plus the fields only a paid model takes.
-// Built in init so the shared part cannot drift between the two.
+// creditOnlyParams are fields that are ordinary on the paid side and closed on
+// the self-hosted one. The set permits nothing: the money axis has no allowlist
+// at all, so no request is checked against a set there. It exists only to
+// classify a refusal on the self-hosted side.
+//
+// That classification is worth keeping on its own. Without it a caller sending
+// `reasoning_effort` to a self-hosted model hears "unknown field", which is
+// false and dead-ends them; with it they hear that the field works on a paid
+// model, which is the only clue they get about what to do next.
 //
 // `reasoning_effort` and `verbosity` are documented Chat Completions fields on
 // the commercial side, and agent tools set them on their own from model
-// metadata — so refusing them outright made every reasoning-capable paid model
-// unusable through this gateway, with nothing the caller could do about it.
-//
-// They stay closed on the self-hosted side for three reasons, none of which is
-// that the serving process would fail on them. Thinking there is disabled as a
-// server default and re-opening it is a service decision, not a per-request
-// one; a field that changes nothing would still read to the caller as if it
-// had; and a model whose fallback points at a commercial upstream would have
-// that upstream honour the field, putting reasoning tokens on the self-hosted
-// allowance. The axis is a property of the model, not of the upstream that
-// happens to answer.
-var creditAxisParams = map[string]bool{}
-
-func init() {
-	for name := range tokenAxisParams {
-		creditAxisParams[name] = true
-	}
-	creditAxisParams["reasoning_effort"] = true
-	creditAxisParams["verbosity"] = true
-}
-
-// allowedParamsFor answers which set governs this request. The caller must
-// have resolved the model first: the axis is a fact about the model the
-// request names, which lives inside the body, so nothing before the parse can
-// know it.
-func allowedParamsFor(model *snapshot.Model) map[string]bool {
-	if model.CreditAxis() {
-		return creditAxisParams
-	}
-	return tokenAxisParams
+// metadata. They stay closed on the self-hosted side for three reasons, none
+// of which is that the serving process would fail on them. Thinking there is
+// disabled as a server default and re-opening it is a service decision, not a
+// per-request one; a field that changes nothing would still read to the caller
+// as if it had; and a model whose fallback points at a commercial upstream
+// would have that upstream honour the field, putting reasoning tokens on the
+// self-hosted allowance. The axis is a property of the model, not of the
+// upstream that happens to answer.
+var creditOnlyParams = map[string]bool{
+	"reasoning_effort": true,
+	"verbosity":        true,
 }
 
 type usage struct {
@@ -275,26 +263,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	case snapshot.AxisCredit:
 		ev.BudgetAxis = snapshot.AxisCredit
 	}
-	// The parameter surface is the first thing the axis decides. It runs here
-	// rather than before the model is read because the axis cannot be known
-	// any earlier, and it runs before the permission fences so that a
-	// malformed request still answers 400 rather than 403.
-	allowed := allowedParamsFor(model)
-	for name := range params {
-		if allowed[name] {
-			continue
-		}
-		if creditAxisParams[name] {
-			// Known field, wrong axis. Same public code as any other rejected
-			// field — one more code is one more thing every SDK has to learn
-			// for a fact it already handles — but different advice, and its
-			// own spool type so the two stay countable apart.
-			refuseAs(errParamNeedsCreditModel(name), spool.StatusBadRequest,
-				"credit_only_parameter")
+	// The parameter allowlist governs the TOKEN axis and nothing else.
+	//
+	// One machine used to run on both axes, and running on both hid the fact
+	// that it was doing two different jobs. On the self-hosted side it is the
+	// enforcement point for a service decision — thinking is off by default,
+	// with no per-request opt-in (see tokenAxisParams) — and the serving
+	// capacity it rations is the platform's own. On the money axis it was our
+	// convenience and nothing more: it refused fields the provider defines,
+	// on requests the student's own budget pays for, so every field it turned
+	// away was one the vendor would have served. Where the vendor accepts a
+	// request this gateway has no reason to be what refuses it.
+	//
+	// It still runs before the permission fences, so a malformed request
+	// answers 400 rather than 403, and it runs after the model is read because
+	// the axis is a fact about the model the body names.
+	if !model.CreditAxis() {
+		for name := range params {
+			if tokenAxisParams[name] {
+				continue
+			}
+			if creditOnlyParams[name] {
+				// Known field, wrong axis. Same public code as any other
+				// rejected field — one more code is one more thing every SDK
+				// has to learn for a fact it already handles — but different
+				// advice, and its own spool type so the two stay countable
+				// apart.
+				refuseAs(errParamNeedsCreditModel(name), spool.StatusBadRequest,
+					"credit_only_parameter")
+				return
+			}
+			refuse(errUnsupportedParam(name), spool.StatusBadRequest)
 			return
 		}
-		refuse(errUnsupportedParam(name), spool.StatusBadRequest)
-		return
 	}
 	if !key.AllowsModel(model) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)

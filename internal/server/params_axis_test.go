@@ -1,16 +1,21 @@
 package server
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
-// The parameter surface is decided by the model's budget axis, so these tests
-// pin both halves: what a paid model may carry that a self-hosted one may not,
-// and what neither may carry. The second half is the one that rots quietly —
-// a field opened for the paid side reaches the commercial provider verbatim,
-// and the fields below are the ones that would spend money or change routing
-// if they ever slipped in.
+// The parameter surface is decided by the model's budget axis, and the two
+// axes are deliberately not symmetric. The self-hosted side has an allowlist
+// that enforces a service decision; the money side has none at all, because
+// there the provider defines the fields and the student's own budget pays for
+// them.
+//
+// The self-hosted half is the one that rots dangerously. Thinking is off there
+// by default with no per-request opt-in, and this allowlist is the only thing
+// enforcing it — a field that slips in turns it on silently and bills the
+// shared token allowance for reasoning nobody asked for.
 
 const (
 	reasoningBody = `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`
@@ -69,49 +74,102 @@ func TestCreditOnlyParamsRefusedOnSelfHostedModel(t *testing.T) {
 }
 
 // Thinking on the self-hosted side is a server default, not a per-request
-// option, and these are the fields that would override it. They stay refused
-// on both axes: opening them is a service decision that has not been made.
-func TestThinkingFieldsRefusedOnBothAxes(t *testing.T) {
-	for _, model := range []string{"pickle-general", "vendor-model"} {
-		for _, field := range []string{
-			`"chat_template_kwargs":{"enable_thinking":true}`,
-			`"thinking_token_budget":100`,
-		} {
-			h := newHarness(t, creditDoc, nil)
-			body := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],` + field + `}`
-			status, resp := h.chat(t, testToken, body)
-			if status != 400 || errCode(t, resp) != "unsupported_parameter" {
-				t.Fatalf("%s carrying %s: got %d %s", model, field, status, resp)
-			}
-			if h.mock.callCount() != 0 {
-				t.Fatalf("%s carrying %s reached the upstream", model, field)
-			}
+// option, and these are the fields that would override it. Nothing about
+// opening the money axis may reach them: a field that quietly switches
+// thinking on is the most expensive failure this surface has, because the
+// completion tokens land on the shared allowance and the request still looks
+// ordinary.
+func TestThinkingFieldsRefusedOnSelfHostedModel(t *testing.T) {
+	for _, field := range []string{
+		`"chat_template_kwargs":{"enable_thinking":true}`,
+		`"thinking_token_budget":100`,
+		`"reasoning_effort":"high"`,
+	} {
+		h := newHarness(t, creditDoc, nil)
+		body := `{"model":"pickle-general","messages":[{"role":"user","content":"hi"}],` + field + `}`
+		status, resp := h.chat(t, testToken, body)
+		if status != 400 || errCode(t, resp) != "unsupported_parameter" {
+			t.Fatalf("self-hosted model carrying %s: got %d %s", field, status, resp)
+		}
+		if h.mock.callCount() != 0 {
+			t.Fatalf("self-hosted model carrying %s reached the upstream", field)
 		}
 	}
 }
 
-// Routing and billing fields the commercial provider accepts. Passthrough
-// forwards a body largely as it arrives, so admitting these would leave the
-// money axis with no control of ours at all — the credential's own limit would
-// be the whole of it. They are refused on the paid axis on purpose.
-func TestProviderRoutingFieldsStayRefusedOnPaidModel(t *testing.T) {
-	for _, field := range []string{
-		`"models":["a","b"]`,
-		`"provider":{"order":["openai"]}`,
-		`"route":"fallback"`,
-		`"plugins":[{"id":"web"}]`,
-		`"transforms":["middle-out"]`,
-		`"web_search_options":{"search_context_size":"high"}`,
+// The money axis carries no allowlist, so the provider's own fields reach it
+// verbatim — routing, plugins, caching, sampling extensions and anything the
+// vendor adds later without this gateway being changed. Refusing them was our
+// convenience rather than a control: the credential's own limit is what bounds
+// this axis, and every field turned away here was one the vendor would have
+// served on a request the student's budget pays for.
+func TestProviderFieldsReachThePaidUpstream(t *testing.T) {
+	for _, tc := range []struct{ field, key, want string }{
+		{`"models":["a","b"]`, "models", `["a","b"]`},
+		{`"provider":{"order":["openai"]}`, "provider", `{"order":["openai"]}`},
+		{`"route":"fallback"`, "route", `"fallback"`},
+		{`"plugins":[{"id":"web"}]`, "plugins", `[{"id":"web"}]`},
+		{`"transforms":["middle-out"]`, "transforms", `["middle-out"]`},
+		{`"web_search_options":{"search_context_size":"high"}`, "web_search_options", `{"search_context_size":"high"}`},
+		{`"reasoning":{"effort":"high"}`, "reasoning", `{"effort":"high"}`},
+		{`"prediction":{"type":"content"}`, "prediction", `{"type":"content"}`},
+		{`"chat_template_kwargs":{"enable_thinking":true}`, "chat_template_kwargs", `{"enable_thinking":true}`},
+		// A field this build has never heard of travels too. That is the point
+		// of removing the list rather than lengthening it.
+		{`"some_field_added_next_month":42`, "some_field_added_next_month", `42`},
 	} {
 		h := newHarness(t, creditDoc, nil)
-		body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` + field + `}`
+		body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` + tc.field + `}`
 		status, resp := h.chat(t, testToken, body)
-		if status != 400 || errCode(t, resp) != "unsupported_parameter" {
-			t.Fatalf("paid model carrying %s: got %d %s", field, status, resp)
+		if status != 200 {
+			t.Fatalf("paid model carrying %s: got %d %s", tc.field, status, resp)
 		}
-		if h.mock.callCount() != 0 {
-			t.Fatalf("paid model carrying %s reached the upstream", field)
+		params, _ := h.mock.last()
+		if got := string(params[tc.key]); got != tc.want {
+			t.Fatalf("%s reached the upstream as %q, want %q", tc.key, got, tc.want)
 		}
+	}
+}
+
+// Opening the axis must not open the four things that are not the allowlist's
+// to decide. Each is what it is for a reason the list never carried.
+func TestPaidAxisKeepsItsNonAllowlistRules(t *testing.T) {
+	h := newHarness(t, creditDoc, nil)
+
+	// The public model name is translated to the upstream's own, so a caller
+	// sending arbitrary fields still cannot learn which server answers.
+	if status, resp := h.chat(t, testToken, creditChatBody); status != 200 {
+		t.Fatalf("paid chat: %d %s", status, resp)
+	}
+	params, _ := h.mock.last()
+	if got := string(params["model"]); got != `"`+upstreamModel+`"` {
+		t.Fatalf("model reached the upstream as %s", got)
+	}
+
+	// Usage is forced on even when the caller sent stream_options themselves
+	// and asked for the opposite. Metering depends on it.
+	body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` +
+		`"stream":true,"stream_options":{"include_usage":false}}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("paid stream: %d %s", status, resp)
+	}
+	params, _ = h.mock.last()
+	var opts struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+	if err := json.Unmarshal(params["stream_options"], &opts); err != nil {
+		t.Fatal(err)
+	}
+	if !opts.IncludeUsage {
+		t.Fatalf("include_usage was not forced on: %s", params["stream_options"])
+	}
+
+	// A reserved self-serve prefix is still never a passthrough model, whatever
+	// else the body carries.
+	status, resp := h.chat(t, testToken,
+		`{"model":"pickle-nosuch","messages":[],"provider":{"order":["openai"]}}`)
+	if status != 404 || errCode(t, resp) != "model_not_found" {
+		t.Fatalf("reserved prefix: %d %s", status, resp)
 	}
 }
 
