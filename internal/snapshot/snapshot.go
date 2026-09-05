@@ -75,6 +75,20 @@ const (
 	AxisCredit = "CREDIT"
 )
 
+// Passthrough capabilities. A key's passthroughEndpoints list names these, and
+// each one governs the routes the passthrough surface opens for it — they are
+// capabilities rather than paths, so a vendor adding a sub-path under one
+// already granted does not need a new token, and an approver reads a word
+// rather than a URL.
+//
+// The vocabulary is the control plane's to define; the gateway only ever asks
+// about a capability it actually routes, which is why an unrecognized token in
+// a document can open nothing here and is carried through untouched.
+const (
+	EndpointImages     = "images"
+	EndpointEmbeddings = "embeddings"
+)
+
 // reservedModelPrefixes are the prefixes reserved for curated self-serve
 // model names: the current one first ("pickle-"), then prefixes retired by a
 // rename ("pnu-", retired 2026-08-25) that stay guarded so a stale name in
@@ -84,6 +98,110 @@ const (
 // lowercases the candidate before comparing, so a mixed-case entry would
 // silently never match (a test pins this).
 var reservedModelPrefixes = []string{"pickle-", "pnu-"}
+
+// routerVendorPrefix is the vendor whose whole namespace selects models rather
+// than naming them. Each name under it resolves to some other model at request
+// time, by the vendor's own criteria, and the request is billed as whatever it
+// picked — the vendor's documentation says the response's model field is how
+// you find out which one answered.
+//
+// That makes them unfenceable by the money lists, which judge the one name a
+// request asked for. Unlike a fallback candidate list there is nothing to walk:
+// the choice does not exist until after the fence has run.
+//
+// THIS IS A PREFIX AND NOT A LIST OF NAMES, and the difference is the point. A
+// list was written first with the one name then known; it missed four more that
+// already existed and would have missed every one added later. That is how the
+// same defect was found three times in one round, the third time created by the
+// list itself. A full read of the vendor catalogue (431 models, 2026-09-05)
+// found six names under this vendor and no real model among them: auto,
+// auto-beta, free, fusion, pareto-code and bodybuilder. Closing the vendor
+// closes whatever it adds next, without anyone having to notice in time.
+//
+// A real model CAN ship under this vendor, so the cost is not zero and the
+// earlier claim that the catalogue held none was wrong. The active catalogue
+// lists six, all of them selectors (the vendor marks each `tokenizer: Router`),
+// but openrouter/sherlock-think-alpha and openrouter/horizon-beta are real
+// models whose endpoints have simply been retired — they answer on the
+// per-model endpoint with real names and a tokenizer that is not Router.
+//
+// The rule stands anyway, on a different reason: refusing costs little. These
+// are stealth previews, normally free, and the refusal only ever falls on a key
+// that already carries a fence. Do not restore "there are none" — someone will
+// read it and unpick the prefix.
+//
+// The vendor does expose the discriminator this wants: `tokenizer: Router`
+// marks a selector and a real model does not carry it. The gateway has no
+// catalogue to read it from, which is the same gap the note below describes.
+const routerVendorPrefix = "openrouter/"
+
+// IsRouterModelName reports whether a public name selects a model rather than
+// naming one.
+//
+// The leading tilde is stripped because the vendor really does use it: the same
+// catalogue read found 13 tilde ids, every one a "-latest" floating alias. So a
+// caller can spell one, and without stripping it this guard would be one
+// character from being walked past.
+//
+// Those aliases leave a gap this does not close: a key denying
+// anthropic/claude-opus-4 can still reach that model as
+// ~anthropic/claude-opus-latest. That is a standing decision — "~vendor/*" and
+// "vendor/*" are deliberately separate prefixes and the approval screen says
+// so — not something this guard should quietly change.
+func IsRouterModelName(publicName string) bool {
+	// Surrounding space is stripped because a prefix test is defeated by a
+	// single leading byte. A variant suffix is not stripped and needs no
+	// handling: ":nitro" is at the end and cannot move what a name starts with,
+	// which is one of the things a prefix buys over a set of exact names.
+	// TrimLeft and not TrimPrefix: one tilde stripped still leaves "~~name"
+	// starting with a tilde, and the prefix test would then miss it. Whether
+	// the vendor reads a doubled tilde is unverified — the catalogue answers
+	// 404 for one — but a guard that costs a character should not depend on
+	// that being true.
+	lower := strings.TrimLeft(strings.ToLower(strings.TrimSpace(publicName)), "~")
+	return strings.HasPrefix(lower, routerVendorPrefix)
+}
+
+// presetMarker attaches a saved configuration to a request. The vendor accepts
+// it three ways: a top-level "preset" field, a model named "@preset/slug", and
+// a model with one appended, "openai/gpt-4@preset/slug". A preset can carry the
+// model and the fallback list, so it stands in for everything the money fence
+// judges and reaches it from outside the fields the fence reads.
+//
+// It is refused rather than judged, and refused for every key rather than only
+// fenced ones, because presets live on the platform's own vendor account: every
+// student key is issued under it, so one preset created there is reachable by
+// all of them. Nothing is lost by refusing — a full read of the vendor
+// catalogue (431 models, 2026-09-05) found no model id containing this
+// character.
+const presetMarker = "@"
+
+// PresetField is the top-level request field that names a preset directly.
+const PresetField = "preset"
+
+// IsPresetModelName reports whether a model name carries a preset.
+func IsPresetModelName(publicName string) bool {
+	return strings.Contains(publicName, presetMarker)
+}
+
+// A NOTE ON ALL OF THE ABOVE, worth reading before adding a seventh guard.
+//
+// The money fence assumes one thing: that the name a request asks for is the
+// model that gets billed. Six separate channels have broken that assumption —
+// a repeated `model` member, the `models` fallback list, this vendor's router
+// namespace, the tilde floating aliases, presets, and the vendor's server tools
+// naming a model inside `tools` — and each arrived through a different door.
+//
+// The guards here close those six. THEY DO NOT CLOSE THE CLASS. The previous
+// version of this note said the same thing about five and was proved right
+// within the round, by the sixth. Nothing here can close it: the structural
+// answer is to admit only names the vendor's catalogue calls a concrete model,
+// and the gateway has no catalogue (the control plane does). The vendor marks
+// selectors `tokenizer: Router`, so the discriminator exists and is not
+// reachable from here.
+//
+// When a seventh appears, the question is not which guard to add. It is whether
+// the catalogue belongs here.
 
 // IsReservedModelName reports whether a public model name sits under a
 // reserved self-serve prefix, current or retired. Such a name is served only
@@ -100,7 +218,7 @@ var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 // all, and one character defeated it.
 func IsReservedModelName(publicName string) bool {
 	lower := strings.ToLower(publicName)
-	lower = strings.TrimPrefix(lower, "~")
+	lower = strings.TrimLeft(lower, "~")
 	for _, p := range reservedModelPrefixes {
 		if strings.HasPrefix(lower, p) {
 			return true
@@ -185,8 +303,24 @@ type Key struct {
 	// carrying neither list is unfenced and a key carrying only this one is
 	// fenced out of just these names.
 	CreditDeniedModels []string `json:"creditDeniedModels,omitempty"`
-	Limits             Limits   `json:"limits"`
-	QuotaExhausted     bool     `json:"quotaExhausted,omitempty"`
+	// PassthroughEndpoints is the closed-vocabulary list of passthrough
+	// capabilities this key may reach — see the Endpoint* constants.
+	//
+	// EMPTY MEANS NONE, the exact opposite of the two money lists above, and
+	// the asymmetry is deliberate. Those lists narrow a surface every key
+	// already has; this one is the surface itself, and a path nobody granted
+	// must not open by the mere act of the gateway learning to serve it. So an
+	// absent member decodes to nil, nil has length zero, and length zero is
+	// closed — which is also the right reading of a control plane too old to
+	// send the member at all, since a gateway too old to read it does not
+	// serve these routes either.
+	//
+	// Nothing here governs chat completions or the model catalogue: those keep
+	// the fences they already have, so this list can never take away something
+	// a key has today.
+	PassthroughEndpoints []string `json:"passthroughEndpoints,omitempty"`
+	Limits               Limits   `json:"limits"`
+	QuotaExhausted       bool     `json:"quotaExhausted,omitempty"`
 	// UpstreamCredentials maps an upstream ref (lowercased at load) to the
 	// bearer this key must use there. CREDIT-axis models require an entry for
 	// the serving upstream — there is deliberately no fallback to the
@@ -233,6 +367,22 @@ func (k *Key) CredentialFor(ref string) string {
 	return k.UpstreamCredentials[strings.ToLower(ref)]
 }
 
+// AllowsEndpoint reports whether the key was granted one passthrough
+// capability. An empty list allows nothing — see PassthroughEndpoints for why
+// this fence defaults closed where the money lists default open.
+//
+// The caller passes one of the Endpoint* constants, never a client-supplied
+// string, so a document entry this build does not recognize cannot match
+// anything and needs no filtering at load.
+func (k *Key) AllowsEndpoint(capability string) bool {
+	for _, granted := range k.PassthroughEndpoints {
+		if granted == capability {
+			return true
+		}
+	}
+	return false
+}
+
 // AllowsModel reports whether the key may use the model. An empty allow list
 // means every PUBLIC model; a RESTRICTED model requires an explicit listing.
 func (k *Key) AllowsModel(m *Model) bool {
@@ -259,15 +409,68 @@ func (k *Key) AllowsModel(m *Model) bool {
 // Each list empty means that half restricts nothing, so a key with neither is
 // bounded only by the amount granted, as it was before these fields existed.
 // A denial wins: it is checked after the allowance and can only take away.
+// HasCreditFence reports whether anyone has made a decision about which paid
+// models this key may reach. A key with neither list is bounded only by the
+// amount it was granted.
+func (k *Key) HasCreditFence() bool {
+	return len(k.CreditAllowedModels) > 0 || len(k.CreditDeniedModels) > 0
+}
+
 func (k *Key) AllowsCreditModel(m *Model) bool {
 	if !m.CreditAxis() {
 		return true
 	}
-	name := strings.ToLower(m.PublicName)
+	// Normalized here, at the single door both lists go through, and not inside
+	// MatchesCreditModel. That function's contract is that the name reaches it
+	// already normalized, and the console keeps a 1:1 mirror of it — moving the
+	// trim inside would oblige that mirror to change in the same unit of work
+	// for a rule that is not the matcher's.
+	//
+	// It has to happen somewhere. Load normalizes the PATTERN
+	// (normalizeCreditPatterns trims and lower-cases it) while the NAME arrived
+	// untrimmed, and a comparison that normalizes one side always leaks this
+	// way. For a catalogue model the name is a server value and cannot carry
+	// padding; for a passthrough model it is synthesized from the request
+	// string, so it is the caller's, and this round is what opens that surface.
+	name := strings.ToLower(strings.TrimSpace(m.PublicName))
+	// A router name sidesteps both lists: whichever model it resolves to is
+	// what gets billed, and that model is chosen after this fence has run. A
+	// key carrying no fence loses nothing by being refused one — its money is
+	// the only bound it ever had — but a key carrying one has had a decision
+	// made about which models it may reach, and the name that can walk around
+	// that decision is exactly the one that must not be the exception.
+	//
+	// This lives inside the fence rather than at its call sites so that no
+	// caller can consult the lists without it. The call sites read the same
+	// two predicates again only to choose a clearer message, never to decide.
+	if k.HasCreditFence() && IsRouterModelName(name) {
+		return false
+	}
 	if len(k.CreditAllowedModels) > 0 && !matchesAnyCreditModel(k.CreditAllowedModels, name) {
 		return false
 	}
-	return !matchesAnyCreditModel(k.CreditDeniedModels, name)
+	// The two lists deliberately part company on the tilde, and this is the one
+	// place the "an entry means the same thing in either list" symmetry does
+	// not hold.
+	//
+	// The allow list keeps the strict reading: "~anthropic/*" and "anthropic/*"
+	// stay separate prefixes there, because an approver who opened a vendor did
+	// not thereby choose a moving target that points somewhere new next week.
+	// That reasoning is about granting, and it does not survive being copied
+	// onto a list that only ever takes away — read strictly on the deny side it
+	// left a key that denied "anthropic/*" still able to reach that vendor's
+	// newest model through "~anthropic/claude-opus-latest".
+	//
+	// So a denial is tested against the tilde-stripped name as well. Denying
+	// wider costs nothing: the worst case is refusing an alias of a model
+	// somebody had already decided this key may not use.
+	if matchesAnyCreditModel(k.CreditDeniedModels, name) {
+		return false
+	}
+	if stripped := strings.TrimLeft(name, "~"); stripped != name {
+		return !matchesAnyCreditModel(k.CreditDeniedModels, stripped)
+	}
+	return true
 }
 
 // matchesAnyCreditModel reports whether any pattern in one already-normalized
@@ -299,10 +502,19 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 	if pattern == "" || pattern == "*" {
 		return false
 	}
+	// A variant suffix (":nitro", ":batch", ":free") is the same model at
+	// another rate, so every exact comparison below is made against the bare
+	// name as well. The leading-star branch already did this and the exact ones
+	// did not, which left one function keeping two rules: a deny list naming
+	// openai/gpt-5-pro fenced that model and let openai/gpt-5-pro:nitro past.
+	// Matching wider costs nothing on a deny list, which only ever takes away,
+	// and on an allow list it admits another rate for a model already chosen.
+	baseName, _, _ := strings.Cut(lowerName, ":")
+
 	vendor, seg, hasVendor := strings.Cut(pattern, "/")
 	if !hasVendor {
 		// A name with no vendor segment ("pickle-general") is an exact entry.
-		return pattern == lowerName
+		return pattern == lowerName || pattern == baseName
 	}
 	rest, ok := strings.CutPrefix(lowerName, vendor+"/")
 	if !ok || rest == "" {
@@ -342,7 +554,11 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 		}
 		return false
 	default:
-		return rest == seg
+		if rest == seg {
+			return true
+		}
+		base, _, _ := strings.Cut(rest, ":")
+		return base == seg
 	}
 }
 
@@ -780,6 +996,20 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			}
 			continue
 		}
+		// The endpoint fence is normalized but never fatal, and that is the
+		// mirror image of the money lists above. There, an entry this build
+		// cannot read would shrink a list toward empty and empty means
+		// unrestricted, so the whole key has to go. Here empty means closed:
+		// an entry that shrinks away takes a capability off the key, which is
+		// the safe direction, and dropping the key over it would deny chat as
+		// well over a passthrough capability the key may never have used.
+		//
+		// So an unrecognized token is kept as-is rather than filtered. The
+		// vocabulary belongs to the control plane; a token this build does not
+		// route is matched by nothing, and keeping it means a newer control
+		// plane can add one without a second copy of the closed set living
+		// here and going stale.
+		k.PassthroughEndpoints = normalizeEndpoints(k.PassthroughEndpoints)
 		reason := keyProblem(&k, i, st.byHash)
 		if reason != "" {
 			if derr := drop("%s", reason); derr != nil {
@@ -804,6 +1034,29 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 	st.rejected = len(dropped)
 	st.dropReasons = dropped
 	return st, nil
+}
+
+// normalizeEndpoints lower-cases, trims and de-duplicates a key's passthrough
+// capability list, dropping blanks. It cannot fail: see the call site for why
+// this list is normalized rather than validated.
+func normalizeEndpoints(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(tokens))
+	out := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		lower := strings.ToLower(strings.TrimSpace(token))
+		if lower == "" || seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		out = append(out, lower)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // normalizeCreditPatterns lower-cases and trims one money list, returning the

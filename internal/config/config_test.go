@@ -217,7 +217,7 @@ func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
 		case strings.HasSuffix(n, "_BYTES"), strings.HasSuffix(n, "_SIZE"),
 			strings.HasSuffix(n, "_DAYS"), strings.HasSuffix(n, "_RETRIES"),
 			strings.HasSuffix(n, "_RPM"), strings.HasSuffix(n, "_TPM"),
-			strings.HasSuffix(n, "_CONCURRENCY"), n == "LLMGW_MAX_IN_FLIGHT":
+			strings.HasSuffix(n, "_CONCURRENCY"), strings.HasSuffix(n, "_IN_FLIGHT"):
 			return "7"
 		case strings.HasSuffix(n, "_LISTEN"):
 			return "127.0.0.1:9999"
@@ -256,5 +256,59 @@ func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
 		if !declared[ref] {
 			t.Fatalf("a general setting was parsed as an upstream declaration: %q", ref)
 		}
+	}
+}
+
+// The passthrough surface's four bounds carry defaults, and every one of them
+// is settable on its own. The deployed environment is the authority on the
+// values; what this pins is that the wiring exists and that chat's own four
+// stay where they were.
+func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
+	setRequired(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PassthroughRequestBodyMaxBytes != 25<<20 || cfg.PassthroughResponseMaxBytes != 32<<20 {
+		t.Fatalf("byte defaults: %d %d", cfg.PassthroughRequestBodyMaxBytes, cfg.PassthroughResponseMaxBytes)
+	}
+	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 16 {
+		t.Fatalf("wait/pool defaults: %v %d", cfg.PassthroughHeaderWait, cfg.PassthroughMaxInFlight)
+	}
+	// The four the chat path reads are untouched by all of this.
+	if cfg.RequestBodyMaxBytes != 2<<20 || cfg.UpstreamHeaderWait != 60*time.Second || cfg.MaxInFlight != 16 {
+		t.Fatalf("chat limits moved: %d %v %d", cfg.RequestBodyMaxBytes, cfg.UpstreamHeaderWait, cfg.MaxInFlight)
+	}
+
+	t.Setenv("LLMGW_PASSTHROUGH_REQUEST_BODY_MAX_BYTES", "1048576")
+	t.Setenv("LLMGW_PASSTHROUGH_RESPONSE_MAX_BYTES", "20971520")
+	t.Setenv("LLMGW_PASSTHROUGH_HEADER_WAIT", "300s")
+	t.Setenv("LLMGW_PASSTHROUGH_MAX_IN_FLIGHT", "6")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PassthroughRequestBodyMaxBytes != 1<<20 || cfg.PassthroughResponseMaxBytes != 20<<20 {
+		t.Fatalf("byte overrides: %d %d", cfg.PassthroughRequestBodyMaxBytes, cfg.PassthroughResponseMaxBytes)
+	}
+	if cfg.PassthroughHeaderWait != 300*time.Second || cfg.PassthroughMaxInFlight != 6 {
+		t.Fatalf("overrides: %v %d", cfg.PassthroughHeaderWait, cfg.PassthroughMaxInFlight)
+	}
+	// Overriding the passthrough copies still leaves chat where it was.
+	if cfg.RequestBodyMaxBytes != 2<<20 || cfg.UpstreamHeaderWait != 60*time.Second {
+		t.Fatalf("chat limits moved: %d %v", cfg.RequestBodyMaxBytes, cfg.UpstreamHeaderWait)
+	}
+}
+
+func TestPassthroughLimitsRejectBadValues(t *testing.T) {
+	setRequired(t)
+	t.Setenv("LLMGW_PASSTHROUGH_RESPONSE_MAX_BYTES", "0")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a zero response cap must not start the daemon")
+	}
+	t.Setenv("LLMGW_PASSTHROUGH_RESPONSE_MAX_BYTES", "")
+	t.Setenv("LLMGW_PASSTHROUGH_MAX_IN_FLIGHT", "-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a negative slot count must not start the daemon")
 	}
 }

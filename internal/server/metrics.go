@@ -53,19 +53,21 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writeJSON(w, map[string]any{
-		"inFlight":           s.InFlight(),
-		"maxInFlight":        s.cfg.MaxInFlight,
-		"generation":         s.store.Generation(),
-		"reloadFailures":     s.store.ReloadFailures(),
-		"rejectedEntries":    s.store.RejectedEntries(),
-		"bodiesDropped":      s.bodies.Dropped(),
-		"requestsByStatus":   s.metrics.statusMap(),
-		"inputTokens":        s.metrics.inputTokens.Load(),
-		"outputTokens":       s.metrics.outputTokens.Load(),
-		"upstreamRetries":    s.metrics.upstreamRetries.Load(),
-		"upstreamFallbacks":  s.metrics.upstreamFallbacks.Load(),
-		"bodiesCaptured":     s.metrics.bodiesCaptured.Load(),
-		"spoolWriteFailures": s.metrics.spoolWriteFailures.Load(),
+		"inFlight":               s.InFlight(),
+		"maxInFlight":            s.cfg.MaxInFlight,
+		"passthroughInFlight":    s.PassthroughInFlight(),
+		"passthroughMaxInFlight": s.cfg.PassthroughMaxInFlight,
+		"generation":             s.store.Generation(),
+		"reloadFailures":         s.store.ReloadFailures(),
+		"rejectedEntries":        s.store.RejectedEntries(),
+		"bodiesDropped":          s.bodies.Dropped(),
+		"requestsByStatus":       s.metrics.statusMap(),
+		"inputTokens":            s.metrics.inputTokens.Load(),
+		"outputTokens":           s.metrics.outputTokens.Load(),
+		"upstreamRetries":        s.metrics.upstreamRetries.Load(),
+		"upstreamFallbacks":      s.metrics.upstreamFallbacks.Load(),
+		"bodiesCaptured":         s.metrics.bodiesCaptured.Load(),
+		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
 	})
 }
 

@@ -80,10 +80,21 @@ var (
 		"모델 서버 호출에 실패했습니다. 잠시 후 다시 시도해주세요."}
 	errUpstreamTimeout = apiError{http.StatusGatewayTimeout, "server_error", "upstream_timeout",
 		"모델 서버 응답이 제한 시간을 초과했습니다. 잠시 후 다시 시도해주세요."}
+	// The response cap, said out loud. io.LimitReader truncates silently, so
+	// without this the caller gets "the upstream sent something unparseable" —
+	// a server fault they cannot act on — for a response that was simply
+	// bigger than this service relays. The remedy is theirs, so it is named.
+	errPassthroughResponseTooLarge = apiError{http.StatusBadGateway, "server_error",
+		"upstream_response_too_large",
+		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
-		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions입니다."}
+		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, " +
+			"POST /v1/images, GET /v1/images/models, POST /v1/embeddings입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
+	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",
+		"streaming_not_supported",
+		"이 경로는 스트리밍을 지원하지 않습니다. stream을 빼고 요청해주세요."}
 )
 
 // retryAfterSeconds is the Retry-After each error carries, keyed by the code
@@ -122,6 +133,70 @@ func errParamNeedsCreditModel(name string) apiError {
 			". 유료 모델에서만 사용할 수 있습니다."}
 }
 
+// A model named by one of the vendor's server tools. Same public code and same
+// spool type as any other money-fence refusal — it is the same rule reaching a
+// different field — but the advice has to say where the name was, because the
+// caller did not put it in `model` and would not find it by looking there.
+func errToolModelNotAllowed(name string) apiError {
+	if name == "" || len(name) > maxPassthroughNameBytes {
+		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+			"이 API Key로는 tools가 지정한 모델을 사용할 수 없습니다. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key로는 tools가 지정한 " + name + "을(를) 사용할 수 없습니다. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
+// toolRefusalType names the tools refusal in the usage record. It reuses the
+// existing types rather than adding one: the contract already enumerates these,
+// and a refusal here is the same event as the same refusal one field over.
+func toolRefusalType(e apiError) string {
+	switch e.code {
+	case "endpoint_not_allowed":
+		return "endpoint_not_allowed"
+	case "model_not_allowed":
+		return "credit_model_not_allowed"
+	default:
+		return e.code
+	}
+}
+
+// A preset. It stands in for the model and its fallback list, so it reaches
+// past the money fence from outside the fields the fence reads, and it is
+// refused for every key because presets live on the platform's own vendor
+// account rather than the caller's.
+var errPresetNotAllowed = apiError{http.StatusBadRequest, "invalid_request_error",
+	"preset_not_supported",
+	"이 게이트웨이는 preset을 지원하지 않습니다. 모델 이름을 직접 지정해주세요."}
+
+// A router name on a key that carries a model fence. The generic refusal is
+// wrong here: the caller did not ask for a model somebody excluded, they asked
+// for a name that picks one later, and the remedy is to name a model rather
+// than to go and read a list.
+func errRouterModelNotAllowed(name string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 자동 선택 모델(" + name + ")을 쓸 수 없습니다. " +
+			"어떤 모델이 답할지 미리 알 수 없어 허용 여부를 판단할 수 없기 때문입니다. " +
+			"모델 이름을 직접 지정해주세요."}
+}
+
+// A fallback candidate the key may not be billed for. It names the entry
+// because the caller sent a list and cannot otherwise tell which one is the
+// problem, and the name is echoed back only when it is short enough to be a
+// real model name — the field is client input, and a refusal is no place to
+// reflect a kilobyte of it.
+func errCandidateModelNotAllowed(name string) apiError {
+	if name == "" || len(name) > maxPassthroughNameBytes {
+		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+			"이 API Key로는 대체 모델 목록(models)에 적힌 모델을 사용할 수 없습니다. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key로는 대체 모델 목록(models)의 " + name + "을(를) 사용할 수 없습니다. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
 func errUnsupportedParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
 		"지원하지 않는 파라미터입니다: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해주세요."}
@@ -130,6 +205,25 @@ func errUnsupportedParam(name string) apiError {
 func errInvalidParamValue(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
 		"파라미터 값이 올바르지 않습니다: " + name}
+}
+
+// The endpoint fence. 403 with a code of its own rather than a 404,
+// deliberately: the passthrough paths are public documentation, so hiding
+// their existence would buy nothing and would leave a student unable to tell
+// "my key was not granted this" from "this service has no such path" — two
+// states with completely different next actions.
+//
+// It names the capability rather than the path, because the grant is a
+// capability and that is the word an approver's screen shows; a student
+// quoting this refusal is then asking for the thing that can actually be
+// given. And it says how to get it. This is the one fence on the surface a
+// student cannot work around on their own — a refused model can be swapped
+// for another, a refused capability only an approver can grant — so a message
+// that only said no would leave them with nowhere to go.
+func errEndpointNotAllowed(label string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
+		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
+			"콘솔에서 이 기능을 신청하면 승인 후 사용할 수 있습니다."}
 }
 
 func errMissingParam(name string) apiError {

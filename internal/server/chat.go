@@ -43,6 +43,11 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 	// the guard into a billable request. Retired prefixes stay guarded too.
 	if doc.PassthroughRef == "" ||
 		snapshot.IsReservedModelName(publicName) ||
+		// A preset stands in for the model and its fallbacks, so a name
+		// carrying one is not a name this fence can judge. Guarded here rather
+		// than at the call sites because this is the one door every
+		// uncatalogued name goes through.
+		snapshot.IsPresetModelName(publicName) ||
 		len(publicName) > maxPassthroughNameBytes {
 		return nil
 	}
@@ -52,6 +57,222 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 		UpstreamModel: publicName,
 		BudgetAxis:    snapshot.AxisCredit,
 	}
+}
+
+// `route` is deliberately not fenced, and this is inference rather than a
+// verified fact. The vendor's current fallback and routing documents do not
+// mention the field at all — not in the examples, not in the settings tables —
+// so it reads as a retired one. The reasoning for leaving it open is that it
+// selects AMONG candidates and `models` is the only candidate list, so fencing
+// every entry of that list bounds whatever `route` can reach, and `route` with
+// no `models` has nothing to select from.
+//
+// Recorded as inference on purpose. A note that claimed this was checked would
+// be read as settled by the next person, and an unverified vendor behaviour
+// treated as settled is exactly what defeated this fence once already.
+//
+// candidateModelsField is the request field that names models the vendor may
+// serve INSTEAD of the one in `model`. The vendor's own documentation is
+// explicit that any error can trigger a fallback to the next entry and that
+// "requests are priced using the model that was ultimately used", so an entry
+// here is a model this key can be billed for.
+//
+// That makes it the money fence's business rather than the parameter surface's.
+// The fence is built on model identity — AllowsCreditModel judges one public
+// name — so a field that changes which model answers walks around it while
+// every record, the spool included, still shows the name that was judged.
+const candidateModelsField = "models"
+
+// fenceCandidateModels applies the money fence to every entry of that list,
+// returning the first entry that fails.
+//
+// Judging beats refusing here. Refusing the field would take back a capability
+// the vendor offers and this gateway has no reason to withhold; judging it
+// leaves fallback working between models the key may already use, which is
+// what the field is for. The body is parsed whole for `model` already, so the
+// extra cost is walking a short array.
+//
+// An unreadable list fails closed. A list this build cannot parse is one it
+// cannot fence, and forwarding it would hand the vendor candidates nobody
+// judged.
+func fenceCandidateModels(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, params map[string]json.RawMessage) (string, bool) {
+	raw, present := params[candidateModelsField]
+	if !present || string(bytes.TrimSpace(raw)) == "null" {
+		return "", true
+	}
+	var names []string
+	if json.Unmarshal(raw, &names) != nil {
+		return "", false
+	}
+	for _, name := range names {
+		if !allowsCandidateModel(doc, modelLookup, key, name) {
+			return name, false
+		}
+	}
+	return "", true
+}
+
+// allowsCandidateModel resolves one candidate exactly the way the request's own
+// `model` is resolved and applies the same two fences. Resolving it the same
+// way is the point: it is what keeps a reserved self-serve prefix out of the
+// list, so a typo in a curated name cannot leave for the vendor as a fallback
+// after being refused as a primary.
+func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, name string) bool {
+	// An empty candidate is refused rather than ignored. The primary `model`
+	// already refuses an empty string, and a list that quietly tolerates one is
+	// the asymmetry a fail-closed claim cannot afford — `[null]` decodes to
+	// exactly this.
+	if name == "" {
+		return false
+	}
+	// A preset in a candidate is the same refusal as a preset in `model`.
+	if snapshot.IsPresetModelName(name) {
+		return false
+	}
+	// A reserved self-serve name is never a candidate, catalogued or not. The
+	// list goes to the vendor, so such a name there is either a typo or our own
+	// naming leaving the platform; the catalogue lookup below would otherwise
+	// accept a TOKEN-axis row and hand it over, which is exactly the leak the
+	// primary path's prefix guard exists to stop.
+	if snapshot.IsReservedModelName(name) {
+		return false
+	}
+	m := modelLookup(name)
+	if m == nil {
+		m = passthroughModel(doc, name)
+	}
+	if m == nil {
+		return false
+	}
+	// The axis has to be checked, not inferred. AllowsCreditModel answers true
+	// for anything off the money axis — that is what makes it a money fence —
+	// so a candidate that resolves to a TOKEN-axis catalogue row would sail
+	// through every check here. Requiring the money axis closes that
+	// structurally rather than by naming the shapes that could reach it, and
+	// costs nothing: a self-hosted model is not something the vendor can serve,
+	// so it is meaningless as a fallback anyway.
+	if !m.CreditAxis() {
+		return false
+	}
+	return key.AllowsModel(m) && key.AllowsCreditModel(m)
+}
+
+// The vendor's server tools are the sixth channel, and they arrive inside
+// `tools` rather than beside it. A tool runs on the vendor's side during the
+// completion, and of the twelve it offers, four take a model of their own:
+// advisor consults a stronger model mid-generation, subagent delegates to a
+// smaller worker, fusion runs a panel plus an analyst, and image_generation
+// produces an image. The advisor's documentation says its model may be any
+// model on the platform and gives a tilde floating alias as the first example —
+// the shape closed everywhere else this round.
+//
+// image_generation is the one that matters most, because it runs on the chat
+// path and so reaches past the capability fence that governs the image routes.
+// Note that the vendor's overview table lists its second model as "None" while
+// its own detail page documents parameters.model with a default; the detail
+// page is the specific one and is what this follows. Somebody reading only the
+// overview will think this tool takes no model.
+//
+// These are judged rather than blocked, and judged by the same function the
+// fallback candidates go through — a tool that names a model this key may
+// already use is not a problem, and this way there is one rule with one more
+// place that applies it rather than a second rule to keep in step. A tool that
+// names no model passes untouched.
+//
+// WHAT THIS DELIBERATELY DOES NOT CATCH, so that it does not read as an
+// oversight: a tool of the vendor's that this build does not know, naming its
+// model through a parameter this build does not know, is forwarded unjudged.
+// Refusing unknown tools was considered and declined (operator, 2026-09-06).
+// The money is still bounded either way — the key's own credit limit is what
+// caps it, so nobody can spend past what was approved — and what leaks is only
+// which model that approved amount is spent on. While the deny list is a cost
+// control, that is the caller's own balance draining faster, and a caller who
+// gets this far is doing it on purpose.
+//
+// THE CONDITION THAT REVERSES IT: the moment a deny list carries policy rather
+// than cost — a vendor nobody may use, a model excluded for a reason that is
+// not price — the "their own balance" argument stops holding, because the harm
+// is then no longer the caller's to absorb. Revisit this the first time a deny
+// list is used that way.
+const toolsField = "tools"
+
+// serverToolPrefix marks the vendor's own tools. A caller's function tool
+// carries its schema under `function`, so its own "parameters" is a different
+// thing entirely and is deliberately not read here.
+const serverToolPrefix = "openrouter:"
+
+// imageGenerationTool produces an image from the chat path. It answers to the
+// image capability as well: a grant that is required to call the image route
+// and not required to reach the same work through a tool is not a grant.
+const imageGenerationTool = "openrouter:image_generation"
+
+// toolModelParams are the parameters through which a server tool names the
+// model it will call. A tool naming one some other way is forwarded unjudged —
+// see the decision recorded above; that is a choice, not a gap nobody noticed.
+var toolModelParams = []string{"model", "analysis_models"}
+
+// fenceServerTools judges every model a server tool names, and applies the
+// image capability to the tool that generates images. It returns the refusal to
+// send, or nil.
+func (s *Server) fenceServerTools(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, params map[string]json.RawMessage) *apiError {
+	raw, present := params[toolsField]
+	if !present || string(bytes.TrimSpace(raw)) == "null" {
+		return nil
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil {
+		// Unreadable is unfenceable, and this field can carry a model.
+		e := errInvalidParamValue(toolsField)
+		return &e
+	}
+	for _, rawTool := range tools {
+		var tool struct {
+			Type       string                     `json:"type"`
+			Parameters map[string]json.RawMessage `json:"parameters"`
+		}
+		if json.Unmarshal(rawTool, &tool) != nil {
+			e := errInvalidParamValue(toolsField)
+			return &e
+		}
+		if !strings.HasPrefix(strings.ToLower(tool.Type), serverToolPrefix) {
+			continue
+		}
+		if strings.EqualFold(tool.Type, imageGenerationTool) &&
+			!key.AllowsEndpoint(snapshot.EndpointImages) {
+			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
+			return &e
+		}
+		for _, name := range toolModelParams {
+			v, ok := tool.Parameters[name]
+			if !ok {
+				continue
+			}
+			// The vendor spells these both ways: one model, or a list.
+			var one string
+			if json.Unmarshal(v, &one) == nil {
+				if !allowsCandidateModel(doc, modelLookup, key, one) {
+					e := errToolModelNotAllowed(one)
+					return &e
+				}
+				continue
+			}
+			var many []string
+			if json.Unmarshal(v, &many) != nil {
+				e := errInvalidParamValue(toolsField)
+				return &e
+			}
+			for _, candidate := range many {
+				if !allowsCandidateModel(doc, modelLookup, key, candidate) {
+					e := errToolModelNotAllowed(candidate)
+					return &e
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // tokenAxisParams are the top-level request fields the gateway forwards for a
@@ -95,41 +316,29 @@ var tokenAxisParams = map[string]bool{
 	"parallel_tool_calls":   true,
 }
 
-// creditAxisParams is tokenAxisParams plus the fields only a paid model takes.
-// Built in init so the shared part cannot drift between the two.
+// creditOnlyParams are fields that are ordinary on the paid side and closed on
+// the self-hosted one. The set permits nothing: the money axis has no allowlist
+// at all, so no request is checked against a set there. It exists only to
+// classify a refusal on the self-hosted side.
+//
+// That classification is worth keeping on its own. Without it a caller sending
+// `reasoning_effort` to a self-hosted model hears "unknown field", which is
+// false and dead-ends them; with it they hear that the field works on a paid
+// model, which is the only clue they get about what to do next.
 //
 // `reasoning_effort` and `verbosity` are documented Chat Completions fields on
 // the commercial side, and agent tools set them on their own from model
-// metadata — so refusing them outright made every reasoning-capable paid model
-// unusable through this gateway, with nothing the caller could do about it.
-//
-// They stay closed on the self-hosted side for three reasons, none of which is
-// that the serving process would fail on them. Thinking there is disabled as a
-// server default and re-opening it is a service decision, not a per-request
-// one; a field that changes nothing would still read to the caller as if it
-// had; and a model whose fallback points at a commercial upstream would have
-// that upstream honour the field, putting reasoning tokens on the self-hosted
-// allowance. The axis is a property of the model, not of the upstream that
-// happens to answer.
-var creditAxisParams = map[string]bool{}
-
-func init() {
-	for name := range tokenAxisParams {
-		creditAxisParams[name] = true
-	}
-	creditAxisParams["reasoning_effort"] = true
-	creditAxisParams["verbosity"] = true
-}
-
-// allowedParamsFor answers which set governs this request. The caller must
-// have resolved the model first: the axis is a fact about the model the
-// request names, which lives inside the body, so nothing before the parse can
-// know it.
-func allowedParamsFor(model *snapshot.Model) map[string]bool {
-	if model.CreditAxis() {
-		return creditAxisParams
-	}
-	return tokenAxisParams
+// metadata. They stay closed on the self-hosted side for three reasons, none
+// of which is that the serving process would fail on them. Thinking there is
+// disabled as a server default and re-opening it is a service decision, not a
+// per-request one; a field that changes nothing would still read to the caller
+// as if it had; and a model whose fallback points at a commercial upstream
+// would have that upstream honour the field, putting reasoning tokens on the
+// self-hosted allowance. The axis is a property of the model, not of the
+// upstream that happens to answer.
+var creditOnlyParams = map[string]bool{
+	"reasoning_effort": true,
+	"verbosity":        true,
 }
 
 type usage struct {
@@ -255,6 +464,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errMissingParam("messages"), spool.StatusBadRequest)
 		return
 	}
+	// Checked before the model resolves, because a preset name resolves to
+	// nothing and would otherwise answer "no such model, see GET /v1/models" —
+	// advice that sends the caller to a list which cannot contain the answer.
+	if snapshot.IsPresetModelName(publicModel) {
+		refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
+		return
+	}
 	model := modelLookup(publicModel)
 	if model == nil {
 		model = passthroughModel(&doc, publicModel)
@@ -275,26 +491,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	case snapshot.AxisCredit:
 		ev.BudgetAxis = snapshot.AxisCredit
 	}
-	// The parameter surface is the first thing the axis decides. It runs here
-	// rather than before the model is read because the axis cannot be known
-	// any earlier, and it runs before the permission fences so that a
-	// malformed request still answers 400 rather than 403.
-	allowed := allowedParamsFor(model)
-	for name := range params {
-		if allowed[name] {
-			continue
-		}
-		if creditAxisParams[name] {
-			// Known field, wrong axis. Same public code as any other rejected
-			// field — one more code is one more thing every SDK has to learn
-			// for a fact it already handles — but different advice, and its
-			// own spool type so the two stay countable apart.
-			refuseAs(errParamNeedsCreditModel(name), spool.StatusBadRequest,
-				"credit_only_parameter")
+	// The parameter allowlist governs the TOKEN axis and nothing else.
+	//
+	// One machine used to run on both axes, and running on both hid the fact
+	// that it was doing two different jobs. On the self-hosted side it is the
+	// enforcement point for a service decision — thinking is off by default,
+	// with no per-request opt-in (see tokenAxisParams) — and the serving
+	// capacity it rations is the platform's own. On the money axis it was our
+	// convenience and nothing more: it refused fields the provider defines,
+	// on requests the student's own budget pays for, so every field it turned
+	// away was one the vendor would have served. Where the vendor accepts a
+	// request this gateway has no reason to be what refuses it.
+	//
+	// It still runs before the permission fences, so a malformed request
+	// answers 400 rather than 403, and it runs after the model is read because
+	// the axis is a fact about the model the body names.
+	if !model.CreditAxis() {
+		for name := range params {
+			if tokenAxisParams[name] {
+				continue
+			}
+			if creditOnlyParams[name] {
+				// Known field, wrong axis. Same public code as any other
+				// rejected field — one more code is one more thing every SDK
+				// has to learn for a fact it already handles — but different
+				// advice, and its own spool type so the two stay countable
+				// apart.
+				refuseAs(errParamNeedsCreditModel(name), spool.StatusBadRequest,
+					"credit_only_parameter")
+				return
+			}
+			refuse(errUnsupportedParam(name), spool.StatusBadRequest)
 			return
 		}
-		refuse(errUnsupportedParam(name), spool.StatusBadRequest)
-		return
 	}
 	if !key.AllowsModel(model) {
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
@@ -329,8 +558,41 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// errors.go). The spool gets its own error type so the two stay
 			// countable apart — otherwise nobody can tell how many callers hit
 			// this one.
+			//
+			// Re-reading the two predicates here decides only which message to
+			// send; the refusal itself was already decided above, and this
+			// branch cannot admit anything the fence turned away.
+			if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
+				refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
+					"router_model_not_allowed")
+				return
+			}
 			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
 				"credit_model_not_allowed")
+			return
+		}
+		// A preset carries its own model and fallback list, so it reaches past
+		// every check here from outside the fields they read. Refused rather
+		// than judged: presets live on the platform's vendor account, which
+		// every student key is issued under, so one created there is reachable
+		// by all of them.
+		if _, present := params[snapshot.PresetField]; present {
+			refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
+			return
+		}
+		// The same fence over the fallback candidates. Without this the field
+		// is a way around everything above it: the vendor may serve and bill
+		// any entry, while the fence, the spool and the student's own screen
+		// all keep showing the name that was judged.
+		if bad, ok := fenceCandidateModels(&doc, modelLookup, key, params); !ok {
+			refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
+				"credit_model_not_allowed")
+			return
+		}
+		// And over the models the vendor's own server tools name, which reach
+		// past everything above from inside `tools`.
+		if e := s.fenceServerTools(&doc, modelLookup, key, params); e != nil {
+			refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 			return
 		}
 		// Past the fence, the credential is the whole of the money axis: its
@@ -515,12 +777,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, charge, &ev, record, len(messagesRaw), capture)
+		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, charge, &ev, record, len(messagesRaw), capture)
 		return
 	}
 	s.finishStream(w, resp, streamArgs{
 		capture:      capture,
 		publicName:   model.PublicName,
+		sentModel:    model.UpstreamModel,
 		keyID:        key.KeyID,
 		charge:       charge,
 		inputBytes:   len(messagesRaw),
@@ -552,7 +815,26 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 // cost is a multiple of this, times the in-flight cap.
 const upstreamResponseCapBytes = 8 << 20
 
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
+// servedModelMismatch records that the vendor answered with a model other than
+// the one requested. The vendor falls back on its own and prices the request
+// using whatever it ultimately used, so this is a real event; the response's
+// model field is rewritten to the public name a line later, which makes this
+// the only place the fact exists at all.
+//
+// It is logged rather than spooled. The usage event has no field for a served
+// model, and adding one is a change the control plane has to accept first —
+// the same ordering that governed budgetAxis — so the log is what closes the
+// gap today.
+func (s *Server) noteServedModel(ev *spool.Event, requested, served string) {
+	if requested == "" || served == "" || strings.EqualFold(requested, served) {
+		return
+	}
+	s.log.Warn("upstream served a different model than requested",
+		"keyId", ev.KeyID, "publicModel", ev.PublicModelName,
+		"requested", requested, "served", served, "eventUuid", ev.EventUUID)
+}
+
+func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -596,7 +878,9 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		record()
 		return
 	}
-	if _, has := m["model"]; has {
+	if raw, has := m["model"]; has {
+		served, _ := raw.(string)
+		s.noteServedModel(ev, sentModel, served)
 		m["model"] = publicName
 	}
 	var u usage
@@ -659,6 +943,9 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 
 type streamArgs struct {
 	publicName string
+	// sentModel is the upstream model name this request asked for, so a
+	// vendor-side fallback can be noticed before the name is rewritten.
+	sentModel string
 	// keyID is for logging only; metering goes through charge, which already
 	// knows the key and whether this request's axis is metered at all.
 	keyID        string
@@ -705,6 +992,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	// parsing. An assembled payload that still does not parse is dropped, not
 	// forwarded: a verbatim chunk would leak the upstream model identifier.
 	var dataLines [][]byte
+	notedServed := false
 	flushEvent := func() bool {
 		if len(dataLines) == 0 {
 			return true
@@ -727,6 +1015,10 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			}
 			dropped++
 			return true
+		}
+		if !notedServed && c.servedModel != "" {
+			notedServed = true
+			s.noteServedModel(ev, a.sentModel, c.servedModel)
 		}
 		if c.usage != nil {
 			u = *c.usage
@@ -866,6 +1158,7 @@ func capRequest(raw json.RawMessage) (json.RawMessage, bool) {
 type chunk struct {
 	out          []byte
 	parsed       map[string]any
+	servedModel  string // the upstream's own model name, before it is rewritten
 	usage        *usage
 	content      string // this chunk's assistant text, for capture
 	contentChars int
@@ -894,7 +1187,8 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 		return chunk{}, false
 	}
 	c := chunk{parsed: m, choicesEmpty: true}
-	if _, has := m["model"]; has {
+	if raw, has := m["model"]; has {
+		c.servedModel, _ = raw.(string)
 		m["model"] = publicName
 	}
 	if uraw, has := m["usage"]; has && uraw != nil {
