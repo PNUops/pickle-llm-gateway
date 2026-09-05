@@ -618,9 +618,9 @@ func TestFenceNormalizationIsConsistent(t *testing.T) {
 	if !snapshot.IsRouterModelName("~~openrouter/auto") {
 		t.Fatal("a doubled tilde walked past the router prefix")
 	}
-	if !snapshot.MatchesCreditModel("anthropic/claude-opus-4.8", " anthropic/claude-opus-4.8") {
-		t.Fatal("a padded name walked past a deny entry")
-	}
+	// Asserted through the fence and not the matcher: the matcher's contract is
+	// that the name arrives normalized, and the console mirrors that function
+	// exactly. Trimming belongs to the caller, so that is where it is checked.
 	// The tilde strip belongs to the fence, not the matcher: the matcher keeps
 	// "~vendor/*" and "vendor/*" as separate prefixes on purpose, and it is
 	// AllowsCreditModel that tries the stripped name against the deny list. So
@@ -630,6 +630,10 @@ func TestFenceNormalizationIsConsistent(t *testing.T) {
 		"anthropic/claude-opus-4",
 		"~anthropic/claude-opus-latest",
 		"~~anthropic/claude-opus-latest",
+		// A passthrough model's name is synthesized from the request string, so
+		// padding is the caller's to send. A catalogue name never carries it.
+		" anthropic/claude-opus-4",
+		"anthropic/claude-opus-4 ",
 	} {
 		m := snapshot.Model{PublicName: name, BudgetAxis: snapshot.AxisCredit}
 		if denied.AllowsCreditModel(&m) {

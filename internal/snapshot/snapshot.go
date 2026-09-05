@@ -420,7 +420,19 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	if !m.CreditAxis() {
 		return true
 	}
-	name := strings.ToLower(m.PublicName)
+	// Normalized here, at the single door both lists go through, and not inside
+	// MatchesCreditModel. That function's contract is that the name reaches it
+	// already normalized, and the console keeps a 1:1 mirror of it — moving the
+	// trim inside would oblige that mirror to change in the same unit of work
+	// for a rule that is not the matcher's.
+	//
+	// It has to happen somewhere. Load normalizes the PATTERN
+	// (normalizeCreditPatterns trims and lower-cases it) while the NAME arrived
+	// untrimmed, and a comparison that normalizes one side always leaks this
+	// way. For a catalogue model the name is a server value and cannot carry
+	// padding; for a passthrough model it is synthesized from the request
+	// string, so it is the caller's, and this round is what opens that surface.
+	name := strings.ToLower(strings.TrimSpace(m.PublicName))
 	// A router name sidesteps both lists: whichever model it resolves to is
 	// what gets billed, and that model is chosen after this fence has run. A
 	// key carrying no fence loses nothing by being refused one — its money is
@@ -490,14 +502,6 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 	if pattern == "" || pattern == "*" {
 		return false
 	}
-	// The name is trimmed here rather than trusted. IsRouterModelName does the
-	// same, and the two guarding the same request from different sides while
-	// disagreeing about whitespace is how " anthropic/claude-opus-4.8" slipped
-	// a deny list. An allow list refuses the padded name anyway, so this only
-	// ever mattered on the side that takes away — which is the shape the plan
-	// calls the representative use.
-	lowerName = strings.TrimSpace(lowerName)
-
 	// A variant suffix (":nitro", ":batch", ":free") is the same model at
 	// another rate, so every exact comparison below is made against the bare
 	// name as well. The leading-star branch already did this and the exact ones
