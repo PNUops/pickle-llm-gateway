@@ -118,8 +118,21 @@ var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 // auto-beta, free, fusion, pareto-code and bodybuilder. Closing the vendor
 // closes whatever it adds next, without anyone having to notice in time.
 //
-// The cost is that a real model shipped under this vendor would be refused.
-// That is the safe direction, and the catalogue says there are none.
+// A real model CAN ship under this vendor, so the cost is not zero and the
+// earlier claim that the catalogue held none was wrong. The active catalogue
+// lists six, all of them selectors (the vendor marks each `tokenizer: Router`),
+// but openrouter/sherlock-think-alpha and openrouter/horizon-beta are real
+// models whose endpoints have simply been retired — they answer on the
+// per-model endpoint with real names and a tokenizer that is not Router.
+//
+// The rule stands anyway, on a different reason: refusing costs little. These
+// are stealth previews, normally free, and the refusal only ever falls on a key
+// that already carries a fence. Do not restore "there are none" — someone will
+// read it and unpick the prefix.
+//
+// The vendor does expose the discriminator this wants: `tokenizer: Router`
+// marks a selector and a real model does not carry it. The gateway has no
+// catalogue to read it from, which is the same gap the note below describes.
 const routerVendorPrefix = "openrouter/"
 
 // IsRouterModelName reports whether a public name selects a model rather than
@@ -140,7 +153,12 @@ func IsRouterModelName(publicName string) bool {
 	// single leading byte. A variant suffix is not stripped and needs no
 	// handling: ":nitro" is at the end and cannot move what a name starts with,
 	// which is one of the things a prefix buys over a set of exact names.
-	lower := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(publicName)), "~")
+	// TrimLeft and not TrimPrefix: one tilde stripped still leaves "~~name"
+	// starting with a tilde, and the prefix test would then miss it. Whether
+	// the vendor reads a doubled tilde is unverified — the catalogue answers
+	// 404 for one — but a guard that costs a character should not depend on
+	// that being true.
+	lower := strings.TrimLeft(strings.ToLower(strings.TrimSpace(publicName)), "~")
 	return strings.HasPrefix(lower, routerVendorPrefix)
 }
 
@@ -166,19 +184,24 @@ func IsPresetModelName(publicName string) bool {
 	return strings.Contains(publicName, presetMarker)
 }
 
-// A NOTE ON ALL OF THE ABOVE, worth reading before adding a sixth guard.
+// A NOTE ON ALL OF THE ABOVE, worth reading before adding a seventh guard.
 //
 // The money fence assumes one thing: that the name a request asks for is the
-// model that gets billed. Five separate channels have broken that assumption —
+// model that gets billed. Six separate channels have broken that assumption —
 // a repeated `model` member, the `models` fallback list, this vendor's router
-// namespace, the tilde floating aliases, and presets — and each arrived through
-// a different door. The guards here close those five. They do not close the
-// class, and nothing here can: the structural answer is to admit only names the
-// vendor's catalogue calls a concrete model, and the gateway does not have that
-// catalogue (the control plane does).
+// namespace, the tilde floating aliases, presets, and the vendor's server tools
+// naming a model inside `tools` — and each arrived through a different door.
 //
-// So when a sixth appears, the question is not which guard to add. It is
-// whether the catalogue belongs here.
+// The guards here close those six. THEY DO NOT CLOSE THE CLASS. The previous
+// version of this note said the same thing about five and was proved right
+// within the round, by the sixth. Nothing here can close it: the structural
+// answer is to admit only names the vendor's catalogue calls a concrete model,
+// and the gateway has no catalogue (the control plane does). The vendor marks
+// selectors `tokenizer: Router`, so the discriminator exists and is not
+// reachable from here.
+//
+// When a seventh appears, the question is not which guard to add. It is whether
+// the catalogue belongs here.
 
 // IsReservedModelName reports whether a public model name sits under a
 // reserved self-serve prefix, current or retired. Such a name is served only
@@ -195,7 +218,7 @@ func IsPresetModelName(publicName string) bool {
 // all, and one character defeated it.
 func IsReservedModelName(publicName string) bool {
 	lower := strings.ToLower(publicName)
-	lower = strings.TrimPrefix(lower, "~")
+	lower = strings.TrimLeft(lower, "~")
 	for _, p := range reservedModelPrefixes {
 		if strings.HasPrefix(lower, p) {
 			return true
@@ -432,7 +455,7 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	if matchesAnyCreditModel(k.CreditDeniedModels, name) {
 		return false
 	}
-	if stripped := strings.TrimPrefix(name, "~"); stripped != name {
+	if stripped := strings.TrimLeft(name, "~"); stripped != name {
 		return !matchesAnyCreditModel(k.CreditDeniedModels, stripped)
 	}
 	return true
@@ -467,6 +490,14 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 	if pattern == "" || pattern == "*" {
 		return false
 	}
+	// The name is trimmed here rather than trusted. IsRouterModelName does the
+	// same, and the two guarding the same request from different sides while
+	// disagreeing about whitespace is how " anthropic/claude-opus-4.8" slipped
+	// a deny list. An allow list refuses the padded name anyway, so this only
+	// ever mattered on the side that takes away — which is the shape the plan
+	// calls the representative use.
+	lowerName = strings.TrimSpace(lowerName)
+
 	// A variant suffix (":nitro", ":batch", ":free") is the same model at
 	// another rate, so every exact comparison below is made against the bare
 	// name as well. The leading-star branch already did this and the exact ones

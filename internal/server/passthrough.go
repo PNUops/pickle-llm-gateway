@@ -260,6 +260,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// AllowsCreditModel compares lower-cased strings without consulting
 			// the catalogue, so a name no catalogue lists is fenced exactly as
 			// it is on chat.
+			// See chat.go: a preset name resolves to nothing and must not come
+			// back as "no such model".
+			if snapshot.IsPresetModelName(publicModel) {
+				refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
+				return
+			}
 			model := passthroughModel(&doc, publicModel)
 			if model == nil {
 				// A reserved self-serve prefix, or a name too long to be one.
@@ -275,10 +281,6 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			if !key.AllowsCreditModel(model) {
 				// See chat.go: the two predicates are re-read only to pick the
 				// message, never to decide.
-				if snapshot.IsPresetModelName(publicModel) {
-					refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
-					return
-				}
 				if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
 					refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
 						"router_model_not_allowed")
@@ -304,6 +306,13 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				key, params); !ok {
 				refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
 					"credit_model_not_allowed")
+				return
+			}
+			// And the models the vendor's server tools name, for the reason
+			// given on chat.
+			if e := s.fenceServerTools(&doc, func(string) *snapshot.Model { return nil },
+				key, params); e != nil {
+				refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 				return
 			}
 			// Streaming is refused rather than forwarded. Every route this

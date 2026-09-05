@@ -2008,6 +2008,18 @@ func allAPIErrors() map[string]apiError {
 		"errUnsupportedParam(x)":  errUnsupportedParam("x"),
 		"errInvalidParamValue(x)": errInvalidParamValue("x"),
 		"errMissingParam(x)":      errMissingParam("x"),
+		// Added by the passthrough round. A new error that is not listed here
+		// is one the leak check never reads.
+		"errCreditPending":               errCreditPending,
+		"errPresetNotAllowed":            errPresetNotAllowed,
+		"errPassthroughNoStreaming":      errPassthroughNoStreaming,
+		"errPassthroughResponseTooLarge": errPassthroughResponseTooLarge,
+		"errEndpointNotAllowed(x)":       errEndpointNotAllowed("x"),
+		"errCandidateModelNotAllowed(x)": errCandidateModelNotAllowed("x"),
+		"errToolModelNotAllowed(x)":      errToolModelNotAllowed("x"),
+		"errRouterModelNotAllowed(x)":    errRouterModelNotAllowed("x"),
+		"errCreditModelNotAllowed":       errCreditModelNotAllowed,
+		"errParamNeedsCreditModel(x)":    errParamNeedsCreditModel("x"),
 	}
 }
 
@@ -2015,6 +2027,21 @@ func allAPIErrors() map[string]apiError {
 // test happens to trigger. The type set is OpenAI's because their SDKs branch
 // on it; the code is ours and has to be unique, or a client cannot tell two
 // refusals apart.
+// sharedCodes are the public codes more than one error deliberately answers
+// with. Each is a case where several causes are one fact to an SDK — the field
+// may not be sent, the model may not be used — and a second code would be one
+// more thing every client has to learn for something it already handles. The
+// advice differs in the message, and the usage record keeps its own type so the
+// causes stay countable apart.
+//
+// Listing them keeps the check useful: a collision on any other code is still a
+// mistake, and adding a code here is a decision somebody has to make on purpose
+// rather than a test quietly going quiet.
+var sharedCodes = map[string]bool{
+	"model_not_allowed":     true,
+	"unsupported_parameter": true,
+}
+
 func TestEveryAPIErrorIsWellFormed(t *testing.T) {
 	// The same set the single-error test used, kept in one place now.
 	okTypes := map[string]bool{
@@ -2035,7 +2062,7 @@ func TestEveryAPIErrorIsWellFormed(t *testing.T) {
 		if e.message == "" {
 			t.Errorf("%s: empty message", name)
 		}
-		if prev, dup := seenCode[e.code]; dup {
+		if prev, dup := seenCode[e.code]; dup && !sharedCodes[e.code] {
 			t.Errorf("%s and %s share the code %q; a client cannot tell them apart", name, prev, e.code)
 		}
 		seenCode[e.code] = name

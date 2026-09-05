@@ -197,6 +197,14 @@ func TestUnknownModelAnswersBeforeUnknownParameter(t *testing.T) {
 func creditPassthroughDoc(d *snapshot.Document) {
 	creditDoc(d)
 	d.PassthroughRef = "mock"
+	// A TOKEN-axis row whose name is NOT under a reserved prefix. Without one,
+	// every self-hosted name in a test is caught by the prefix guard first and
+	// the axis check behind it is unreachable — which is exactly what happened:
+	// deleting that check left the suite green.
+	d.Models = append(d.Models, snapshot.Model{
+		PublicName: "campus-x", UpstreamRef: "mock",
+		UpstreamModel: upstreamModel, BudgetAxis: snapshot.AxisToken,
+	})
 }
 
 // models[] names models the vendor may serve and bill INSTEAD of the one in
@@ -493,11 +501,17 @@ func TestExactDenyCatchesVariantSuffixes(t *testing.T) {
 // fence, because AllowsCreditModel answers true for anything off that axis.
 func TestCandidateMustBeOnTheMoneyAxis(t *testing.T) {
 	h := newHarness(t, creditPassthroughDoc, nil)
-	// pickle-general is a real catalogue row on the TOKEN axis.
-	body := `{"model":"vendor-model","messages":[],"models":["pickle-general"]}`
-	status, resp := h.chat(t, testToken, body)
-	if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
-		t.Fatalf("%d %s", status, resp)
+	// campus-x is a real catalogue row on the TOKEN axis and carries no
+	// reserved prefix, so it reaches the axis check instead of being stopped by
+	// the prefix guard ahead of it. pickle-general cannot test this: it is
+	// refused one guard earlier, which left the axis check unreachable and the
+	// suite green when it was deleted.
+	for _, candidate := range []string{"campus-x", "pickle-general"} {
+		body := `{"model":"vendor-model","messages":[],"models":["` + candidate + `"]}`
+		status, resp := h.chat(t, testToken, body)
+		if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+			t.Fatalf("%s: %d %s", candidate, status, resp)
+		}
 	}
 	// An empty candidate is refused rather than ignored; [null] decodes to it.
 	for _, list := range []string{`[""]`, `[null]`, `["openai/gpt-5",""]`} {
@@ -505,6 +519,121 @@ func TestCandidateMustBeOnTheMoneyAxis(t *testing.T) {
 		status, resp := h.chat(t, testToken, body)
 		if status != http.StatusForbidden {
 			t.Fatalf("%s: %d %s", list, status, resp)
+		}
+	}
+}
+
+// The vendor's server tools name models inside `tools`, which reaches past
+// every fence that reads the fields beside it. Judged by the same function the
+// fallback candidates use.
+func TestServerToolModelsAreFenced(t *testing.T) {
+	fenced := func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditDeniedModels = []string{"openai/*-pro", "anthropic/*"}
+		d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointImages}
+		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
+	}
+	for _, tc := range []struct{ name, tools string }{
+		{"advisor names a denied model",
+			`[{"type":"openrouter:advisor","parameters":{"model":"openai/o1-pro"}}]`},
+		// The vendor's own first example of this parameter is a tilde alias.
+		{"advisor names a floating alias",
+			`[{"type":"openrouter:advisor","parameters":{"model":"~anthropic/claude-opus-latest"}}]`},
+		{"a list of models",
+			`[{"type":"openrouter:fusion","parameters":{"analysis_models":["openai/gpt-5","openai/o1-pro"]}}]`},
+		{"a router as the tool's model",
+			`[{"type":"openrouter:advisor","parameters":{"model":"openrouter/auto"}}]`},
+		{"a preset as the tool's model",
+			`[{"type":"openrouter:advisor","parameters":{"model":"x@preset/s"}}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, fenced, nil)
+			body := `{"model":"vendor-model","messages":[],"tools":` + tc.tools + `}`
+			status, resp := h.chat(t, testToken, body)
+			if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+				t.Fatalf("%d %s", status, resp)
+			}
+			if msg := errMessage(t, resp); !strings.Contains(msg, "tools") {
+				t.Fatalf("the refusal has to say where the name was: %s", msg)
+			}
+			if h.mock.callCount() != 0 {
+				t.Fatal("reached the upstream")
+			}
+		})
+	}
+
+	// A tool naming a model the key may already use is not a problem, and a
+	// tool that names no model is untouched.
+	h := newHarness(t, fenced, nil)
+	for _, tools := range []string{
+		`[{"type":"openrouter:advisor","parameters":{"model":"openai/gpt-5"}}]`,
+		`[{"type":"openrouter:web_search"}]`,
+		`[{"type":"function","function":{"name":"f","parameters":{"model":"openai/o1-pro"}}}]`,
+	} {
+		body := `{"model":"vendor-model","messages":[],"tools":` + tools + `}`
+		if status, resp := h.chat(t, testToken, body); status != 200 {
+			t.Fatalf("%s: %d %s", tools, status, resp)
+		}
+	}
+}
+
+// Image generation runs on the chat path, so without this it produces images
+// for a key the capability fence never granted — the fence that the README
+// calls the one a student cannot work around.
+func TestImageGenerationToolAnswersToTheCapabilityFence(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil) // no passthroughEndpoints
+	body := `{"model":"vendor-model","messages":[],"tools":[{"type":"openrouter:image_generation"}]}`
+	status, resp := h.chat(t, testToken, body)
+	if status != http.StatusForbidden || errCode(t, resp) != "endpoint_not_allowed" {
+		t.Fatalf("%d %s", status, resp)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("an ungranted key generated an image through chat")
+	}
+	// Granted, it works — the fence is the grant, not the path.
+	h2 := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointImages}
+	}, nil)
+	if status, resp := h2.chat(t, testToken, body); status != 200 {
+		t.Fatalf("granted key: %d %s", status, resp)
+	}
+}
+
+// An unreadable tools field can carry a model, so it fails closed like the
+// candidate list does.
+func TestUnreadableToolsIsRefused(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	for _, tools := range []string{`"web_search"`, `[1]`, `{"a":1}`} {
+		body := `{"model":"vendor-model","messages":[],"tools":` + tools + `}`
+		if status, resp := h.chat(t, testToken, body); status != 400 {
+			t.Fatalf("%s: %d %s", tools, status, resp)
+		}
+	}
+}
+
+// Two normalizations that guard the same request from different sides must not
+// disagree about whitespace or a doubled tilde.
+func TestFenceNormalizationIsConsistent(t *testing.T) {
+	if !snapshot.IsRouterModelName("~~openrouter/auto") {
+		t.Fatal("a doubled tilde walked past the router prefix")
+	}
+	if !snapshot.MatchesCreditModel("anthropic/claude-opus-4.8", " anthropic/claude-opus-4.8") {
+		t.Fatal("a padded name walked past a deny entry")
+	}
+	// The tilde strip belongs to the fence, not the matcher: the matcher keeps
+	// "~vendor/*" and "vendor/*" as separate prefixes on purpose, and it is
+	// AllowsCreditModel that tries the stripped name against the deny list. So
+	// the assertion has to be made where the rule lives.
+	denied := snapshot.Key{CreditDeniedModels: []string{"anthropic/*"}}
+	for _, name := range []string{
+		"anthropic/claude-opus-4",
+		"~anthropic/claude-opus-latest",
+		"~~anthropic/claude-opus-latest",
+	} {
+		m := snapshot.Model{PublicName: name, BudgetAxis: snapshot.AxisCredit}
+		if denied.AllowsCreditModel(&m) {
+			t.Fatalf("%q walked past a deny entry", name)
 		}
 	}
 }

@@ -159,6 +159,98 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 	return key.AllowsModel(m) && key.AllowsCreditModel(m)
 }
 
+// The vendor's server tools are the sixth channel, and they arrive inside
+// `tools` rather than beside it. A tool runs on the vendor's side during the
+// completion and several of them call a model of their own: the advisor takes
+// `parameters.model` and its documentation says that may be any model on the
+// platform, with a tilde floating alias as the first example. Image generation
+// takes one too and runs on the chat path, which is how it reaches past the
+// capability fence that governs the image routes.
+//
+// These are judged rather than blocked, and judged by the same function the
+// fallback candidates go through — a tool that names a model this key may
+// already use is not a problem, and this way there is one rule with one more
+// place that applies it rather than a second rule to keep in step. A tool that
+// names no model passes untouched.
+const toolsField = "tools"
+
+// serverToolPrefix marks the vendor's own tools. A caller's function tool
+// carries its schema under `function`, so its own "parameters" is a different
+// thing entirely and is deliberately not read here.
+const serverToolPrefix = "openrouter:"
+
+// imageGenerationTool produces an image from the chat path. It answers to the
+// image capability as well: a grant that is required to call the image route
+// and not required to reach the same work through a tool is not a grant.
+const imageGenerationTool = "openrouter:image_generation"
+
+// toolModelParams are the parameters through which a server tool names the
+// model it will call. A tool of the vendor's that names one some other way
+// still slips past, which is the open half of this channel.
+var toolModelParams = []string{"model", "analysis_models"}
+
+// fenceServerTools judges every model a server tool names, and applies the
+// image capability to the tool that generates images. It returns the refusal to
+// send, or nil.
+func (s *Server) fenceServerTools(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, params map[string]json.RawMessage) *apiError {
+	raw, present := params[toolsField]
+	if !present || string(bytes.TrimSpace(raw)) == "null" {
+		return nil
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil {
+		// Unreadable is unfenceable, and this field can carry a model.
+		e := errInvalidParamValue(toolsField)
+		return &e
+	}
+	for _, rawTool := range tools {
+		var tool struct {
+			Type       string                     `json:"type"`
+			Parameters map[string]json.RawMessage `json:"parameters"`
+		}
+		if json.Unmarshal(rawTool, &tool) != nil {
+			e := errInvalidParamValue(toolsField)
+			return &e
+		}
+		if !strings.HasPrefix(strings.ToLower(tool.Type), serverToolPrefix) {
+			continue
+		}
+		if strings.EqualFold(tool.Type, imageGenerationTool) &&
+			!key.AllowsEndpoint(snapshot.EndpointImages) {
+			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
+			return &e
+		}
+		for _, name := range toolModelParams {
+			v, ok := tool.Parameters[name]
+			if !ok {
+				continue
+			}
+			// The vendor spells these both ways: one model, or a list.
+			var one string
+			if json.Unmarshal(v, &one) == nil {
+				if !allowsCandidateModel(doc, modelLookup, key, one) {
+					e := errToolModelNotAllowed(one)
+					return &e
+				}
+				continue
+			}
+			var many []string
+			if json.Unmarshal(v, &many) != nil {
+				e := errInvalidParamValue(toolsField)
+				return &e
+			}
+			for _, candidate := range many {
+				if !allowsCandidateModel(doc, modelLookup, key, candidate) {
+					e := errToolModelNotAllowed(candidate)
+					return &e
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // tokenAxisParams are the top-level request fields the gateway forwards for a
 // self-hosted model. An unknown field is refused rather than silently
 // forwarded, so replacing the upstream can never silently change what student
@@ -348,6 +440,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errMissingParam("messages"), spool.StatusBadRequest)
 		return
 	}
+	// Checked before the model resolves, because a preset name resolves to
+	// nothing and would otherwise answer "no such model, see GET /v1/models" —
+	// advice that sends the caller to a list which cannot contain the answer.
+	if snapshot.IsPresetModelName(publicModel) {
+		refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
+		return
+	}
 	model := modelLookup(publicModel)
 	if model == nil {
 		model = passthroughModel(&doc, publicModel)
@@ -439,10 +538,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// Re-reading the two predicates here decides only which message to
 			// send; the refusal itself was already decided above, and this
 			// branch cannot admit anything the fence turned away.
-			if snapshot.IsPresetModelName(publicModel) {
-				refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
-				return
-			}
 			if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
 				refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
 					"router_model_not_allowed")
@@ -468,6 +563,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if bad, ok := fenceCandidateModels(&doc, modelLookup, key, params); !ok {
 			refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
 				"credit_model_not_allowed")
+			return
+		}
+		// And over the models the vendor's own server tools name, which reach
+		// past everything above from inside `tools`.
+		if e := s.fenceServerTools(&doc, modelLookup, key, params); e != nil {
+			refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 			return
 		}
 		// Past the fence, the credential is the whole of the money axis: its

@@ -133,6 +133,35 @@ func errParamNeedsCreditModel(name string) apiError {
 			". 유료 모델에서만 사용할 수 있습니다."}
 }
 
+// A model named by one of the vendor's server tools. Same public code and same
+// spool type as any other money-fence refusal — it is the same rule reaching a
+// different field — but the advice has to say where the name was, because the
+// caller did not put it in `model` and would not find it by looking there.
+func errToolModelNotAllowed(name string) apiError {
+	if name == "" || len(name) > maxPassthroughNameBytes {
+		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+			"이 API Key로는 tools가 지정한 모델을 사용할 수 없습니다. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key로는 tools가 지정한 " + name + "을(를) 사용할 수 없습니다. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
+// toolRefusalType names the tools refusal in the usage record. It reuses the
+// existing types rather than adding one: the contract already enumerates these,
+// and a refusal here is the same event as the same refusal one field over.
+func toolRefusalType(e apiError) string {
+	switch e.code {
+	case "endpoint_not_allowed":
+		return "endpoint_not_allowed"
+	case "model_not_allowed":
+		return "credit_model_not_allowed"
+	default:
+		return e.code
+	}
+}
+
 // A preset. It stands in for the model and its fallback list, so it reaches
 // past the money fence from outside the fields the fence reads, and it is
 // refused for every key because presets live on the platform's own vendor
