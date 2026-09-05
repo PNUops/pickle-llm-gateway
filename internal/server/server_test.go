@@ -49,8 +49,20 @@ type upstreamMock struct {
 	mu       sync.Mutex
 	lastBody map[string]json.RawMessage
 	lastAuth string
-	opts     mockOpts
-	calls    int
+	// The passthrough surface reaches paths other than /chat/completions, and
+	// what it forwards (and does not forward) is part of its contract.
+	lastPath    string
+	lastMethod  string
+	lastHeaders http.Header
+	lastRaw     []byte
+	opts        mockOpts
+	calls       int
+}
+
+func (u *upstreamMock) lastRequest() (path, method string, hdr http.Header, raw []byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.lastPath, u.lastMethod, u.lastHeaders, u.lastRaw
 }
 
 // callCount is how many requests reached the upstream. A test that asserts
@@ -81,12 +93,40 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	u.lastBody = params
 	u.lastAuth = r.Header.Get("Authorization")
+	u.lastPath = r.URL.Path
+	u.lastMethod = r.Method
+	u.lastHeaders = r.Header.Clone()
+	u.lastRaw = body
 	u.calls++
 	cp := u.opts
 	u.mu.Unlock()
 
 	if cp.delay > 0 {
 		time.Sleep(cp.delay)
+	}
+	// Anything that is not chat completions is the passthrough surface. The
+	// two usage namings below are deliberate: the vendor does not use one
+	// spelling across every route, and the gateway has to meter both.
+	if r.URL.Path != "/chat/completions" {
+		if cp.status != 0 && cp.status != http.StatusOK {
+			w.WriteHeader(cp.status)
+			_, _ = io.WriteString(w, cp.errBody)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case cp.rawResp != "":
+			_, _ = io.WriteString(w, cp.rawResp)
+		case cp.noUsage:
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"b64_json":"aGk="}]}`)
+		case r.URL.Path == "/embeddings":
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":9,"completion_tokens":0,"total_tokens":9}}`)
+		case r.URL.Path == "/images/models":
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"openai/gpt-image-1"}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"b64_json":"aGk="}],"usage":{"input_tokens":11,"output_tokens":3,"total_tokens":14,"cost":0.04}}`)
+		}
+		return
 	}
 	if cp.failNext > 0 {
 		u.mu.Lock()
@@ -216,9 +256,17 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		UpstreamHeaderWait:  5 * time.Second,
 		RequestMaxDuration:  30 * time.Second,
 		MaxInFlight:         16,
-		DefaultRpm:          1000,
-		DefaultTpm:          1_000_000,
-		DefaultConcurrency:  8,
+		// The passthrough surface fails closed on a zero slot count, so a
+		// harness that left these unset would 503 every passthrough test for
+		// the wrong reason.
+		PassthroughRequestBodyMaxBytes: 1 << 20,
+		PassthroughResponseMaxBytes:    1 << 20,
+		PassthroughHeaderWait:          5 * time.Second,
+		PassthroughMaxInFlight:         4,
+		PassthroughMaxN:                4,
+		DefaultRpm:                     1000,
+		DefaultTpm:                     1_000_000,
+		DefaultConcurrency:             8,
 		Upstreams: map[string]config.Upstream{
 			"mock": {Ref: "mock", BaseURL: up.URL, APIKey: upstreamCred, CapField: "max_completion_tokens"},
 		},
@@ -762,7 +810,9 @@ func TestHealthzAndUnknownPath(t *testing.T) {
 		t.Fatalf("healthz: %d %s", resp.StatusCode, raw)
 	}
 
-	resp2, err := http.Get(h.gw.URL + "/v1/embeddings")
+	// Deliberately out of scope, and it has to stay that way: audio has no
+	// usage in its response, so opening it would meter invented numbers.
+	resp2, err := http.Get(h.gw.URL + "/v1/audio/speech")
 	if err != nil {
 		t.Fatal(err)
 	}
