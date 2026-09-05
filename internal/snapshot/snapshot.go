@@ -75,6 +75,20 @@ const (
 	AxisCredit = "CREDIT"
 )
 
+// Passthrough capabilities. A key's passthroughEndpoints list names these, and
+// each one governs the routes the passthrough surface opens for it — they are
+// capabilities rather than paths, so a vendor adding a sub-path under one
+// already granted does not need a new token, and an approver reads a word
+// rather than a URL.
+//
+// The vocabulary is the control plane's to define; the gateway only ever asks
+// about a capability it actually routes, which is why an unrecognized token in
+// a document can open nothing here and is carried through untouched.
+const (
+	EndpointImages     = "images"
+	EndpointEmbeddings = "embeddings"
+)
+
 // reservedModelPrefixes are the prefixes reserved for curated self-serve
 // model names: the current one first ("pickle-"), then prefixes retired by a
 // rename ("pnu-", retired 2026-08-25) that stay guarded so a stale name in
@@ -185,8 +199,24 @@ type Key struct {
 	// carrying neither list is unfenced and a key carrying only this one is
 	// fenced out of just these names.
 	CreditDeniedModels []string `json:"creditDeniedModels,omitempty"`
-	Limits             Limits   `json:"limits"`
-	QuotaExhausted     bool     `json:"quotaExhausted,omitempty"`
+	// PassthroughEndpoints is the closed-vocabulary list of passthrough
+	// capabilities this key may reach — see the Endpoint* constants.
+	//
+	// EMPTY MEANS NONE, the exact opposite of the two money lists above, and
+	// the asymmetry is deliberate. Those lists narrow a surface every key
+	// already has; this one is the surface itself, and a path nobody granted
+	// must not open by the mere act of the gateway learning to serve it. So an
+	// absent member decodes to nil, nil has length zero, and length zero is
+	// closed — which is also the right reading of a control plane too old to
+	// send the member at all, since a gateway too old to read it does not
+	// serve these routes either.
+	//
+	// Nothing here governs chat completions or the model catalogue: those keep
+	// the fences they already have, so this list can never take away something
+	// a key has today.
+	PassthroughEndpoints []string `json:"passthroughEndpoints,omitempty"`
+	Limits               Limits   `json:"limits"`
+	QuotaExhausted       bool     `json:"quotaExhausted,omitempty"`
 	// UpstreamCredentials maps an upstream ref (lowercased at load) to the
 	// bearer this key must use there. CREDIT-axis models require an entry for
 	// the serving upstream — there is deliberately no fallback to the
@@ -231,6 +261,22 @@ func (k *Key) CredentialFor(ref string) string {
 		return ""
 	}
 	return k.UpstreamCredentials[strings.ToLower(ref)]
+}
+
+// AllowsEndpoint reports whether the key was granted one passthrough
+// capability. An empty list allows nothing — see PassthroughEndpoints for why
+// this fence defaults closed where the money lists default open.
+//
+// The caller passes one of the Endpoint* constants, never a client-supplied
+// string, so a document entry this build does not recognize cannot match
+// anything and needs no filtering at load.
+func (k *Key) AllowsEndpoint(capability string) bool {
+	for _, granted := range k.PassthroughEndpoints {
+		if granted == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // AllowsModel reports whether the key may use the model. An empty allow list
@@ -780,6 +826,20 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			}
 			continue
 		}
+		// The endpoint fence is normalized but never fatal, and that is the
+		// mirror image of the money lists above. There, an entry this build
+		// cannot read would shrink a list toward empty and empty means
+		// unrestricted, so the whole key has to go. Here empty means closed:
+		// an entry that shrinks away takes a capability off the key, which is
+		// the safe direction, and dropping the key over it would deny chat as
+		// well over a passthrough capability the key may never have used.
+		//
+		// So an unrecognized token is kept as-is rather than filtered. The
+		// vocabulary belongs to the control plane; a token this build does not
+		// route is matched by nothing, and keeping it means a newer control
+		// plane can add one without a second copy of the closed set living
+		// here and going stale.
+		k.PassthroughEndpoints = normalizeEndpoints(k.PassthroughEndpoints)
 		reason := keyProblem(&k, i, st.byHash)
 		if reason != "" {
 			if derr := drop("%s", reason); derr != nil {
@@ -804,6 +864,29 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 	st.rejected = len(dropped)
 	st.dropReasons = dropped
 	return st, nil
+}
+
+// normalizeEndpoints lower-cases, trims and de-duplicates a key's passthrough
+// capability list, dropping blanks. It cannot fail: see the call site for why
+// this list is normalized rather than validated.
+func normalizeEndpoints(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(tokens))
+	out := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		lower := strings.ToLower(strings.TrimSpace(token))
+		if lower == "" || seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		out = append(out, lower)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // normalizeCreditPatterns lower-cases and trims one money list, returning the
