@@ -65,6 +65,36 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 축은 모델 행의 속성이지 업스트림 종류가 아니므로, 같은 모델의 업스트림을 교체해도
 축은 바뀌지 않습니다.
 
+**요청 본문의 최상위 필드도 축이 정합니다.** 목록에 없는 이름은 무시가 아니라 거절
+(`unsupported_parameter`, 400)입니다. 조용히 흘리면 업스트림을 교체할 때 학생 코드가 보낼 수
+있는 것이 소리 없이 바뀝니다.
+
+두 축이 공통으로 받는 열일곱은 이렇습니다.
+
+```
+model  messages  stream  stream_options  max_tokens  max_completion_tokens
+temperature  top_p  stop  presence_penalty  frequency_penalty  seed  user
+response_format  tools  tool_choice  parallel_tool_calls
+```
+
+**CREDIT 축은 여기에 `reasoning_effort`와 `verbosity` 둘을 더 받습니다.** 상용 공급자가
+문서화한 필드이고, 에이전트 도구가 모델 정보를 보고 스스로 붙입니다. 그래서 이 둘을 막으면
+추론 가능한 상용 모델이 이 게이트웨이로는 전부 못 쓰게 되고, 호출자가 할 수 있는 일이
+없습니다.
+
+**TOKEN 축에서는 그 둘이 계속 거절됩니다.** `chat_template_kwargs`와
+`thinking_token_budget`도 마찬가지입니다. 서빙 프로세스가 그 필드에 실패하기 때문이 아닙니다.
+실측하면 `reasoning_effort`를 받아들이고 사고를 켜서 답을 `content`에서 `reasoning`으로
+옮깁니다. **자체 서빙의 사고를 요청 단위로 열지 않는다는 것이 운영 결정이고, 이 목록이 그
+결정의 집행 지점입니다.** 사고를 켜면 완성 토큰이 자릿수 단위로 늘고 그 비용은 공용 토큰
+한도가 받습니다. 또 폴백이 상용 업스트림을 가리키는 순간 그쪽은 그 필드를 존중하므로,
+자체 서빙 한도에 추론 토큰이 실립니다.
+
+**축은 모델의 속성이므로 검사도 모델을 읽은 뒤에 돕니다.** 요청 모양 오류가 권한 오류보다
+먼저 오도록, 허용 목록 검사는 축을 안 직후이자 Key의 모델 접근 검사 직전입니다. TOKEN 축에
+상용 전용 필드를 보내면 공개 코드는 같은 `unsupported_parameter`이고 안내 문구만 다릅니다.
+코드를 하나 더 만들면 모든 SDK가 이미 다루는 사실을 위해 새 이름을 하나 더 배워야 합니다.
+
 자격증명이 없는 이유는 두 가지이고 거절도 둘로 나뉩니다. 금액 한도를 받은 적이 없으면
 `credit_unavailable`(403)이고, 한도는 부여됐는데 그 Key의 업스트림 자격증명이 아직
 만들어지지 않았으면 `credit_pending`(503)입니다. 뒤쪽은 관리 API가 문서에
