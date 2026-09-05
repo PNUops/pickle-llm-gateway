@@ -32,6 +32,12 @@ func TestMatchesCreditModel(t *testing.T) {
 		{"openai/gpt-5-*", "openai/gpt-5:batch", false},
 		// Written without the separator, the prefix covers the variants.
 		{"openai/gpt-5*", "openai/gpt-5:batch", true},
+		// The star stands for nothing at all as readily as for something, the
+		// way a glob's does. Without this the wider-looking pattern was the
+		// narrower one: "openai/gpt-5-*" reaches gpt-5 through the separator
+		// rule, so "openai/gpt-5*" not reaching it read as a bug to anyone
+		// writing the two side by side.
+		{"openai/gpt-5*", "openai/gpt-5", true},
 		{"openai/gpt-5-*", "openai/gpt-4o", false},
 		// A leading star names a family by how its names end.
 		{"openai/*-pro", "openai/gpt-5-pro", true},
@@ -55,6 +61,10 @@ func TestMatchesCreditModel(t *testing.T) {
 		// A bare star matches nothing on purpose: "everything" is an empty
 		// list, and a second spelling of one state is how state counts grow.
 		{"*", "openai/gpt-4o", false},
+		// Including against the name "*" itself. A caller can send any string
+		// as a model name, and passthrough would synthesize a model called
+		// exactly that, so reading the pattern as a name here is the one way a
+		// bare star could still match something.
 		{"*", "*", false},
 		{"", "openai/gpt-4o", false},
 		// A name with no vendor segment still works as an exact entry.

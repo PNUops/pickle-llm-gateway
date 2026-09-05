@@ -79,7 +79,7 @@ func TestUnusableCreditDenyPatternDropsTheKey(t *testing.T) {
 		body := fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
 		  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
 		  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
-		           "credit_denied_models":[%s]}]}`, hash, entry)
+		           "creditDeniedModels":[%s]}]}`, hash, entry)
 		s := openDoc(t, body)
 
 		_, byHash, _ := s.Current()
@@ -103,7 +103,7 @@ func TestWildcardPatternsSurviveLoad(t *testing.T) {
 	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
 	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
 	           "creditAllowedModels":["openai/gpt-5-*","~openai/*"],
-	           "credit_denied_models":["openai/*-pro","openai/o1*"]}]}`, hash)
+	           "creditDeniedModels":["openai/*-pro","openai/o1*"]}]}`, hash)
 	s := openDoc(t, body)
 
 	_, byHash, _ := s.Current()
@@ -126,6 +126,51 @@ func TestWildcardPatternsSurviveLoad(t *testing.T) {
 	}
 }
 
+// The deny list is read from the document under exactly one name, and this is
+// what a document that spells it any other way does: nothing. Unknown fields in
+// a key entry are ignored on purpose, so a misspelling does not fail the load —
+// it arrives as an empty list, and an empty deny list denies nothing. The
+// models somebody closed are open again while every screen still shows them
+// closed, which is the worst shape this round can fail in.
+//
+// The mistake this pins is a real one: the database column is snake_case and
+// the document field is not, so the column name is the misspelling that comes
+// to hand. It is written here as a document the loader accepts and a fence that
+// then does not hold.
+//
+// Nothing else in this repository can catch it. The matcher tests are handed
+// patterns directly and never see a document at all, and the server tests are
+// worse than useless here: they build a Document as a Go value and marshal it
+// with the same struct tags they read it back through, so the two sides always
+// agree whatever the tag says. A green server package is not evidence that the
+// name matches what the writer sends — only a document written out by hand, as
+// below, is.
+func TestMisspelledDenyFieldFencesNothing(t *testing.T) {
+	hash := HashToken("misspelled")
+	body := fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
+	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
+	           "credit_denied_models":["openai/o1-pro"]}]}`, hash)
+	s := openDoc(t, body)
+
+	_, byHash, _ := s.Current()
+	key := byHash(hash)
+	if key == nil {
+		t.Fatal("the key was dropped; an unknown field in a key entry is ignored, " +
+			"not refused, which is what makes this failure a silent one")
+	}
+	if len(key.CreditDeniedModels) != 0 {
+		t.Fatalf("a field named credit_denied_models filled the deny list: %v — "+
+			"the document field is creditDeniedModels, and if that changed here "+
+			"it has to change on the side that writes the document too",
+			key.CreditDeniedModels)
+	}
+	if !key.AllowsCreditModel(creditModel("openai/o1-pro")) {
+		t.Fatal("a misspelled field denied a model, so the name this loader reads " +
+			"is no longer the one the writer is being told to send")
+	}
+}
+
 // Deny entries are lower-cased and trimmed at load like allow entries, so a
 // control plane that skipped normalization gets a working fence instead of one
 // that silently matches nothing — which on this list means denying nothing.
@@ -134,7 +179,7 @@ func TestCreditDenyPatternsNormalizeAtLoad(t *testing.T) {
 	body := fmt.Sprintf(`{"generation":1,"serviceEnabled":true,
 	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
 	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
-	           "credit_denied_models":["OpenAI/*-PRO"," anthropic/claude-opus-4 "]}]}`, hash)
+	           "creditDeniedModels":["OpenAI/*-PRO"," anthropic/claude-opus-4 "]}]}`, hash)
 	s := openDoc(t, body)
 
 	_, byHash, _ := s.Current()

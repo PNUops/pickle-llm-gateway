@@ -184,7 +184,7 @@ type Key struct {
 	// Empty means this axis restricts nothing, like the field above, so a key
 	// carrying neither list is unfenced and a key carrying only this one is
 	// fenced out of just these names.
-	CreditDeniedModels []string `json:"credit_denied_models,omitempty"`
+	CreditDeniedModels []string `json:"creditDeniedModels,omitempty"`
 	Limits             Limits   `json:"limits"`
 	QuotaExhausted     bool     `json:"quotaExhausted,omitempty"`
 	// UpstreamCredentials maps an upstream ref (lowercased at load) to the
@@ -325,9 +325,13 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 		// "openai/*-pro" was meant to reach a model called plainly "pro".
 	case strings.HasSuffix(seg, "*"):
 		// A trailing star is a prefix, and a prefix already covers the variant
-		// suffixes, so it needs none of the handling above.
+		// suffixes, so it needs none of the handling above. The star also
+		// stands for nothing at all, as a glob's does: "openai/gpt-5*" reaches
+		// gpt-5 itself. Requiring at least one character made the wider-looking
+		// pattern the narrower one — "openai/gpt-5-*" reached gpt-5 through the
+		// separator rule below while "openai/gpt-5*" did not.
 		stem := seg[:len(seg)-1]
-		if strings.HasPrefix(rest, stem) && len(rest) > len(stem) {
+		if strings.HasPrefix(rest, stem) {
 			return true
 		}
 		// "openai/gpt-5-*" is written to name the gpt-5 family, and the family
@@ -768,7 +772,7 @@ func build(raw []byte, known map[string]bool, fromControl bool) (*state, error) 
 			k.CreditAllowedModels, k.KeyID, "creditAllowedModels")
 		if listProblem == "" {
 			k.CreditDeniedModels, listProblem = normalizeCreditPatterns(
-				k.CreditDeniedModels, k.KeyID, "credit_denied_models")
+				k.CreditDeniedModels, k.KeyID, "creditDeniedModels")
 		}
 		if listProblem != "" {
 			if derr := drop("%s", listProblem); derr != nil {
