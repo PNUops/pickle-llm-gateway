@@ -54,6 +54,73 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 	}
 }
 
+// candidateModelsField is the request field that names models the vendor may
+// serve INSTEAD of the one in `model`. The vendor's own documentation is
+// explicit that any error can trigger a fallback to the next entry and that
+// "requests are priced using the model that was ultimately used", so an entry
+// here is a model this key can be billed for.
+//
+// That makes it the money fence's business rather than the parameter surface's.
+// The fence is built on model identity — AllowsCreditModel judges one public
+// name — so a field that changes which model answers walks around it while
+// every record, the spool included, still shows the name that was judged.
+const candidateModelsField = "models"
+
+// fenceCandidateModels applies the money fence to every entry of that list,
+// returning the first entry that fails.
+//
+// Judging beats refusing here. Refusing the field would take back a capability
+// the vendor offers and this gateway has no reason to withhold; judging it
+// leaves fallback working between models the key may already use, which is
+// what the field is for. The body is parsed whole for `model` already, so the
+// extra cost is walking a short array.
+//
+// An unreadable list fails closed. A list this build cannot parse is one it
+// cannot fence, and forwarding it would hand the vendor candidates nobody
+// judged.
+func fenceCandidateModels(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, params map[string]json.RawMessage) (string, bool) {
+	raw, present := params[candidateModelsField]
+	if !present || string(bytes.TrimSpace(raw)) == "null" {
+		return "", true
+	}
+	var names []string
+	if json.Unmarshal(raw, &names) != nil {
+		return "", false
+	}
+	for _, name := range names {
+		if !allowsCandidateModel(doc, modelLookup, key, name) {
+			return name, false
+		}
+	}
+	return "", true
+}
+
+// allowsCandidateModel resolves one candidate exactly the way the request's own
+// `model` is resolved and applies the same two fences. Resolving it the same
+// way is the point: it is what keeps a reserved self-serve prefix out of the
+// list, so a typo in a curated name cannot leave for the vendor as a fallback
+// after being refused as a primary.
+func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, name string) bool {
+	// A reserved self-serve name is never a candidate, catalogued or not. The
+	// list goes to the vendor, so such a name there is either a typo or our own
+	// naming leaving the platform; the catalogue lookup below would otherwise
+	// accept a TOKEN-axis row and hand it over, which is exactly the leak the
+	// primary path's prefix guard exists to stop.
+	if snapshot.IsReservedModelName(name) {
+		return false
+	}
+	m := modelLookup(name)
+	if m == nil {
+		m = passthroughModel(doc, name)
+	}
+	if m == nil {
+		return false
+	}
+	return key.AllowsModel(m) && key.AllowsCreditModel(m)
+}
+
 // tokenAxisParams are the top-level request fields the gateway forwards for a
 // self-hosted model. An unknown field is refused rather than silently
 // forwarded, so replacing the upstream can never silently change what student
@@ -334,6 +401,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				"credit_model_not_allowed")
 			return
 		}
+		// The same fence over the fallback candidates. Without this the field
+		// is a way around everything above it: the vendor may serve and bill
+		// any entry, while the fence, the spool and the student's own screen
+		// all keep showing the name that was judged.
+		if bad, ok := fenceCandidateModels(&doc, modelLookup, key, params); !ok {
+			refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
+				"credit_model_not_allowed")
+			return
+		}
 		// Past the fence, the credential is the whole of the money axis: its
 		// issuer holds the limit, so a key granted no money budget simply
 		// carries none. No per-key limit of ours applies on this side.
@@ -516,12 +592,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, charge, &ev, record, len(messagesRaw), capture)
+		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, charge, &ev, record, len(messagesRaw), capture)
 		return
 	}
 	s.finishStream(w, resp, streamArgs{
 		capture:      capture,
 		publicName:   model.PublicName,
+		sentModel:    model.UpstreamModel,
 		keyID:        key.KeyID,
 		charge:       charge,
 		inputBytes:   len(messagesRaw),
@@ -553,7 +630,26 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 // cost is a multiple of this, times the in-flight cap.
 const upstreamResponseCapBytes = 8 << 20
 
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
+// servedModelMismatch records that the vendor answered with a model other than
+// the one requested. The vendor falls back on its own and prices the request
+// using whatever it ultimately used, so this is a real event; the response's
+// model field is rewritten to the public name a line later, which makes this
+// the only place the fact exists at all.
+//
+// It is logged rather than spooled. The usage event has no field for a served
+// model, and adding one is a change the control plane has to accept first —
+// the same ordering that governed budgetAxis — so the log is what closes the
+// gap today.
+func (s *Server) noteServedModel(ev *spool.Event, requested, served string) {
+	if requested == "" || served == "" || strings.EqualFold(requested, served) {
+		return
+	}
+	s.log.Warn("upstream served a different model than requested",
+		"keyId", ev.KeyID, "publicModel", ev.PublicModelName,
+		"requested", requested, "served", served, "eventUuid", ev.EventUUID)
+}
+
+func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -597,7 +693,9 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		record()
 		return
 	}
-	if _, has := m["model"]; has {
+	if raw, has := m["model"]; has {
+		served, _ := raw.(string)
+		s.noteServedModel(ev, sentModel, served)
 		m["model"] = publicName
 	}
 	var u usage
@@ -660,6 +758,9 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 
 type streamArgs struct {
 	publicName string
+	// sentModel is the upstream model name this request asked for, so a
+	// vendor-side fallback can be noticed before the name is rewritten.
+	sentModel string
 	// keyID is for logging only; metering goes through charge, which already
 	// knows the key and whether this request's axis is metered at all.
 	keyID        string
@@ -706,6 +807,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	// parsing. An assembled payload that still does not parse is dropped, not
 	// forwarded: a verbatim chunk would leak the upstream model identifier.
 	var dataLines [][]byte
+	notedServed := false
 	flushEvent := func() bool {
 		if len(dataLines) == 0 {
 			return true
@@ -728,6 +830,10 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			}
 			dropped++
 			return true
+		}
+		if !notedServed && c.servedModel != "" {
+			notedServed = true
+			s.noteServedModel(ev, a.sentModel, c.servedModel)
 		}
 		if c.usage != nil {
 			u = *c.usage
@@ -867,6 +973,7 @@ func capRequest(raw json.RawMessage) (json.RawMessage, bool) {
 type chunk struct {
 	out          []byte
 	parsed       map[string]any
+	servedModel  string // the upstream's own model name, before it is rewritten
 	usage        *usage
 	content      string // this chunk's assistant text, for capture
 	contentChars int
@@ -895,7 +1002,8 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 		return chunk{}, false
 	}
 	c := chunk{parsed: m, choicesEmpty: true}
-	if _, has := m["model"]; has {
+	if raw, has := m["model"]; has {
+		c.servedModel, _ = raw.(string)
 		m["model"] = publicName
 	}
 	if uraw, has := m["usage"]; has && uraw != nil {

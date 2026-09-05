@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
@@ -438,34 +440,100 @@ func TestPassthroughCapsAreSeparateFromChat(t *testing.T) {
 	}
 }
 
-// The passthrough pool is separate from the gateway-wide one, so a surface
-// with no slots left cannot take chat down with it.
+// The passthrough pool is separate from the gateway-wide one. The property
+// that matters is concurrency, so this occupies the passthrough slots and
+// holds them there while chat is exercised — a version of this test that only
+// made requests in sequence passed with one shared pool, which is to say it
+// tested nothing.
 func TestPassthroughSlotPoolIsSeparate(t *testing.T) {
-	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
-		c.PassthroughMaxInFlight = 1
-	})
-	// Occupy the single passthrough slot, then prove chat still answers.
+	const slots = 2
 	release := make(chan struct{})
-	h.mock.set(func(o *mockOpts) { o.delay = 0 })
-	go func() {
-		h.passthroughStatus(http.MethodPost, "/v1/images", testToken, imageBody)
-		close(release)
-	}()
-	<-release
-	if status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[]}`); status != 200 {
-		t.Fatalf("chat: %d %s", status, body)
+	var releaseOnce sync.Once
+	unpark := func() { releaseOnce.Do(func() { close(release) }) }
+	// Registered before anything parks. Without it a failed assertion leaves
+	// the parked requests in the upstream forever and the test server's own
+	// cleanup waits on them, so a real defect would show up as a hung run
+	// rather than a failed one.
+	t.Cleanup(unpark)
+	var parked sync.WaitGroup
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
+		c.PassthroughMaxInFlight = slots
+	})
+	// Park every passthrough slot inside the upstream call.
+	h.mock.set(func(o *mockOpts) { o.block = release })
+	parked.Add(slots)
+	for i := 0; i < slots; i++ {
+		go func() {
+			defer parked.Done()
+			h.passthroughStatus(http.MethodPost, "/v1/images", testToken, imageBody)
+		}()
 	}
+	// Wait until the upstream has actually been entered by both, so the slots
+	// are held rather than merely requested.
+	deadline := time.Now().Add(5 * time.Second)
+	for h.mock.blockedCount() < slots {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d passthrough requests reached the upstream", h.mock.blockedCount(), slots)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := h.srv.PassthroughInFlight(); got != slots {
+		t.Fatalf("passthrough in flight %d, want %d", got, slots)
+	}
+
+	// The surface is full: another passthrough request is refused, and refused
+	// without reaching the upstream. The probe carries its own short deadline
+	// so that a pool which is not actually bounded fails here with a timeout
+	// rather than parking this test forever.
+	status, body := h.passthroughProbe(t, imageBody, 3*time.Second)
+	if status != http.StatusServiceUnavailable || errCode(t, body) != "server_busy" {
+		t.Fatalf("full pool: %d %s", status, body)
+	}
+	if got := h.mock.blockedCount(); got != slots {
+		t.Fatalf("a refused request still reached the upstream: %d parked, want %d", got, slots)
+	}
+	// ...while chat, which owns a different pool, still answers.
+	if status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[]}`); status != 200 {
+		t.Fatalf("chat starved by the passthrough pool: %d %s", status, body)
+	}
+
+	unpark()
+	parked.Wait()
 	if got := h.srv.PassthroughInFlight(); got != 0 {
 		t.Fatalf("slot leaked: %d", got)
 	}
+
 	// A pool with no capacity at all refuses rather than opening the surface.
 	h2 := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
 		c.PassthroughMaxInFlight = 0
 	})
-	status, body := h2.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody)
+	status, body = h2.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody)
 	if status != http.StatusServiceUnavailable || errCode(t, body) != "server_busy" {
 		t.Fatalf("zero pool: %d %s", status, body)
 	}
+}
+
+// passthroughProbe is one passthrough request with its own deadline, for the
+// tests where hanging is the failure being guarded against.
+func (h *harness) passthroughProbe(t *testing.T, body string, timeout time.Duration) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/images", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("the request was not refused; it was still running after %s: %v", timeout, err)
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, out
 }
 
 func (h *harness) passthroughStatus(method, path, token, body string) int {
@@ -769,5 +837,61 @@ func TestPassthroughNonJSONUpstreamAnswerIsRefused(t *testing.T) {
 	// And nothing was metered as if it had succeeded.
 	if events[0].Status == spool.StatusOK {
 		t.Fatalf("a body we could not read was recorded as a success: %+v", events[0])
+	}
+}
+
+// The candidate-model fence runs here too. Whether these routes honour the
+// field is not something this gateway has to establish: fencing it costs a
+// short walk and not fencing it costs a bypass of the money fence.
+func TestPassthroughCandidateModelsAreFenced(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		passthroughDoc(snapshot.EndpointImages)(d)
+		d.Keys[0].CreditDeniedModels = []string{"openai/*-pro"}
+	}, nil)
+	body := `{"model":"openai/gpt-image-1","prompt":"x","models":["openai/o1-pro"]}`
+	status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body)
+	if status != http.StatusForbidden || errCode(t, out) != "model_not_allowed" {
+		t.Fatalf("%d %s", status, out)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("a fenced candidate reached the upstream")
+	}
+	// A reserved self-serve name cannot ride in the list either.
+	status, out = h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","prompt":"x","models":["pickle-general"]}`)
+	if status != http.StatusForbidden || errCode(t, out) != "model_not_allowed" {
+		t.Fatalf("reserved candidate: %d %s", status, out)
+	}
+	// Allowed candidates still travel.
+	if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","prompt":"x","models":["openai/gpt-image-2"]}`); status != 200 {
+		t.Fatalf("allowed candidate: %d %s", status, out)
+	}
+}
+
+// Streaming is refused rather than forwarded. Every route this surface opens
+// is non-streamed and the metering reads a whole JSON body, so a streamed
+// answer would relay with no usage in it and land in the accounting as an
+// exact zero — billed to nobody and looking like a success.
+func TestPassthroughRefusesStreaming(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages, snapshot.EndpointEmbeddings), nil)
+	for _, path := range []string{"/v1/images", "/v1/embeddings"} {
+		body := `{"model":"openai/gpt-image-1","prompt":"x","stream":true}`
+		status, out := h.passthrough(t, http.MethodPost, path, testToken, body)
+		if status != http.StatusBadRequest || errCode(t, out) != "streaming_not_supported" {
+			t.Fatalf("%s: %d %s", path, status, out)
+		}
+		if h.mock.callCount() != 0 {
+			t.Fatalf("%s reached the upstream", path)
+		}
+	}
+	// stream:false and an absent stream are both ordinary requests.
+	for _, body := range []string{
+		`{"model":"openai/gpt-image-1","prompt":"x","stream":false}`,
+		`{"model":"openai/gpt-image-1","prompt":"x"}`,
+	} {
+		if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body); status != 200 {
+			t.Fatalf("%s: %d %s", body, status, out)
+		}
 	}
 }

@@ -92,6 +92,9 @@ var (
 			"POST /v1/images, GET /v1/images/models, POST /v1/embeddings입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
+	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",
+		"streaming_not_supported",
+		"이 경로는 스트리밍을 지원하지 않습니다. stream을 빼고 요청해주세요."}
 )
 
 // retryAfterSeconds is the Retry-After each error carries, keyed by the code
@@ -128,6 +131,22 @@ func errParamNeedsCreditModel(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
 		"자체 서빙 모델은 이 파라미터를 지원하지 않습니다: " + name +
 			". 유료 모델에서만 사용할 수 있습니다."}
+}
+
+// A fallback candidate the key may not be billed for. It names the entry
+// because the caller sent a list and cannot otherwise tell which one is the
+// problem, and the name is echoed back only when it is short enough to be a
+// real model name — the field is client input, and a refusal is no place to
+// reflect a kilobyte of it.
+func errCandidateModelNotAllowed(name string) apiError {
+	if name == "" || len(name) > maxPassthroughNameBytes {
+		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+			"이 API Key로는 대체 모델 목록(models)에 적힌 모델을 사용할 수 없습니다. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key로는 대체 모델 목록(models)의 " + name + "을(를) 사용할 수 없습니다. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
 }
 
 func errUnsupportedParam(name string) apiError {

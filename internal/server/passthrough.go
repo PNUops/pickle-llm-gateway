@@ -11,7 +11,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -278,6 +277,31 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 					"credit_model_not_allowed")
 				return
 			}
+			// The same fence over any fallback candidates, for the same reason
+			// it runs on chat: the vendor may serve and bill an entry from that
+			// list instead, and every record here would still show the name
+			// that was judged. Whether these routes honour the field is not
+			// something this gateway needs to establish — fencing it costs a
+			// short walk and not fencing it costs a bypass.
+			if bad, ok := fenceCandidateModels(&doc, func(string) *snapshot.Model { return nil },
+				key, params); !ok {
+				refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
+					"credit_model_not_allowed")
+				return
+			}
+			// Streaming is refused rather than forwarded. Every route this
+			// surface opens is non-streamed, and the metering here reads a
+			// whole JSON body — a streamed answer would parse as nothing, be
+			// relayed with no usage in it, and land in the accounting as an
+			// exact zero. Saying so is better than billing nothing and looking
+			// successful.
+			if raw, present := params["stream"]; present {
+				var streaming bool
+				if json.Unmarshal(raw, &streaming) == nil && streaming {
+					refuse(errPassthroughNoStreaming, spool.StatusBadRequest)
+					return
+				}
+			}
 			forward, err := json.Marshal(params)
 			if err != nil {
 				refuse(errBadJSON, spool.StatusBadRequest)
@@ -375,15 +399,34 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	var body []byte
 	var err error
 	if n := resp.ContentLength; n > 0 && n <= limit {
-		// Allocate once at the declared size. io.ReadAll grows by doubling and
-		// holds the old and the new buffer at the same time while it copies,
-		// so a large answer briefly costs several times itself — and it is the
-		// peak, not the average, that the slot count multiplies. A non-streamed
-		// JSON answer declares its length, which is every answer this surface
-		// forwards. ReadFrom still grows if the upstream understates it.
-		buf := bytes.NewBuffer(make([]byte, 0, n+1))
-		_, err = buf.ReadFrom(reader)
-		body = buf.Bytes()
+		// Read the declared length into exactly one allocation. io.ReadAll and
+		// bytes.Buffer.ReadFrom both grow by doubling and hold the old and the
+		// new buffer at once while copying, so a large answer briefly costs
+		// several times itself — and the slot count multiplies the peak, not
+		// the average. ReadFull does no growing at all: the buffer is the
+		// final size before the first byte arrives.
+		//
+		// A non-streamed JSON answer declares its length, which is every
+		// answer this surface forwards. The two ways the declaration can be
+		// wrong are both handled below rather than trusted.
+		body = make([]byte, n)
+		var read int
+		read, err = io.ReadFull(reader, body)
+		body = body[:read]
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			// Fewer bytes than declared. What arrived is what there is, and it
+			// will fail to parse below if it is truncated JSON.
+			err = nil
+		}
+		if err == nil {
+			// More bytes than declared. Rare and not trusted away: append only
+			// runs when there is something to append, so the ordinary path
+			// still holds one buffer.
+			var extra []byte
+			if extra, err = io.ReadAll(reader); len(extra) > 0 {
+				body = append(body, extra...)
+			}
+		}
 	} else {
 		body, err = io.ReadAll(reader)
 	}

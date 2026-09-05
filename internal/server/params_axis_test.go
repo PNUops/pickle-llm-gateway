@@ -2,8 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 )
 
 // The parameter surface is decided by the model's budget axis, and the two
@@ -105,7 +108,6 @@ func TestThinkingFieldsRefusedOnSelfHostedModel(t *testing.T) {
 // served on a request the student's budget pays for.
 func TestProviderFieldsReachThePaidUpstream(t *testing.T) {
 	for _, tc := range []struct{ field, key, want string }{
-		{`"models":["a","b"]`, "models", `["a","b"]`},
 		{`"provider":{"order":["openai"]}`, "provider", `{"order":["openai"]}`},
 		{`"route":"fallback"`, "route", `"fallback"`},
 		{`"plugins":[{"id":"web"}]`, "plugins", `[{"id":"web"}]`},
@@ -186,5 +188,106 @@ func TestUnknownModelAnswersBeforeUnknownParameter(t *testing.T) {
 	}
 	if h.mock.callCount() != 0 {
 		t.Fatalf("the upstream was called for an unknown model")
+	}
+}
+
+// creditPassthroughDoc is creditDoc with a passthrough upstream, so a vendor
+// model name that no catalogue lists still resolves — which is what a fallback
+// candidate normally is.
+func creditPassthroughDoc(d *snapshot.Document) {
+	creditDoc(d)
+	d.PassthroughRef = "mock"
+}
+
+// models[] names models the vendor may serve and bill INSTEAD of the one in
+// `model`, so the money fence has to judge every entry. Judging rather than
+// refusing keeps fallback working between models the key may already use.
+func TestCandidateModelsAreFenced(t *testing.T) {
+	// Allowed candidates travel, and reach the upstream untouched.
+	h := newHarness(t, creditPassthroughDoc, nil)
+	body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` +
+		`"models":["openai/gpt-5","openai/gpt-5-mini"]}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("allowed candidates: %d %s", status, resp)
+	}
+	params, _ := h.mock.last()
+	if got := string(params["models"]); got != `["openai/gpt-5","openai/gpt-5-mini"]` {
+		t.Fatalf("candidate list reached the upstream as %s", got)
+	}
+}
+
+// The bypass this fence closes: a key whose deny list forbids a model puts it
+// in models[] instead, the vendor falls back to it on any error, and prices the
+// request using the model it actually used. Every record here would still show
+// the name that was judged.
+func TestDeniedCandidateModelIsRefused(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditDeniedModels = []string{"openai/*-pro"}
+	}, nil)
+	body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` +
+		`"models":["openai/gpt-5","openai/o1-pro"]}`
+	status, resp := h.chat(t, testToken, body)
+	if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+		t.Fatalf("denied candidate: %d %s", status, resp)
+	}
+	// The caller sent a list and cannot otherwise tell which entry is the
+	// problem.
+	if msg := errMessage(t, resp); !strings.Contains(msg, "openai/o1-pro") {
+		t.Fatalf("the refusal has to name the entry: %s", msg)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatalf("a fenced candidate reached the upstream")
+	}
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 || evs[0].ErrorType != "credit_model_not_allowed" {
+		t.Fatalf("spooled %+v", evs)
+	}
+}
+
+// An allow list bounds candidates the same way it bounds the primary.
+func TestCandidateOutsideAllowListIsRefused(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditAllowedModels = []string{"openai/*"}
+	}, nil)
+	body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` +
+		`"models":["openai/gpt-5","google/gemini-3-pro"]}`
+	status, resp := h.chat(t, testToken, body)
+	if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+		t.Fatalf("%d %s", status, resp)
+	}
+}
+
+// A reserved self-serve name must not reach the vendor as a fallback, and the
+// catalogue lookup would otherwise accept one: pickle-general is a real row.
+func TestReservedNameIsNeverACandidate(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	for _, list := range []string{`["pickle-general"]`, `["pickle-nosuch"]`, `["~pickle-general"]`} {
+		body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"models":` + list + `}`
+		status, resp := h.chat(t, testToken, body)
+		if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+			t.Fatalf("%s: %d %s", list, status, resp)
+		}
+		if h.mock.callCount() != 0 {
+			t.Fatalf("%s reached the upstream", list)
+		}
+	}
+}
+
+// A list this build cannot read is a list it cannot fence.
+func TestUnreadableCandidateListIsRefused(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	for _, list := range []string{`"openai/gpt-5"`, `[1,2]`, `{"a":1}`} {
+		body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"models":` + list + `}`
+		status, resp := h.chat(t, testToken, body)
+		if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+			t.Fatalf("%s: %d %s", list, status, resp)
+		}
+	}
+	// null and absent both mean the caller sent no candidates.
+	body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"models":null}`
+	if status, resp := h.chat(t, testToken, body); status != 200 {
+		t.Fatalf("null candidates: %d %s", status, resp)
 	}
 }

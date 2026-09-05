@@ -43,6 +43,9 @@ type mockOpts struct {
 	abortMid    bool          // stream: hijack and close after one chunk, no [DONE]
 	chunkDelay  time.Duration // stream: pause before each chunk
 	failNext    int           // fail this many next calls with a 502, then serve
+	// block parks a request inside the upstream until the channel is closed,
+	// which is what lets a test hold a slot rather than hope to race one.
+	block chan struct{}
 }
 
 type upstreamMock struct {
@@ -57,6 +60,14 @@ type upstreamMock struct {
 	lastRaw     []byte
 	opts        mockOpts
 	calls       int
+	blocked     int
+}
+
+// blockedCount is how many requests are parked inside the upstream right now.
+func (u *upstreamMock) blockedCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.blocked
 }
 
 func (u *upstreamMock) lastRequest() (path, method string, hdr http.Header, raw []byte) {
@@ -108,6 +119,25 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	// two usage namings below are deliberate: the vendor does not use one
 	// spelling across every route, and the gateway has to meter both.
 	if r.URL.Path != "/chat/completions" {
+		// Parking is scoped to this surface on purpose: a test that holds the
+		// passthrough slots still has to be able to reach chat, which is the
+		// whole property being checked.
+		if cp.block != nil {
+			u.mu.Lock()
+			u.blocked++
+			u.mu.Unlock()
+			// Bounded so nothing can park forever. A failed assertion in the
+			// test that parked these would otherwise leave them here, the test
+			// server's Close would wait on them, and a real defect would
+			// surface as a hung run instead of the assertion that caught it.
+			select {
+			case <-cp.block:
+			case <-time.After(15 * time.Second):
+			}
+			u.mu.Lock()
+			u.blocked--
+			u.mu.Unlock()
+		}
 		if cp.status != 0 && cp.status != http.StatusOK {
 			w.WriteHeader(cp.status)
 			_, _ = io.WriteString(w, cp.errBody)
