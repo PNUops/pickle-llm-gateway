@@ -32,7 +32,7 @@ var (
 	errQuotaExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "quota_exhausted",
 		"사용량 한도를 모두 사용했습니다. 한도는 기간이 지나면 초기화되며, 증액이 필요하면 콘솔에서 신청해주세요."}
 	errCreditUnavailable = apiError{http.StatusForbidden, "permission_error", "credit_unavailable",
-		"이 API Key에는 상용 모델을 쓸 금액 한도가 없습니다. 콘솔에서 한도를 신청해주세요."}
+		"이 API Key에는 유료 모델을 쓸 금액 한도가 없습니다. 콘솔에서 한도를 신청해주세요."}
 	// 503 rather than 403 on purpose: nothing about the request is wrong and
 	// the state ends on its own, so the honest answer is "not yet", which is
 	// also the one OpenAI-compatible clients retry without being told. The
@@ -40,7 +40,7 @@ var (
 	errCreditPending = apiError{http.StatusServiceUnavailable, "server_error", "credit_pending",
 		"승인된 금액 한도를 이 API Key에 적용하는 중입니다. 적용이 끝나면 자동으로 사용할 수 있으니 잠시 후 다시 시도해주세요."}
 	errCreditExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "credit_exhausted",
-		"상용 모델에 부여된 금액 한도를 모두 사용했습니다. 증액이 필요하면 콘솔에서 신청해주세요."}
+		"유료 모델에 부여된 금액 한도를 모두 사용했습니다. 증액이 필요하면 콘솔에서 신청해주세요."}
 	errServiceDisabled = apiError{http.StatusServiceUnavailable, "server_error", "service_disabled",
 		"LLM API 서비스가 점검 중입니다. 잠시 후 다시 시도해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
@@ -57,7 +57,7 @@ var (
 	// cannot contain the answer; the console shows the key's own allow list.
 	errCreditModelNotAllowed = apiError{http.StatusForbidden, "permission_error",
 		"model_not_allowed",
-		"이 API Key로는 요청한 상용 모델을 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+		"이 API Key로는 요청한 유료 모델을 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
 	errRateRequests = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_requests",
 		"자체 서빙 모델의 분당 요청 횟수 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateTokens = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_tokens",
