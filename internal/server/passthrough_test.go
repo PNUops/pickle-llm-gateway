@@ -772,3 +772,30 @@ func TestPassthroughMessagesUseCurrentVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// Numbers reach the upstream as the caller wrote them. The top level decodes
+// into raw byte slices rather than into any/float64, so a large integer or a
+// high-precision decimal is never parsed and re-rendered on the way through —
+// a seed that arrived as one number must not leave as another.
+func TestPassthroughDoesNotRewriteNumbers(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	const body = `{"model":"openai/gpt-image-1","seed":12345678901234567890123,` +
+		`"temperature":0.1000000000000000055511151231257827,"scale":1e400,"n":2}`
+	if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body); status != 200 {
+		t.Fatalf("%d %s", status, out)
+	}
+	_, _, _, raw := h.mock.lastRequest()
+	for _, literal := range []string{
+		"12345678901234567890123",
+		"0.1000000000000000055511151231257827",
+		"1e400",
+	} {
+		if !strings.Contains(string(raw), literal) {
+			t.Fatalf("literal %s was rewritten: %s", literal, raw)
+		}
+	}
+	// The bound was applied to n, and n still leaves as it arrived.
+	if !strings.Contains(string(raw), `"n":2`) {
+		t.Fatalf("n was rewritten: %s", raw)
+	}
+}

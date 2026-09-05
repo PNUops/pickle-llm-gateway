@@ -226,6 +226,20 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// Decoding into a map of raw values resolves repeated members the
 			// same way the upstream would, and leaves every value's bytes
 			// untouched so nothing is reinterpreted on the way through.
+			//
+			// This is why there is no UseNumber here and why there does not
+			// need to be. UseNumber matters when a decode would put a number
+			// through float64 and render it back — silently changing a seed or
+			// a precise decimal — but a json.RawMessage is the literal bytes,
+			// so no number on this path is ever parsed at all. Only `n` is
+			// interpreted, into a json.Number that is compared and never
+			// written back. A test pins a 23-digit integer and 1e400, which
+			// float64 cannot even hold.
+			//
+			// Re-marshalling does rewrite one thing: < > & inside strings come
+			// back as \u003c \u003e \u0026. That is the same string to any
+			// decoder, so it changes what the bytes look like and not what
+			// they mean.
 			var params map[string]json.RawMessage
 			if json.Unmarshal(raw, &params) != nil {
 				refuse(errBadJSON, spool.StatusBadRequest)
