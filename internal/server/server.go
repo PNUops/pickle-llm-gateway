@@ -1,7 +1,8 @@
 // Package server terminates the student-facing OpenAI-compatible surface:
-// GET /v1/models and POST /v1/chat/completions, plus a local health probe.
-// Every request is authenticated against the snapshot and metered into the
-// usage spool. Request and response bodies are never logged.
+// GET /v1/models and POST /v1/chat/completions, the passthrough routes in
+// passthrough.go, and a local health probe. Every request is authenticated
+// against the snapshot and metered into the usage spool. Request and response
+// bodies are never logged.
 package server
 
 import (
@@ -29,7 +30,13 @@ type Server struct {
 	log      *slog.Logger
 	client   *http.Client
 	inFlight chan struct{}
-	now      func() time.Time
+	// The passthrough surface's own transport and slot pool. Separate from the
+	// two above so that neither its header wait nor its concurrency can move
+	// what chat does, and so the memory this surface can hold is one
+	// multiplication with a bounded slot count in it — see config.
+	passthroughClient   *http.Client
+	passthroughInFlight chan struct{}
+	now                 func() time.Time
 }
 
 // New wires a Server. The shared HTTP client waits bounded time for upstream
@@ -49,9 +56,17 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 			},
 		},
 		inFlight: make(chan struct{}, cfg.MaxInFlight),
-		health:   newUpstreamHealth(nil),
-		metrics:  &counters{},
-		now:      time.Now,
+		passthroughClient: &http.Client{
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: cfg.PassthroughHeaderWait,
+				MaxIdleConnsPerHost:   16,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		},
+		passthroughInFlight: make(chan struct{}, cfg.PassthroughMaxInFlight),
+		health:              newUpstreamHealth(nil),
+		metrics:             &counters{},
+		now:                 time.Now,
 	}
 }
 
@@ -59,6 +74,10 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 // now. It is a gauge for the control-plane handshake and the health surface;
 // nothing acts on it.
 func (s *Server) InFlight() int { return len(s.inFlight) }
+
+// PassthroughInFlight is the same gauge for the passthrough surface's own
+// pool, which is bounded separately and much lower.
+func (s *Server) PassthroughInFlight() int { return len(s.passthroughInFlight) }
 
 // SetBodySink enables prompt/response capture for keys that opted in. Without
 // a sink no capture happens at all, whatever the snapshot says — the channel
@@ -73,6 +92,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/models/", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	// The passthrough surface. Every pattern here is exact, so none of them
+	// competes with the "/v1/models/" subtree above: a request for
+	// /v1/models/{id} still matches the more specific subtree pattern, and
+	// /v1/images/models matches its own exact pattern rather than either.
+	mux.HandleFunc("/v1/images", s.handlePassthrough(routeImages))
+	mux.HandleFunc("/v1/images/models", s.handlePassthrough(routeImageModels))
+	mux.HandleFunc("/v1/embeddings", s.handlePassthrough(routeEmbeddings))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound)
 	})

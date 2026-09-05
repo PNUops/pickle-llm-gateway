@@ -307,20 +307,66 @@ func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, 
 	return json.Marshal(out)
 }
 
-// attempt performs one upstream call carrying the given bearer (empty sends
-// no auth header). A nil error means resp is a 200 whose body the caller now
-// owns.
+// attemptSpec is the shape of one upstream call. Chat fills it one way and the
+// passthrough surface another; everything after the request is built — the
+// status classification below — is deliberately the same code for both, so a
+// vendor's 402 or 429 can never come to mean two different things depending on
+// which route reached it.
+type attemptSpec struct {
+	// client selects the transport, and with it the response-header wait. The
+	// passthrough surface has its own because a non-streamed image generation
+	// sends no headers until it has finished producing the image.
+	client *http.Client
+	method string
+	// path is appended to the upstream base URL.
+	path string
+	// body is nil for a GET, which then carries no Content-Type either.
+	body []byte
+	cred string
+	// creditAxis only changes how a failure is named in the usage record: a
+	// per-key credential or throttle says nothing about the shared upstream.
+	creditAxis bool
+	// headers are the client headers an allowlist chose to forward. The
+	// gateway's own Content-Type and Authorization are set after these and win.
+	headers http.Header
+}
+
+// attempt performs one chat-completions call carrying the given bearer (empty
+// sends no auth header). A nil error means resp is a 200 whose body the caller
+// now owns.
 func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, cred string,
 	creditAxis bool) (*http.Response, *attemptError) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, up.BaseURL+"/chat/completions", bytes.NewReader(body))
+	return s.do(ctx, up, attemptSpec{
+		client:     s.client,
+		method:     http.MethodPost,
+		path:       "/chat/completions",
+		body:       body,
+		cred:       cred,
+		creditAxis: creditAxis,
+	})
+}
+
+// do performs one upstream call and classifies its outcome.
+func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (*http.Response, *attemptError) {
+	var reader io.Reader = http.NoBody
+	if spec.body != nil {
+		reader = bytes.NewReader(spec.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, spec.method, up.BaseURL+spec.path, reader)
 	if err != nil {
 		return nil, &attemptError{err: err, kind: failureInvalidResponse}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if cred != "" {
-		req.Header.Set("Authorization", "Bearer "+cred)
+	for name, values := range spec.headers {
+		req.Header[name] = values
 	}
-	resp, err := s.client.Do(req)
+	if spec.body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if spec.cred != "" {
+		req.Header.Set("Authorization", "Bearer "+spec.cred)
+	}
+	creditAxis := spec.creditAxis
+	resp, err := spec.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || ctx.Err() == context.Canceled {
 			return nil, &attemptError{err: err, kind: failureClientCanceled}

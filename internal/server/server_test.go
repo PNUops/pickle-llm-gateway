@@ -43,14 +43,37 @@ type mockOpts struct {
 	abortMid    bool          // stream: hijack and close after one chunk, no [DONE]
 	chunkDelay  time.Duration // stream: pause before each chunk
 	failNext    int           // fail this many next calls with a 502, then serve
+	// block parks a request inside the upstream until the channel is closed,
+	// which is what lets a test hold a slot rather than hope to race one.
+	block chan struct{}
 }
 
 type upstreamMock struct {
 	mu       sync.Mutex
 	lastBody map[string]json.RawMessage
 	lastAuth string
-	opts     mockOpts
-	calls    int
+	// The passthrough surface reaches paths other than /chat/completions, and
+	// what it forwards (and does not forward) is part of its contract.
+	lastPath    string
+	lastMethod  string
+	lastHeaders http.Header
+	lastRaw     []byte
+	opts        mockOpts
+	calls       int
+	blocked     int
+}
+
+// blockedCount is how many requests are parked inside the upstream right now.
+func (u *upstreamMock) blockedCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.blocked
+}
+
+func (u *upstreamMock) lastRequest() (path, method string, hdr http.Header, raw []byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.lastPath, u.lastMethod, u.lastHeaders, u.lastRaw
 }
 
 // callCount is how many requests reached the upstream. A test that asserts
@@ -81,12 +104,64 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	u.lastBody = params
 	u.lastAuth = r.Header.Get("Authorization")
+	u.lastPath = r.URL.Path
+	u.lastMethod = r.Method
+	u.lastHeaders = r.Header.Clone()
+	u.lastRaw = body
 	u.calls++
 	cp := u.opts
 	u.mu.Unlock()
 
 	if cp.delay > 0 {
 		time.Sleep(cp.delay)
+	}
+	// Anything that is not chat completions is the passthrough surface. The
+	// two usage namings below are deliberate: the vendor does not use one
+	// spelling across every route, and the gateway has to meter both.
+	if r.URL.Path != "/chat/completions" {
+		// Parking is scoped to this surface on purpose: a test that holds the
+		// passthrough slots still has to be able to reach chat, which is the
+		// whole property being checked.
+		if cp.block != nil {
+			u.mu.Lock()
+			u.blocked++
+			u.mu.Unlock()
+			// Bounded so nothing can park forever. A failed assertion in the
+			// test that parked these would otherwise leave them here, the test
+			// server's Close would wait on them, and a real defect would
+			// surface as a hung run instead of the assertion that caught it.
+			select {
+			case <-cp.block:
+			case <-time.After(15 * time.Second):
+			}
+			u.mu.Lock()
+			u.blocked--
+			u.mu.Unlock()
+		}
+		if cp.status != 0 && cp.status != http.StatusOK {
+			w.WriteHeader(cp.status)
+			_, _ = io.WriteString(w, cp.errBody)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// A real non-streamed JSON answer declares its length, and the gateway
+		// reads it in one allocation when it does.
+		if cp.rawResp != "" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(cp.rawResp)))
+		}
+		switch {
+		case cp.rawResp != "":
+			_, _ = io.WriteString(w, cp.rawResp)
+		case cp.noUsage:
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"b64_json":"aGk="}]}`)
+		case r.URL.Path == "/embeddings":
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":9,"completion_tokens":0,"total_tokens":9}}`)
+		case r.URL.Path == "/images/models":
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"openai/gpt-image-1"}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"b64_json":"aGk="}],"usage":{"input_tokens":11,"output_tokens":3,"total_tokens":14,"cost":0.04}}`)
+		}
+		return
 	}
 	if cp.failNext > 0 {
 		u.mu.Lock()
@@ -216,9 +291,16 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		UpstreamHeaderWait:  5 * time.Second,
 		RequestMaxDuration:  30 * time.Second,
 		MaxInFlight:         16,
-		DefaultRpm:          1000,
-		DefaultTpm:          1_000_000,
-		DefaultConcurrency:  8,
+		// The passthrough surface fails closed on a zero slot count, so a
+		// harness that left these unset would 503 every passthrough test for
+		// the wrong reason.
+		PassthroughRequestBodyMaxBytes: 1 << 20,
+		PassthroughResponseMaxBytes:    1 << 20,
+		PassthroughHeaderWait:          5 * time.Second,
+		PassthroughMaxInFlight:         4,
+		DefaultRpm:                     1000,
+		DefaultTpm:                     1_000_000,
+		DefaultConcurrency:             8,
 		Upstreams: map[string]config.Upstream{
 			"mock": {Ref: "mock", BaseURL: up.URL, APIKey: upstreamCred, CapField: "max_completion_tokens"},
 		},
@@ -762,7 +844,9 @@ func TestHealthzAndUnknownPath(t *testing.T) {
 		t.Fatalf("healthz: %d %s", resp.StatusCode, raw)
 	}
 
-	resp2, err := http.Get(h.gw.URL + "/v1/embeddings")
+	// Deliberately out of scope, and it has to stay that way: audio has no
+	// usage in its response, so opening it would meter invented numbers.
+	resp2, err := http.Get(h.gw.URL + "/v1/audio/speech")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1924,6 +2008,18 @@ func allAPIErrors() map[string]apiError {
 		"errUnsupportedParam(x)":  errUnsupportedParam("x"),
 		"errInvalidParamValue(x)": errInvalidParamValue("x"),
 		"errMissingParam(x)":      errMissingParam("x"),
+		// Added by the passthrough round. A new error that is not listed here
+		// is one the leak check never reads.
+		"errCreditPending":               errCreditPending,
+		"errPresetNotAllowed":            errPresetNotAllowed,
+		"errPassthroughNoStreaming":      errPassthroughNoStreaming,
+		"errPassthroughResponseTooLarge": errPassthroughResponseTooLarge,
+		"errEndpointNotAllowed(x)":       errEndpointNotAllowed("x"),
+		"errCandidateModelNotAllowed(x)": errCandidateModelNotAllowed("x"),
+		"errToolModelNotAllowed(x)":      errToolModelNotAllowed("x"),
+		"errRouterModelNotAllowed(x)":    errRouterModelNotAllowed("x"),
+		"errCreditModelNotAllowed":       errCreditModelNotAllowed,
+		"errParamNeedsCreditModel(x)":    errParamNeedsCreditModel("x"),
 	}
 }
 
@@ -1931,6 +2027,21 @@ func allAPIErrors() map[string]apiError {
 // test happens to trigger. The type set is OpenAI's because their SDKs branch
 // on it; the code is ours and has to be unique, or a client cannot tell two
 // refusals apart.
+// sharedCodes are the public codes more than one error deliberately answers
+// with. Each is a case where several causes are one fact to an SDK — the field
+// may not be sent, the model may not be used — and a second code would be one
+// more thing every client has to learn for something it already handles. The
+// advice differs in the message, and the usage record keeps its own type so the
+// causes stay countable apart.
+//
+// Listing them keeps the check useful: a collision on any other code is still a
+// mistake, and adding a code here is a decision somebody has to make on purpose
+// rather than a test quietly going quiet.
+var sharedCodes = map[string]bool{
+	"model_not_allowed":     true,
+	"unsupported_parameter": true,
+}
+
 func TestEveryAPIErrorIsWellFormed(t *testing.T) {
 	// The same set the single-error test used, kept in one place now.
 	okTypes := map[string]bool{
@@ -1951,7 +2062,7 @@ func TestEveryAPIErrorIsWellFormed(t *testing.T) {
 		if e.message == "" {
 			t.Errorf("%s: empty message", name)
 		}
-		if prev, dup := seenCode[e.code]; dup {
+		if prev, dup := seenCode[e.code]; dup && !sharedCodes[e.code] {
 			t.Errorf("%s and %s share the code %q; a client cannot tell them apart", name, prev, e.code)
 		}
 		seenCode[e.code] = name

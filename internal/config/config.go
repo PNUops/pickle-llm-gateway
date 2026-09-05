@@ -71,6 +71,60 @@ type Config struct {
 	// ever applied before any of the response has reached the client.
 	UpstreamRetries int
 
+	// The passthrough surface's own copies of the four values above. Chat runs
+	// on the fields above and does not move; these govern only the routes the
+	// passthrough surface opens, so an answer about image sizes can never
+	// change what a chat request may send or hold.
+	//
+	// The separate slot pool is what makes the memory arithmetic provable.
+	// A request is held three times over — the bytes as read, the decoded
+	// top-level members, and the body re-serialized for the upstream, which is
+	// what makes the model fence sound (see passthrough.go). The response is
+	// held once, because it is forwarded verbatim rather than re-marshalled.
+	// Taking the measured 1.75x amplification (2026-09-02) on the response
+	// side as the conservative bound, the ceiling these caps guarantee is
+	//
+	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
+	//
+	// which at the defaults below is about 2,096 MiB. That is the number to
+	// check a host against, and it is the whole reason this pool is separate:
+	// it holds whatever the chat pool is sized to, so raising one cannot move
+	// the other's arithmetic. The same caps applied to the gateway-wide pool
+	// would give a figure in the tens of gigabytes.
+	//
+	// The expected load is far below the ceiling. An image response measured
+	// 2026-09-05 is 13.09 MiB at 4K and 1.61 MiB at the default resolution
+	// (base64 expands the image 1.333x), so sixteen concurrent 4K generations
+	// sit at about 366 MiB.
+	//
+	// The response cap, the header wait and the slot count come from that
+	// measurement. An 8 MiB response cap could not hold a 4K image at all, and
+	// 32 MiB leaves room above one; a 4K generation takes 32 seconds and is
+	// not streamed, so the 60s chat header wait has under twice the margin
+	// while 180s has room.
+	//
+	// The request cap is the vendor's own documented limit, 25 MB, rather than
+	// a number of ours. Where the vendor accepts a request there is no reason
+	// for this gateway to be the thing that refuses it, so a value picked here
+	// would only ever be a smaller ceiling with nothing behind it. It covers
+	// both shapes an image edit can take: a reference image as a plain URL
+	// costs nothing, and a 4K one inline as a data URL fits once base64 has
+	// expanded it.
+	//
+	// There is deliberately no bound on `n`. The vendor does not cap it, and
+	// the reason one was considered here — that an oversized response would be
+	// truncated into an unexplained 502 — no longer holds: the response cap
+	// refuses that case by name (see errPassthroughResponseTooLarge), so a
+	// resource limit does the work a policy limit would have done, and says so.
+	//
+	// The deployed environment remains the authority — a host with a different
+	// memory budget wants different numbers, and the unit's MemoryHigh and
+	// GOMEMLIMIT move with them.
+	PassthroughRequestBodyMaxBytes int64
+	PassthroughResponseMaxBytes    int64
+	PassthroughHeaderWait          time.Duration
+	PassthroughMaxInFlight         int
+
 	// Fallback limits for keys whose snapshot entry sets none.
 	DefaultRpm         int
 	DefaultTpm         int
@@ -143,17 +197,25 @@ func FromEnv() (*Config, error) {
 		// this default: a response near that cap costs roughly 13 MB to hold,
 		// decode and re-serialise, so raising the cap moves how many such
 		// responses it takes to exhaust the container.
-		MaxInFlight:        16,
-		UpstreamRetries:    1,
-		DefaultRpm:         20,
-		DefaultTpm:         20000,
-		DefaultConcurrency: 2,
-		SpoolRetentionDays: 90,
-		UsageBatchSize:     500,
-		UsagePushInterval:  30 * time.Second,
-		BodyQueueSize:      256,
-		BodyBatchSize:      20,
-		Upstreams:          map[string]Upstream{},
+		MaxInFlight:     16,
+		UpstreamRetries: 1,
+		// See the field comments for what the measurement decided and what is
+		// still provisional. The header wait is the value images actually
+		// need: a generation is not streamed, so the upstream sends no headers
+		// until it has finished producing the image.
+		PassthroughRequestBodyMaxBytes: 25 << 20,
+		PassthroughResponseMaxBytes:    32 << 20,
+		PassthroughHeaderWait:          180 * time.Second,
+		PassthroughMaxInFlight:         16,
+		DefaultRpm:                     20,
+		DefaultTpm:                     20000,
+		DefaultConcurrency:             2,
+		SpoolRetentionDays:             90,
+		UsageBatchSize:                 500,
+		UsagePushInterval:              30 * time.Second,
+		BodyQueueSize:                  256,
+		BodyBatchSize:                  20,
+		Upstreams:                      map[string]Upstream{},
 	}
 
 	var errs []string
@@ -183,6 +245,7 @@ func FromEnv() (*Config, error) {
 		dst  *int
 	}{
 		{"MAX_IN_FLIGHT", &cfg.MaxInFlight},
+		{"PASSTHROUGH_MAX_IN_FLIGHT", &cfg.PassthroughMaxInFlight},
 		{"BODY_QUEUE_SIZE", &cfg.BodyQueueSize},
 		{"BODY_BATCH_SIZE", &cfg.BodyBatchSize},
 		{"DEFAULT_RPM", &cfg.DefaultRpm},
@@ -222,6 +285,7 @@ func FromEnv() (*Config, error) {
 		{"CONTROL_TIMEOUT", &cfg.ControlTimeout},
 		{"USAGE_PUSH_INTERVAL", &cfg.UsagePushInterval},
 		{"UPSTREAM_HEADER_WAIT", &cfg.UpstreamHeaderWait},
+		{"PASSTHROUGH_HEADER_WAIT", &cfg.PassthroughHeaderWait},
 		{"REQUEST_MAX_DURATION", &cfg.RequestMaxDuration},
 	} {
 		if v := getenv(opt.name, ""); v != "" {
@@ -257,12 +321,21 @@ func FromEnv() (*Config, error) {
 			cfg.UsageBatchSize = n
 		}
 	}
-	if v := getenv("REQUEST_BODY_MAX_BYTES", ""); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n <= 0 {
-			errs = append(errs, envPrefix+"REQUEST_BODY_MAX_BYTES must be a positive integer")
-		} else {
-			cfg.RequestBodyMaxBytes = n
+	for _, opt := range []struct {
+		name string
+		dst  *int64
+	}{
+		{"REQUEST_BODY_MAX_BYTES", &cfg.RequestBodyMaxBytes},
+		{"PASSTHROUGH_REQUEST_BODY_MAX_BYTES", &cfg.PassthroughRequestBodyMaxBytes},
+		{"PASSTHROUGH_RESPONSE_MAX_BYTES", &cfg.PassthroughResponseMaxBytes},
+	} {
+		if v := getenv(opt.name, ""); v != "" {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || n <= 0 {
+				errs = append(errs, envPrefix+opt.name+" must be a positive integer")
+				continue
+			}
+			*opt.dst = n
 		}
 	}
 

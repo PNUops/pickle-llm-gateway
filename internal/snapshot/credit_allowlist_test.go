@@ -255,3 +255,40 @@ func TestAllowsCreditModelIgnoresTokenAxis(t *testing.T) {
 		t.Fatal("an empty fence must restrict nothing")
 	}
 }
+
+// A padded deny entry survives the load and still fences, and so does a padded
+// model name at judgement time. The two sides normalize in different places —
+// the loader trims the PATTERN, the fence trims the NAME — and the matcher
+// table can show neither, because it is handed both already normalized.
+//
+// This is the shape a one-sided normalization always leaks in. It reaches the
+// passthrough surface specifically: a catalogue model's name is a server value
+// and cannot carry padding, but a passthrough model's is synthesized from the
+// request string, so it is whatever the caller sent.
+func TestPaddedDenyEntryAndNameSurviveLoad(t *testing.T) {
+	hash := HashToken("padded")
+	body := fmt.Sprintf(`{"generation":1,"serviceEnabled":true,"passthroughRef":"mock",
+	  "models":[{"publicName":"pickle-general","upstreamRef":"mock","upstreamModel":"m"}],
+	  "keys":[{"keyId":"k","tokenHash":%q,"status":"ACTIVE","limits":{},
+	           "creditDeniedModels":["  anthropic/claude-opus-4  "]}]}`, hash)
+	s := openDoc(t, body)
+
+	_, byHash, _ := s.Current()
+	key := byHash(hash)
+	if key == nil {
+		t.Fatal("a key carrying a padded deny entry was dropped at load")
+	}
+	if got := key.CreditDeniedModels[0]; got != "anthropic/claude-opus-4" {
+		t.Fatalf("the loader left the pattern as %q", got)
+	}
+	for _, name := range []string{
+		"anthropic/claude-opus-4",
+		" anthropic/claude-opus-4",
+		"anthropic/claude-opus-4 ",
+	} {
+		m := Model{PublicName: name, BudgetAxis: AxisCredit}
+		if key.AllowsCreditModel(&m) {
+			t.Fatalf("%q was not caught by the padded deny entry", name)
+		}
+	}
+}
