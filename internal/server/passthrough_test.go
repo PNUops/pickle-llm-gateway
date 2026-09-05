@@ -419,29 +419,6 @@ func TestPassthroughOversizedModelNameIsNotRecorded(t *testing.T) {
 	}
 }
 
-// `n` is bounded here so the caller hears the limit, instead of hitting the
-// response cap and getting a 502 that describes a server fault.
-func TestPassthroughNBound(t *testing.T) {
-	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
-		c.PassthroughMaxN = 2
-	})
-	if status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":2}`); status != 200 {
-		t.Fatalf("at the bound: %d %s", status, body)
-	}
-	status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":3}`)
-	if status != http.StatusBadRequest || errCode(t, body) != "invalid_parameter_value" {
-		t.Fatalf("over the bound: %d %s", status, body)
-	}
-	if !strings.Contains(errMessage(t, body), "2") {
-		t.Fatalf("the message has to name the limit: %s", errMessage(t, body))
-	}
-	if h.mock.callCount() != 1 {
-		t.Fatalf("a refused n reached the upstream: %d calls", h.mock.callCount())
-	}
-}
-
 // This surface's caps are its own. Raising or lowering one must not move what
 // a chat request may send.
 func TestPassthroughCapsAreSeparateFromChat(t *testing.T) {
@@ -631,61 +608,6 @@ func TestPassthroughUnauthenticatedIsNotSpooled(t *testing.T) {
 	}
 }
 
-// The bound is on the request, not on one spelling of it: a float or an
-// exponent is the same number to the upstream and must not walk past.
-//
-// The large values matter most. Go leaves an out-of-range float-to-int
-// conversion implementation-defined and the two architectures in play disagree
-// on the sign, so a bound applied after converting passes on the development
-// machine and fails open on the deployed host.
-func TestPassthroughNBoundIsNotEvadableBySpelling(t *testing.T) {
-	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
-		c.PassthroughMaxN = 2
-	})
-	for _, body := range []string{
-		`{"model":"openai/gpt-image-1","prompt":"x","n":3.0}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":3e0}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":2.5}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":1e19}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":9999999999999999999999}`,
-		// The bound is on the number, so a numeric string spelling of an
-		// over-large value is refused by the same comparison.
-		`{"model":"openai/gpt-image-1","prompt":"x","n":"1e19"}`,
-	} {
-		status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body)
-		if status != http.StatusBadRequest {
-			t.Fatalf("%s: %d %s", body, status, out)
-		}
-	}
-	// Neither is a value the vendor can serve, and spending an upstream call
-	// to be told so helps nobody.
-	for _, body := range []string{
-		`{"model":"openai/gpt-image-1","prompt":"x","n":-3}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":0}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":"abc"}`,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":[2]}`,
-	} {
-		status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body)
-		if status != http.StatusBadRequest || errCode(t, out) != "invalid_parameter_value" {
-			t.Fatalf("%s: %d %s", body, status, out)
-		}
-	}
-	if h.mock.callCount() != 0 {
-		t.Fatalf("a refused n reached the upstream: %d calls", h.mock.callCount())
-	}
-	// A numeric string inside the bound is left to the upstream to accept or
-	// refuse on type; what matters here is that the bound was applied to it.
-	if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":"2"}`); status != 200 {
-		t.Fatalf("stringy n inside the bound: %d %s", status, out)
-	}
-	// null is what an SDK sends for "unset", which is the same as absent.
-	if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
-		`{"model":"openai/gpt-image-1","prompt":"x","n":null}`); status != 200 {
-		t.Fatalf("null n: %d %s", status, out)
-	}
-}
-
 // A usage object carrying only a total must not be recorded as an exact zero.
 // The sum is the number every consumer adds up, and it is knowable here.
 func TestPassthroughUsageWithOnlyATotal(t *testing.T) {
@@ -762,7 +684,6 @@ func TestPassthroughRefusalNamesTheCapability(t *testing.T) {
 func TestPassthroughMessagesUseCurrentVocabulary(t *testing.T) {
 	for _, e := range []apiError{
 		errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages)),
-		errPassthroughTooManyItems(4),
 		errPassthroughResponseTooLarge,
 	} {
 		for _, retired := range []string{"상용 모델", "예산 축", "금액 축"} {
@@ -824,5 +745,29 @@ func TestPassthroughMetersTheMeasuredImageEnvelope(t *testing.T) {
 	}
 	if events[0].InputTokens != 19 || events[0].OutputTokens != 1290 || events[0].Estimated {
 		t.Fatalf("image usage: %+v", events[0])
+	}
+}
+
+// What a non-JSON upstream answer actually does, which is the question behind
+// the header allowlist: forwarding a client's Accept could make the vendor
+// return image bytes, and this is the outcome the caller would get.
+//
+// It is a named 502, not a silent drop to an estimate. That matters for the
+// allowlist decision: dropping Accept leaves the caller a working JSON answer
+// they can decode, and forwarding it would trade that for an error.
+func TestPassthroughNonJSONUpstreamAnswerIsRefused(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	h.mock.set(func(o *mockOpts) { o.rawResp = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" })
+	status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody)
+	if status != http.StatusBadGateway || errCode(t, body) != "upstream_error" {
+		t.Fatalf("%d %s", status, body)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 1 || events[0].ErrorType != "upstream_invalid_response" {
+		t.Fatalf("want one upstream_invalid_response event, got %+v", events)
+	}
+	// And nothing was metered as if it had succeeded.
+	if events[0].Status == spool.StatusOK {
+		t.Fatalf("a body we could not read was recorded as a success: %+v", events[0])
 	}
 }

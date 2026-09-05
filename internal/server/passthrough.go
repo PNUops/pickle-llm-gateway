@@ -255,9 +255,6 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				refuse(errMissingParam("model"), spool.StatusBadRequest)
 				return
 			}
-			if refused := s.checkPassthroughN(params, refuse); refused {
-				return
-			}
 
 			// The model fence, unchanged and not rebuilt. passthroughModel
 			// synthesizes the CREDIT-axis model this name would resolve to and
@@ -374,7 +371,22 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// sending garbage — which is the wrong thing to tell someone whose request
 	// was merely too big to relay.
 	limit := s.cfg.PassthroughResponseMaxBytes
-	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	reader := io.LimitReader(resp.Body, limit+1)
+	var body []byte
+	var err error
+	if n := resp.ContentLength; n > 0 && n <= limit {
+		// Allocate once at the declared size. io.ReadAll grows by doubling and
+		// holds the old and the new buffer at the same time while it copies,
+		// so a large answer briefly costs several times itself — and it is the
+		// peak, not the average, that the slot count multiplies. A non-streamed
+		// JSON answer declares its length, which is every answer this surface
+		// forwards. ReadFrom still grows if the upstream understates it.
+		buf := bytes.NewBuffer(make([]byte, 0, n+1))
+		_, err = buf.ReadFrom(reader)
+		body = buf.Bytes()
+	} else {
+		body, err = io.ReadAll(reader)
+	}
 	if err == nil && int64(len(body)) > limit {
 		writeAPIError(w, errPassthroughResponseTooLarge)
 		ev.Status = spool.StatusUpstreamErr
@@ -434,43 +446,6 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	record()
 }
 
-// checkPassthroughN enforces the bound on `n`, answering true when it already
-// refused the request.
-//
-// The comparison is made in float space and before any conversion to int.
-// Go leaves an out-of-range float-to-int conversion implementation-defined,
-// and the two architectures in play disagree: `n: 1e19` saturates to a huge
-// positive on arm64 and wraps to a huge negative on amd64. Converting first
-// would therefore refuse on the development machine and forward on the
-// deployed host, which is the worst possible place for a bound to differ.
-//
-// A value below one is refused as well. It cannot produce an oversized
-// response, but it is not a request the vendor can serve either, and spending
-// an upstream call to be told so helps nobody.
-func (s *Server) checkPassthroughN(params map[string]json.RawMessage,
-	refuse func(apiError, string)) bool {
-	raw, ok := params["n"]
-	if !ok || string(bytes.TrimSpace(raw)) == "null" {
-		// SDKs send null for "unset", which is the same as absent.
-		return false
-	}
-	var num json.Number
-	if json.Unmarshal(raw, &num) != nil {
-		refuse(errInvalidParamValue("n"), spool.StatusBadRequest)
-		return true
-	}
-	f, err := num.Float64()
-	if err != nil || f < 1 {
-		refuse(errInvalidParamValue("n"), spool.StatusBadRequest)
-		return true
-	}
-	if f > float64(s.cfg.PassthroughMaxN) {
-		refuse(errPassthroughTooManyItems(s.cfg.PassthroughMaxN), spool.StatusBadRequest)
-		return true
-	}
-	return false
-}
-
 // passthroughUsage lifts the token counts out of a response. ok=false means
 // the body is not JSON at all.
 //
@@ -524,15 +499,27 @@ func passthroughUsage(body []byte) (usage, bool, bool) {
 // empty, and that is a decision rather than an omission — the mechanism is
 // here so that opening one is a single entry.
 //
-// Nothing survived the list. `Accept` is the one a client legitimately sets,
-// and forwarding it is how metering breaks: a caller asking for image/png gets
-// a body with no `usage` in it and the event silently drops to an estimate.
-// `Accept-Encoding` would hand back a body this surface cannot read.
-// `User-Agent` describes the student's machine to a third party for no benefit.
-// Vendor attribution headers name the vendor in code that is deliberately
-// vendor-neutral, and would attribute a student's call to our account anyway.
-// `Content-Type` and `Authorization` are set by the gateway itself and are not
-// the client's to choose.
+// The rule this was re-examined against is that where the vendor accepts
+// something, this gateway should not be the thing that refuses it. `Accept` is
+// the only header a client sets that the vendor might act on, so it is the
+// only one the rule reaches, and forwarding it makes the caller's outcome
+// worse rather than better.
+//
+// The reason is not that metering would silently go wrong; a test pins what
+// actually happens. An answer this surface cannot parse as JSON is refused as
+// a named 502 and recorded as `upstream_invalid_response`, never metered as a
+// success. So forwarding `Accept: image/png` does not under-bill anyone — it
+// trades a working JSON answer the caller can decode for an error, because
+// the image bytes it would produce carry no `usage` and cannot be relayed as
+// something this service has metered. Dropping the header leaves them the
+// answer they would have got anyway.
+//
+// The rest are not close calls. `Accept-Encoding` would hand back a body this
+// surface cannot read. `User-Agent` describes the student's machine to a third
+// party for no benefit. Vendor attribution headers name the vendor in code
+// that is deliberately vendor-neutral, and would attribute a student's call to
+// our account regardless. `Content-Type` and `Authorization` are set by the
+// gateway itself and are not the client's to choose.
 var passthroughHeaderAllowlist = []string{}
 
 // passthroughForwardedHeaders copies the allowlisted client headers, dropping

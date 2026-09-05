@@ -159,14 +159,6 @@ func errEndpointNotAllowed(label string) apiError {
 			"콘솔에서 이 기능을 신청하면 승인 후 사용할 수 있습니다."}
 }
 
-// Refused here rather than left to the response cap. Past the cap the caller
-// gets a 502 that describes a server fault, which is both wrong and unactionable;
-// the limit is a fact about this service and saying it is the only useful answer.
-func errPassthroughTooManyItems(max int) apiError {
-	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
-		"한 번에 요청할 수 있는 개수(n)의 상한은 " + strconv.Itoa(max) + "입니다."}
-}
-
 func errMissingParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "missing_parameter",
 		"필수 파라미터가 없습니다: " + name}

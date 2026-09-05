@@ -86,7 +86,7 @@ type Config struct {
 	//
 	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
 	//
-	// which at the defaults below is about 1,664 MiB. That is the number to
+	// which at the defaults below is about 2,096 MiB. That is the number to
 	// check a host against, and it is the whole reason this pool is separate:
 	// it holds whatever the chat pool is sized to, so raising one cannot move
 	// the other's arithmetic. The same caps applied to the gateway-wide pool
@@ -103,17 +103,19 @@ type Config struct {
 	// not streamed, so the 60s chat header wait has under twice the margin
 	// while 180s has room.
 	//
-	// The request cap supports both shapes an image edit can take, rather than
-	// asking which one to expect: 16 MiB holds roughly a 12 MB image once
-	// base64 has expanded it, so a 4K reference image fits as a data URL and a
-	// plain URL costs nothing. It is where the supported range and the safety
-	// margin meet — 32 MiB would put the ceiling at 2,432 MiB and leave almost
-	// none.
+	// The request cap is the vendor's own documented limit, 25 MB, rather than
+	// a number of ours. Where the vendor accepts a request there is no reason
+	// for this gateway to be the thing that refuses it, so a value picked here
+	// would only ever be a smaller ceiling with nothing behind it. It covers
+	// both shapes an image edit can take: a reference image as a plain URL
+	// costs nothing, and a 4K one inline as a data URL fits once base64 has
+	// expanded it.
 	//
-	// The bound on `n` is a sanity check and not the effective limit. Four 4K
-	// images are 52 MiB, so the response cap refuses them first; `n` is there
-	// to reject a number that is plainly nonsense before it costs an upstream
-	// call, and size is the response cap's question to answer.
+	// There is deliberately no bound on `n`. The vendor does not cap it, and
+	// the reason one was considered here — that an oversized response would be
+	// truncated into an unexplained 502 — no longer holds: the response cap
+	// refuses that case by name (see errPassthroughResponseTooLarge), so a
+	// resource limit does the work a policy limit would have done, and says so.
 	//
 	// The deployed environment remains the authority — a host with a different
 	// memory budget wants different numbers, and the unit's MemoryHigh and
@@ -122,12 +124,6 @@ type Config struct {
 	PassthroughResponseMaxBytes    int64
 	PassthroughHeaderWait          time.Duration
 	PassthroughMaxInFlight         int
-	// PassthroughMaxN bounds the `n` a passthrough request may ask for. The
-	// surface does not otherwise interpret the body, so without this the
-	// response cap is the only defence and a caller who exceeds it gets a 502
-	// that says nothing about why. Refusing in the caller's own words costs
-	// one more field read from a prefix already being parsed for `model`.
-	PassthroughMaxN int
 
 	// Fallback limits for keys whose snapshot entry sets none.
 	DefaultRpm         int
@@ -207,11 +203,10 @@ func FromEnv() (*Config, error) {
 		// still provisional. The header wait is the value images actually
 		// need: a generation is not streamed, so the upstream sends no headers
 		// until it has finished producing the image.
-		PassthroughRequestBodyMaxBytes: 16 << 20,
+		PassthroughRequestBodyMaxBytes: 25 << 20,
 		PassthroughResponseMaxBytes:    32 << 20,
 		PassthroughHeaderWait:          180 * time.Second,
 		PassthroughMaxInFlight:         16,
-		PassthroughMaxN:                4,
 		DefaultRpm:                     20,
 		DefaultTpm:                     20000,
 		DefaultConcurrency:             2,
@@ -251,7 +246,6 @@ func FromEnv() (*Config, error) {
 	}{
 		{"MAX_IN_FLIGHT", &cfg.MaxInFlight},
 		{"PASSTHROUGH_MAX_IN_FLIGHT", &cfg.PassthroughMaxInFlight},
-		{"PASSTHROUGH_MAX_N", &cfg.PassthroughMaxN},
 		{"BODY_QUEUE_SIZE", &cfg.BodyQueueSize},
 		{"BODY_BATCH_SIZE", &cfg.BodyBatchSize},
 		{"DEFAULT_RPM", &cfg.DefaultRpm},

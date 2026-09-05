@@ -114,6 +114,11 @@ func (u *upstreamMock) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// A real non-streamed JSON answer declares its length, and the gateway
+		// reads it in one allocation when it does.
+		if cp.rawResp != "" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(cp.rawResp)))
+		}
 		switch {
 		case cp.rawResp != "":
 			_, _ = io.WriteString(w, cp.rawResp)
@@ -263,7 +268,6 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		PassthroughResponseMaxBytes:    1 << 20,
 		PassthroughHeaderWait:          5 * time.Second,
 		PassthroughMaxInFlight:         4,
-		PassthroughMaxN:                4,
 		DefaultRpm:                     1000,
 		DefaultTpm:                     1_000_000,
 		DefaultConcurrency:             8,
