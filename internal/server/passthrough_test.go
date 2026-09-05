@@ -86,7 +86,7 @@ func TestPassthroughRefusalIsNamedNotHidden(t *testing.T) {
 	msg := errMessage(t, body)
 	// The capability, not the path: the grant is a capability and that is the
 	// word the approver's screen shows.
-	if !strings.Contains(msg, "이미지") || !strings.Contains(msg, "images") {
+	if !strings.Contains(msg, "이미지 생성") || !strings.Contains(msg, "images") {
 		t.Fatalf("the refusal has to name the capability: %s", msg)
 	}
 	if strings.Contains(msg, "/v1/images") {
@@ -739,8 +739,8 @@ func TestPassthroughRefusalNamesTheCapability(t *testing.T) {
 	for _, tc := range []struct {
 		method, path, body, want string
 	}{
-		{http.MethodPost, "/v1/images", imageBody, "이미지(images)"},
-		{http.MethodGet, "/v1/images/models", "", "이미지(images)"},
+		{http.MethodPost, "/v1/images", imageBody, "이미지 생성(images)"},
+		{http.MethodGet, "/v1/images/models", "", "이미지 생성(images)"},
 		{http.MethodPost, "/v1/embeddings",
 			`{"model":"openai/text-embedding-3-large","input":"hi"}`, "임베딩(embeddings)"},
 	} {

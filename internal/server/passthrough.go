@@ -87,8 +87,13 @@ var (
 // carried alongside the Korean name because the token is what the contract
 // enumerates and what the approval screen lists, so a student reading a
 // refusal and the person granting it are naming the same thing.
+// These are the settled display names, not a paraphrase of them: the whole
+// point is that a student quoting a refusal finds the same words on the screen
+// that grants it. "이미지 생성" reads narrower than what `images` actually
+// covers (editing and the catalogue read travel with it), and matching the
+// screen still wins over being more precise here than the screen is.
 var endpointNames = map[string]string{
-	snapshot.EndpointImages:     "이미지",
+	snapshot.EndpointImages:     "이미지 생성",
 	snapshot.EndpointEmbeddings: "임베딩",
 }
 
