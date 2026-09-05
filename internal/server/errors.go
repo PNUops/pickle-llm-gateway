@@ -147,16 +147,6 @@ func errInvalidParamValue(name string) apiError {
 		"파라미터 값이 올바르지 않습니다: " + name}
 }
 
-// The passthrough surface reads only a bounded prefix of the request body, so
-// a `model` sitting past that prefix is genuinely unreadable rather than
-// absent. The message says which, because the fix is to move the field rather
-// than to add it — a large base64 value ahead of `model` is the way to hit it.
-func errPassthroughModelUnreadable(prefixBytes int) apiError {
-	return apiError{http.StatusBadRequest, "invalid_request_error", "missing_parameter",
-		"요청 본문 앞부분 " + strconv.Itoa(prefixBytes>>10) + " KiB 안에서 model 필드를 찾지 못했습니다. " +
-			"model을 본문 앞쪽에 넣어주세요."}
-}
-
 // Refused here rather than left to the response cap. Past the cap the caller
 // gets a 502 that describes a server fault, which is both wrong and unactionable;
 // the limit is a fact about this service and saying it is the only useful answer.

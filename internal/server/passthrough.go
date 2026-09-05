@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -25,11 +24,21 @@ import (
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
 
-// passthroughPeekBytes is how much of a request body is parsed to find the two
-// fields the fences need. The surface does not interpret the body, so this is
-// a prefix read and not a parse of the whole thing: an image edit carrying a
-// data URL is megabytes of base64 that nothing here has any use for.
-const passthroughPeekBytes = 64 << 10
+// The request body is parsed whole, and the body forwarded upstream is the one
+// this file re-serialized from that parse.
+//
+// A bounded prefix read was tried first and is unsound, because JSON objects
+// may repeat a member and every parser takes the last one. A fence that judged
+// `model` from the front of a body forwarded verbatim can be handed a second
+// `model` further in — inside the prefix, or past it where no prefix read can
+// ever look — and the name that was checked is then not the name that gets
+// billed. The reserved self-serve prefix guard falls to the same trick.
+//
+// Re-serializing is what closes it: the upstream cannot see a member this file
+// did not resolve, so "the name the fence judged" and "the name the vendor
+// serves" are the same string by construction rather than by inspection. It
+// costs a copy of a request body that is already bounded well below the
+// response cap, which is the cheaper half of this surface.
 
 // passthroughRoute is one client-facing path this surface opens.
 type passthroughRoute struct {
@@ -178,6 +187,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		}
 
 		var body []byte
+		inputBytes := 0
 		if route.readsBody {
 			r.Body = http.MaxBytesReader(w, r.Body, s.cfg.PassthroughRequestBodyMaxBytes)
 			raw, err := io.ReadAll(r.Body)
@@ -190,40 +200,53 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				}
 				return
 			}
-			body = raw
+			inputBytes = len(raw)
 
-			peek, err := peekPassthroughBody(body)
-			if err != nil {
+			// Decoding into a map of raw values resolves repeated members the
+			// same way the upstream would, and leaves every value's bytes
+			// untouched so nothing is reinterpreted on the way through.
+			var params map[string]json.RawMessage
+			if json.Unmarshal(raw, &params) != nil {
 				refuse(errBadJSON, spool.StatusBadRequest)
 				return
 			}
-			if peek.model == "" {
-				refuse(errPassthroughModelUnreadable(passthroughPeekBytes), spool.StatusBadRequest)
+			var publicModel string
+			if v, ok := params["model"]; !ok || json.Unmarshal(v, &publicModel) != nil || publicModel == "" {
+				refuse(errMissingParam("model"), spool.StatusBadRequest)
 				return
 			}
-			if peek.haveN && peek.n > s.cfg.PassthroughMaxN {
-				refuse(errPassthroughTooManyItems(s.cfg.PassthroughMaxN), spool.StatusBadRequest)
+			if refused := s.checkPassthroughN(params, refuse); refused {
 				return
 			}
-			ev.PublicModelName = peek.model
 
 			// The model fence, unchanged and not rebuilt. passthroughModel
 			// synthesizes the CREDIT-axis model this name would resolve to and
 			// AllowsCreditModel compares lower-cased strings without consulting
 			// the catalogue, so a name no catalogue lists is fenced exactly as
 			// it is on chat.
-			model := passthroughModel(&doc, peek.model)
+			model := passthroughModel(&doc, publicModel)
 			if model == nil {
 				// A reserved self-serve prefix, or a name too long to be one.
 				// Either way it is not a passthrough name and never leaves.
 				refuse(errModelNotFound, spool.StatusBadRequest)
 				return
 			}
+			// Recorded only once the length guard above has accepted it. The
+			// name is client input on its way to the spool and the journal,
+			// and the guard is what bounds it — assigning any earlier would
+			// let a refused request write kilobytes of junk to both.
+			ev.PublicModelName = model.PublicName
 			if !key.AllowsCreditModel(model) {
 				refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
 					"credit_model_not_allowed")
 				return
 			}
+			forward, err := json.Marshal(params)
+			if err != nil {
+				refuse(errBadJSON, spool.StatusBadRequest)
+				return
+			}
+			body = forward
 		}
 
 		upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
@@ -291,7 +314,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// `choices[0].message.content` out — and neither has a counterpart in
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
-		s.finishPassthrough(w, resp, route, len(body), &ev, record)
+		s.finishPassthrough(w, resp, route, inputBytes, &ev, record)
 	}
 }
 
@@ -344,6 +367,12 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		return
 	}
 
+	// Bound the write to the client. The slot this request holds is released
+	// only when the handler returns, and nothing else bounds a caller that
+	// reads its answer a byte at a time: upCtx covers the upstream call, and
+	// the server sets no write timeout. With a pool this small, two slow
+	// readers would otherwise be the whole surface.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.cfg.RequestMaxDuration))
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := w.Write(body); err != nil {
 		ev.Status = spool.StatusCanceled
@@ -365,73 +394,41 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	record()
 }
 
-// passthroughPeek is what one prefix read yields.
-type passthroughPeek struct {
-	model string
-	n     int
-	haveN bool
-}
-
-// peekPassthroughBody pulls `model` and `n` out of the front of a request
-// body. It walks top-level members with a streaming decoder and stops at the
-// first thing it cannot read, so a body whose prefix ends mid-value still
-// yields whatever came before the cut — which is the whole reason it is not a
-// plain Unmarshal of a truncated slice.
+// checkPassthroughN enforces the bound on `n`, answering true when it already
+// refused the request.
 //
-// A body at or under the prefix size is read whole, so only a large one can
-// hide `model` past the cut. err is returned only when the prefix is not the
-// start of a JSON object at all; a missing `model` comes back as an empty
-// string, because the two need different answers.
-func peekPassthroughBody(body []byte) (passthroughPeek, error) {
-	var out passthroughPeek
-	prefix := body
-	if len(prefix) > passthroughPeekBytes {
-		prefix = prefix[:passthroughPeekBytes]
+// The comparison is made in float space and before any conversion to int.
+// Go leaves an out-of-range float-to-int conversion implementation-defined,
+// and the two architectures in play disagree: `n: 1e19` saturates to a huge
+// positive on arm64 and wraps to a huge negative on amd64. Converting first
+// would therefore refuse on the development machine and forward on the
+// deployed host, which is the worst possible place for a bound to differ.
+//
+// A value below one is refused as well. It cannot produce an oversized
+// response, but it is not a request the vendor can serve either, and spending
+// an upstream call to be told so helps nobody.
+func (s *Server) checkPassthroughN(params map[string]json.RawMessage,
+	refuse func(apiError, string)) bool {
+	raw, ok := params["n"]
+	if !ok || string(bytes.TrimSpace(raw)) == "null" {
+		// SDKs send null for "unset", which is the same as absent.
+		return false
 	}
-	dec := json.NewDecoder(bytes.NewReader(prefix))
-	dec.UseNumber()
-	tok, err := dec.Token()
-	if err != nil {
-		return out, err
+	var num json.Number
+	if json.Unmarshal(raw, &num) != nil {
+		refuse(errInvalidParamValue("n"), spool.StatusBadRequest)
+		return true
 	}
-	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '{' {
-		return out, errors.New("request body is not a JSON object")
+	f, err := num.Float64()
+	if err != nil || f < 1 {
+		refuse(errInvalidParamValue("n"), spool.StatusBadRequest)
+		return true
 	}
-	for dec.More() {
-		nameTok, err := dec.Token()
-		if err != nil {
-			return out, nil // the prefix ended; report what was found
-		}
-		name, _ := nameTok.(string)
-		// Decoding into a RawMessage consumes exactly one value whatever its
-		// shape, which is how a member this surface does not care about gets
-		// stepped over without being understood.
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			return out, nil
-		}
-		switch name {
-		case "model":
-			var v string
-			if json.Unmarshal(raw, &v) == nil {
-				out.model = v
-			}
-		case "n":
-			// Read as a number rather than an int: `2.0` and `2e0` are the
-			// same request to the upstream, and an int-only parse would let
-			// either of them walk past the bound as an unread field.
-			var v json.Number
-			if json.Unmarshal(raw, &v) == nil {
-				if f, err := v.Float64(); err == nil {
-					out.n, out.haveN = int(math.Ceil(f)), true
-				}
-			}
-		}
-		if out.model != "" && out.haveN {
-			break
-		}
+	if f > float64(s.cfg.PassthroughMaxN) {
+		refuse(errPassthroughTooManyItems(s.cfg.PassthroughMaxN), spool.StatusBadRequest)
+		return true
 	}
-	return out, nil
+	return false
 }
 
 // passthroughUsage lifts the token counts out of a response. ok=false means
@@ -468,8 +465,17 @@ func passthroughUsage(body []byte) (usage, bool, bool) {
 		u.PromptTokens = envelope.Usage.InputTokens
 		u.CompletionTokens = envelope.Usage.OutputTokens
 	}
-	if u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 {
-		return usage{}, false, true
+	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
+		if u.TotalTokens == 0 {
+			return usage{}, false, true
+		}
+		// A total with no split. The event has no field for a total, and
+		// recording the split as two zeros would report a metered request as
+		// costing nothing while leaving `estimated` false — a wrong number
+		// wearing the flag that says it is exact. Carrying it on the input
+		// side keeps the sum right, which is what every consumer adds up; the
+		// split is simply not knowable from what the vendor sent.
+		u.PromptTokens = u.TotalTokens
 	}
 	return u, true, true
 }

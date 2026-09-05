@@ -77,12 +77,17 @@ type Config struct {
 	// change what a chat request may send or hold.
 	//
 	// The separate slot pool is what makes the memory arithmetic provable.
-	// Measured amplification is 1.75x (2026-09-02), so the worst case this
-	// surface can put on the heap is
+	// A request is held three times over — the bytes as read, the decoded
+	// top-level members, and the body re-serialized for the upstream, which is
+	// what makes the model fence sound (see passthrough.go). The response is
+	// held once, because it is forwarded verbatim rather than re-marshalled.
+	// Taking the measured 1.75x amplification (2026-09-02) on the response
+	// side as the conservative bound, the worst case this surface can put on
+	// the heap is
 	//
-	//	(PassthroughRequestBodyMaxBytes + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
+	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
 	//
-	// which at the defaults below is about 128 MiB — a number that fits in a
+	// which at the defaults below is about 160 MiB — a number that fits in a
 	// unit file's comment, which the same caps raised globally would not. It
 	// also stops a slow image generation from starving chat of slots.
 	//

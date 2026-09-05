@@ -304,31 +304,18 @@ func TestPassthroughCatalogueReadIsNotEstimated(t *testing.T) {
 	}
 }
 
-// The prefix peek finds `model` past a large member, and says which of the two
-// failures happened when it cannot.
-func TestPassthroughPrefixPeek(t *testing.T) {
+// `model` is read from the whole body, so its position in the object does not
+// decide whether the request works.
+func TestPassthroughReadsModelAnywhereInTheBody(t *testing.T) {
 	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
 
-	// A reference image well under the prefix size: `model` is still found.
-	small := `{"image":"` + strings.Repeat("A", 8<<10) + `","model":"openai/gpt-image-1","prompt":"x"}`
-	if status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, small); status != 200 {
-		t.Fatalf("small prefix: %d %s", status, body)
+	// A reference image far past any prefix a peek could have read.
+	big := `{"image":"` + strings.Repeat("A", 128<<10) + `","model":"openai/gpt-image-1","prompt":"x"}`
+	if status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, big); status != 200 {
+		t.Fatalf("model after a large member: %d %s", status, body)
 	}
 
-	// One past it: the field is unreadable, and the message says to move it
-	// rather than to add it.
-	big := `{"image":"` + strings.Repeat("A", passthroughPeekBytes) + `","model":"openai/gpt-image-1","prompt":"x"}`
-	status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, big)
-	if status != http.StatusBadRequest || errCode(t, body) != "missing_parameter" {
-		t.Fatalf("large prefix: %d %s", status, body)
-	}
-	if msg := errMessage(t, body); !strings.Contains(msg, "앞쪽") {
-		t.Fatalf("message must say where to move the field: %s", msg)
-	}
-
-	// No model at all reads the same way, which is correct: neither request
-	// can be fenced, and the fix is the same field.
-	status, body = h.passthrough(t, http.MethodPost, "/v1/images", testToken, `{"prompt":"x"}`)
+	status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, `{"prompt":"x"}`)
 	if status != http.StatusBadRequest || errCode(t, body) != "missing_parameter" {
 		t.Fatalf("absent model: %d %s", status, body)
 	}
@@ -336,6 +323,89 @@ func TestPassthroughPrefixPeek(t *testing.T) {
 	status, body = h.passthrough(t, http.MethodPost, "/v1/images", testToken, `not json`)
 	if status != http.StatusBadRequest || errCode(t, body) != "invalid_json" {
 		t.Fatalf("bad json: %d %s", status, body)
+	}
+}
+
+// A JSON object may repeat a member and parsers take the last one, so a fence
+// that reads one `model` while the upstream reads another is no fence at all.
+// The body that leaves must be the one that was judged.
+func TestPassthroughDuplicateModelCannotEvadeTheFence(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		passthroughDoc(snapshot.EndpointImages)(d)
+		d.Keys[0].CreditAllowedModels = []string{"openai/gpt-image-1"}
+	}, nil)
+
+	for _, name := range []string{"duplicate in place", "duplicate past any prefix"} {
+		var body string
+		switch name {
+		case "duplicate in place":
+			body = `{"model":"openai/gpt-image-1","n":1,"model":"openai/sora-2-pro","prompt":"x"}`
+		default:
+			body = `{"model":"openai/gpt-image-1","prompt":"` + strings.Repeat("A", 96<<10) +
+				`","model":"openai/sora-2-pro"}`
+		}
+		status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body)
+		if status != http.StatusForbidden || errCode(t, out) != "model_not_allowed" {
+			t.Fatalf("%s: %d %s", name, status, out)
+		}
+		if h.mock.callCount() != 0 {
+			t.Fatalf("%s: reached the upstream", name)
+		}
+	}
+
+	// The reserved self-serve prefix falls to the same trick if the fence
+	// reads a different member than the upstream does.
+	status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","model":"pickle-general","prompt":"x"}`)
+	if status != http.StatusNotFound || errCode(t, out) != "model_not_found" {
+		t.Fatalf("reserved name: %d %s", status, out)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("a reserved name left for the upstream")
+	}
+}
+
+// What the upstream receives is what the fence judged, member for member.
+func TestPassthroughForwardsTheResolvedBody(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","n":1,"n":2,"prompt":"x"}`)
+	if status != 200 {
+		t.Fatalf("%d %s", status, out)
+	}
+	_, _, _, raw := h.mock.lastRequest()
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["model"] != "openai/gpt-image-1" {
+		t.Fatalf("upstream model: %v", got["model"])
+	}
+	// One `n`, and the one the bound was applied to.
+	if strings.Count(string(raw), `"n"`) != 1 {
+		t.Fatalf("upstream saw a repeated member: %s", raw)
+	}
+	if got["prompt"] != "x" {
+		t.Fatalf("an untouched field was altered: %v", got["prompt"])
+	}
+}
+
+// A model name past the length guard must not reach the spool or the journal.
+// The guard is what bounds a field that is client input all the way through.
+func TestPassthroughOversizedModelNameIsNotRecorded(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	junk := strings.Repeat("z", 60<<10)
+	status, _ := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"`+junk+`","prompt":"x"}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("status %d", status)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if events[0].PublicModelName != "" {
+		t.Fatalf("%d bytes of client input reached the spool", len(events[0].PublicModelName))
 	}
 }
 
@@ -553,6 +623,11 @@ func TestPassthroughUnauthenticatedIsNotSpooled(t *testing.T) {
 
 // The bound is on the request, not on one spelling of it: a float or an
 // exponent is the same number to the upstream and must not walk past.
+//
+// The large values matter most. Go leaves an out-of-range float-to-int
+// conversion implementation-defined and the two architectures in play disagree
+// on the sign, so a bound applied after converting passes on the development
+// machine and fails open on the deployed host.
 func TestPassthroughNBoundIsNotEvadableBySpelling(t *testing.T) {
 	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
 		c.PassthroughMaxN = 2
@@ -561,6 +636,24 @@ func TestPassthroughNBoundIsNotEvadableBySpelling(t *testing.T) {
 		`{"model":"openai/gpt-image-1","prompt":"x","n":3.0}`,
 		`{"model":"openai/gpt-image-1","prompt":"x","n":3e0}`,
 		`{"model":"openai/gpt-image-1","prompt":"x","n":2.5}`,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":1e19}`,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":9999999999999999999999}`,
+		// The bound is on the number, so a numeric string spelling of an
+		// over-large value is refused by the same comparison.
+		`{"model":"openai/gpt-image-1","prompt":"x","n":"1e19"}`,
+	} {
+		status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s: %d %s", body, status, out)
+		}
+	}
+	// Neither is a value the vendor can serve, and spending an upstream call
+	// to be told so helps nobody.
+	for _, body := range []string{
+		`{"model":"openai/gpt-image-1","prompt":"x","n":-3}`,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":0}`,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":"abc"}`,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":[2]}`,
 	} {
 		status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, body)
 		if status != http.StatusBadRequest || errCode(t, out) != "invalid_parameter_value" {
@@ -569,6 +662,39 @@ func TestPassthroughNBoundIsNotEvadableBySpelling(t *testing.T) {
 	}
 	if h.mock.callCount() != 0 {
 		t.Fatalf("a refused n reached the upstream: %d calls", h.mock.callCount())
+	}
+	// A numeric string inside the bound is left to the upstream to accept or
+	// refuse on type; what matters here is that the bound was applied to it.
+	if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":"2"}`); status != 200 {
+		t.Fatalf("stringy n inside the bound: %d %s", status, out)
+	}
+	// null is what an SDK sends for "unset", which is the same as absent.
+	if status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","prompt":"x","n":null}`); status != 200 {
+		t.Fatalf("null n: %d %s", status, out)
+	}
+}
+
+// A usage object carrying only a total must not be recorded as an exact zero.
+// The sum is the number every consumer adds up, and it is knowable here.
+func TestPassthroughUsageWithOnlyATotal(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	h.mock.set(func(o *mockOpts) {
+		o.rawResp = `{"created":1,"data":[{"b64_json":"aGk="}],"usage":{"total_tokens":4200}}`
+	})
+	if status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if got := events[0].InputTokens + events[0].OutputTokens; got != 4200 {
+		t.Fatalf("the reported total was lost: %+v", events[0])
+	}
+	if events[0].Estimated {
+		t.Fatalf("a reported total is not an estimate: %+v", events[0])
 	}
 }
 
