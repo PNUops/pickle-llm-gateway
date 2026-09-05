@@ -71,6 +71,36 @@ type Config struct {
 	// ever applied before any of the response has reached the client.
 	UpstreamRetries int
 
+	// The passthrough surface's own copies of the four values above. Chat runs
+	// on the fields above and does not move; these govern only the routes the
+	// passthrough surface opens, so an answer about image sizes can never
+	// change what a chat request may send or hold.
+	//
+	// The separate slot pool is what makes the memory arithmetic provable.
+	// Measured amplification is 1.75x (2026-09-02), so the worst case this
+	// surface can put on the heap is
+	//
+	//	(PassthroughRequestBodyMaxBytes + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
+	//
+	// which at the defaults below is about 128 MiB — a number that fits in a
+	// unit file's comment, which the same caps raised globally would not. It
+	// also stops a slow image generation from starving chat of slots.
+	//
+	// THE DEPLOYED ENVIRONMENT IS THE AUTHORITY ON THESE VALUES. The defaults
+	// here are deliberately conservative placeholders chosen before the image
+	// response-size measurement landed; they are sized to be safe on the
+	// smallest host this daemon runs on, not to be right for the deployment.
+	PassthroughRequestBodyMaxBytes int64
+	PassthroughResponseMaxBytes    int64
+	PassthroughHeaderWait          time.Duration
+	PassthroughMaxInFlight         int
+	// PassthroughMaxN bounds the `n` a passthrough request may ask for. The
+	// surface does not otherwise interpret the body, so without this the
+	// response cap is the only defence and a caller who exceeds it gets a 502
+	// that says nothing about why. Refusing in the caller's own words costs
+	// one more field read from a prefix already being parsed for `model`.
+	PassthroughMaxN int
+
 	// Fallback limits for keys whose snapshot entry sets none.
 	DefaultRpm         int
 	DefaultTpm         int
@@ -143,17 +173,26 @@ func FromEnv() (*Config, error) {
 		// this default: a response near that cap costs roughly 13 MB to hold,
 		// decode and re-serialise, so raising the cap moves how many such
 		// responses it takes to exhaust the container.
-		MaxInFlight:        16,
-		UpstreamRetries:    1,
-		DefaultRpm:         20,
-		DefaultTpm:         20000,
-		DefaultConcurrency: 2,
-		SpoolRetentionDays: 90,
-		UsageBatchSize:     500,
-		UsagePushInterval:  30 * time.Second,
-		BodyQueueSize:      256,
-		BodyBatchSize:      20,
-		Upstreams:          map[string]Upstream{},
+		MaxInFlight:     16,
+		UpstreamRetries: 1,
+		// Conservative placeholders; see the field comments. An image
+		// generation takes 30s to 2 minutes and is not streamed, so the
+		// upstream sends no headers until it has finished — the header wait,
+		// not the caps, is what actually blocks images at the chat defaults.
+		PassthroughRequestBodyMaxBytes: 8 << 20,
+		PassthroughResponseMaxBytes:    32 << 20,
+		PassthroughHeaderWait:          180 * time.Second,
+		PassthroughMaxInFlight:         2,
+		PassthroughMaxN:                4,
+		DefaultRpm:                     20,
+		DefaultTpm:                     20000,
+		DefaultConcurrency:             2,
+		SpoolRetentionDays:             90,
+		UsageBatchSize:                 500,
+		UsagePushInterval:              30 * time.Second,
+		BodyQueueSize:                  256,
+		BodyBatchSize:                  20,
+		Upstreams:                      map[string]Upstream{},
 	}
 
 	var errs []string
@@ -183,6 +222,8 @@ func FromEnv() (*Config, error) {
 		dst  *int
 	}{
 		{"MAX_IN_FLIGHT", &cfg.MaxInFlight},
+		{"PASSTHROUGH_MAX_IN_FLIGHT", &cfg.PassthroughMaxInFlight},
+		{"PASSTHROUGH_MAX_N", &cfg.PassthroughMaxN},
 		{"BODY_QUEUE_SIZE", &cfg.BodyQueueSize},
 		{"BODY_BATCH_SIZE", &cfg.BodyBatchSize},
 		{"DEFAULT_RPM", &cfg.DefaultRpm},
@@ -222,6 +263,7 @@ func FromEnv() (*Config, error) {
 		{"CONTROL_TIMEOUT", &cfg.ControlTimeout},
 		{"USAGE_PUSH_INTERVAL", &cfg.UsagePushInterval},
 		{"UPSTREAM_HEADER_WAIT", &cfg.UpstreamHeaderWait},
+		{"PASSTHROUGH_HEADER_WAIT", &cfg.PassthroughHeaderWait},
 		{"REQUEST_MAX_DURATION", &cfg.RequestMaxDuration},
 	} {
 		if v := getenv(opt.name, ""); v != "" {
@@ -257,12 +299,21 @@ func FromEnv() (*Config, error) {
 			cfg.UsageBatchSize = n
 		}
 	}
-	if v := getenv("REQUEST_BODY_MAX_BYTES", ""); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n <= 0 {
-			errs = append(errs, envPrefix+"REQUEST_BODY_MAX_BYTES must be a positive integer")
-		} else {
-			cfg.RequestBodyMaxBytes = n
+	for _, opt := range []struct {
+		name string
+		dst  *int64
+	}{
+		{"REQUEST_BODY_MAX_BYTES", &cfg.RequestBodyMaxBytes},
+		{"PASSTHROUGH_REQUEST_BODY_MAX_BYTES", &cfg.PassthroughRequestBodyMaxBytes},
+		{"PASSTHROUGH_RESPONSE_MAX_BYTES", &cfg.PassthroughResponseMaxBytes},
+	} {
+		if v := getenv(opt.name, ""); v != "" {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || n <= 0 {
+				errs = append(errs, envPrefix+opt.name+" must be a positive integer")
+				continue
+			}
+			*opt.dst = n
 		}
 	}
 
