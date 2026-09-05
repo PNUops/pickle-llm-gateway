@@ -82,19 +82,32 @@ type Config struct {
 	// what makes the model fence sound (see passthrough.go). The response is
 	// held once, because it is forwarded verbatim rather than re-marshalled.
 	// Taking the measured 1.75x amplification (2026-09-02) on the response
-	// side as the conservative bound, the worst case this surface can put on
-	// the heap is
+	// side as the conservative bound, the ceiling these caps guarantee is
 	//
 	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
 	//
-	// which at the defaults below is about 160 MiB — a number that fits in a
-	// unit file's comment, which the same caps raised globally would not. It
-	// also stops a slow image generation from starving chat of slots.
+	// which at the defaults below is about 1,280 MiB. That is the number to
+	// check a host against, and it is the whole reason this pool is separate:
+	// it holds whatever the chat pool is sized to, so raising one cannot move
+	// the other's arithmetic. The same caps applied to the gateway-wide pool
+	// would give a figure in the tens of gigabytes.
 	//
-	// THE DEPLOYED ENVIRONMENT IS THE AUTHORITY ON THESE VALUES. The defaults
-	// here are deliberately conservative placeholders chosen before the image
-	// response-size measurement landed; they are sized to be safe on the
-	// smallest host this daemon runs on, not to be right for the deployment.
+	// The expected load is far below the ceiling. An image response measured
+	// 2026-09-05 is 13.09 MiB at 4K and 1.61 MiB at the default resolution
+	// (base64 expands the image 1.333x), so sixteen concurrent 4K generations
+	// sit at about 366 MiB.
+	//
+	// The three values the measurement decided are the response cap, the
+	// header wait and the slot count. An 8 MiB response cap could not hold a
+	// 4K image at all, and 32 MiB leaves room above one; a 4K generation takes
+	// 32 seconds and is not streamed, so the 60s chat header wait has under
+	// twice the margin while 180s has room. The request cap and the `n` bound
+	// stay provisional: whether an edit's reference image arrives as a URL or
+	// as a data URL is still unanswered, and that is what would size them.
+	//
+	// The deployed environment remains the authority — a host with a different
+	// memory budget wants different numbers, and the unit's MemoryHigh and
+	// GOMEMLIMIT move with them.
 	PassthroughRequestBodyMaxBytes int64
 	PassthroughResponseMaxBytes    int64
 	PassthroughHeaderWait          time.Duration
@@ -180,14 +193,14 @@ func FromEnv() (*Config, error) {
 		// responses it takes to exhaust the container.
 		MaxInFlight:     16,
 		UpstreamRetries: 1,
-		// Conservative placeholders; see the field comments. An image
-		// generation takes 30s to 2 minutes and is not streamed, so the
-		// upstream sends no headers until it has finished — the header wait,
-		// not the caps, is what actually blocks images at the chat defaults.
+		// See the field comments for what the measurement decided and what is
+		// still provisional. The header wait is the value images actually
+		// need: a generation is not streamed, so the upstream sends no headers
+		// until it has finished producing the image.
 		PassthroughRequestBodyMaxBytes: 8 << 20,
 		PassthroughResponseMaxBytes:    32 << 20,
 		PassthroughHeaderWait:          180 * time.Second,
-		PassthroughMaxInFlight:         2,
+		PassthroughMaxInFlight:         16,
 		PassthroughMaxN:                4,
 		DefaultRpm:                     20,
 		DefaultTpm:                     20000,

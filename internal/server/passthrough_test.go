@@ -799,3 +799,30 @@ func TestPassthroughDoesNotRewriteNumbers(t *testing.T) {
 		t.Fatalf("n was rewritten: %s", raw)
 	}
 }
+
+// The envelope an image generation actually returns, measured 2026-09-05. It
+// carries the chat naming plus a cost and a per-modality breakdown, and the
+// extra members must neither confuse the extraction nor be dropped from what
+// the caller receives.
+func TestPassthroughMetersTheMeasuredImageEnvelope(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	const resp = `{"created":1757030400,"data":[{"b64_json":"aGk="}],` +
+		`"usage":{"prompt_tokens":19,"completion_tokens":1290,"total_tokens":1309,` +
+		`"completion_tokens_details":{"image_tokens":1290},"cost":0.242}}`
+	h.mock.set(func(o *mockOpts) { o.rawResp = resp })
+	status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody)
+	if status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	// Forwarded whole: cost and the breakdown are the caller's to read.
+	if string(body) != resp {
+		t.Fatalf("the envelope was altered: %s", body)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if events[0].InputTokens != 19 || events[0].OutputTokens != 1290 || events[0].Estimated {
+		t.Fatalf("image usage: %+v", events[0])
+	}
+}

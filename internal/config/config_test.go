@@ -273,7 +273,7 @@ func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
 	if cfg.PassthroughRequestBodyMaxBytes != 8<<20 || cfg.PassthroughResponseMaxBytes != 32<<20 {
 		t.Fatalf("byte defaults: %d %d", cfg.PassthroughRequestBodyMaxBytes, cfg.PassthroughResponseMaxBytes)
 	}
-	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 2 {
+	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 16 {
 		t.Fatalf("wait/pool defaults: %v %d", cfg.PassthroughHeaderWait, cfg.PassthroughMaxInFlight)
 	}
 	if cfg.PassthroughMaxN != 4 {
