@@ -895,3 +895,28 @@ func TestPassthroughRefusesStreaming(t *testing.T) {
 		}
 	}
 }
+
+// The same guards on this surface. A preset and an unreadable stream both fail
+// closed here, and the vendor's own model field is noted even though the caller
+// can see it: our own records cannot.
+func TestPassthroughPresetAndStreamFailClosed(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	for _, tc := range []struct{ name, body, code string }{
+		{"preset field", `{"model":"openai/gpt-image-1","preset":"s"}`, "preset_not_supported"},
+		{"preset in the model", `{"model":"openai/gpt-image-1@preset/s"}`, ""},
+		{"unreadable stream", `{"model":"openai/gpt-image-1","stream":"yes"}`, "invalid_parameter_value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, out := h.passthrough(t, http.MethodPost, "/v1/images", testToken, tc.body)
+			if status == 200 {
+				t.Fatalf("served: %s", out)
+			}
+			if tc.code != "" && errCode(t, out) != tc.code {
+				t.Fatalf("%d %s", status, out)
+			}
+			if h.mock.callCount() != 0 {
+				t.Fatal("reached the upstream")
+			}
+		})
+	}
+}

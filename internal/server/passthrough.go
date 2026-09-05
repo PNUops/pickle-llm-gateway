@@ -275,6 +275,10 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			if !key.AllowsCreditModel(model) {
 				// See chat.go: the two predicates are re-read only to pick the
 				// message, never to decide.
+				if snapshot.IsPresetModelName(publicModel) {
+					refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
+					return
+				}
 				if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
 					refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
 						"router_model_not_allowed")
@@ -282,6 +286,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				}
 				refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
 					"credit_model_not_allowed")
+				return
+			}
+			// See chat.go: a preset reaches past every check here from outside
+			// the fields they read, and is refused for every key.
+			if _, present := params[snapshot.PresetField]; present {
+				refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
 				return
 			}
 			// The same fence over any fallback candidates, for the same reason
@@ -304,7 +314,17 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// successful.
 			if raw, present := params["stream"]; present {
 				var streaming bool
-				if json.Unmarshal(raw, &streaming) == nil && streaming {
+				// A value this build cannot read is refused rather than
+				// forwarded. Ignoring it would leave one file deciding two
+				// ways: `models` fails closed when unreadable and `stream`
+				// would fail open, and it is the same question both times —
+				// what does the gateway do with an instruction it did not
+				// understand.
+				if json.Unmarshal(raw, &streaming) != nil {
+					refuse(errInvalidParamValue("stream"), spool.StatusBadRequest)
+					return
+				}
+				if streaming {
 					refuse(errPassthroughNoStreaming, spool.StatusBadRequest)
 					return
 				}
@@ -460,7 +480,7 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// A response that does not parse as JSON is not something the gateway can
 	// vouch for, and forwarding it verbatim could hand back whatever the
 	// upstream put in it. Same answer chat gives.
-	u, haveUsage, ok := passthroughUsage(body)
+	served, u, haveUsage, ok := passthroughUsage(body)
 	if !ok {
 		writeAPIError(w, errUpstream)
 		ev.Status = spool.StatusUpstreamErr
@@ -475,6 +495,11 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// the server sets no write timeout. With a pool this small, two slow
 	// readers would otherwise be the whole surface.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.cfg.RequestMaxDuration))
+	// The caller sees the vendor's own model field here, since this surface
+	// forwards the body untouched — but nothing on our side would, and a
+	// fallback is exactly the case somebody later has to explain.
+	s.noteServedModel(ev, ev.PublicModelName, served)
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := w.Write(body); err != nil {
 		ev.Status = spool.StatusCanceled
@@ -505,8 +530,9 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 // — a wrong number that says it is exact. A usage object that yields nothing
 // on either naming is therefore reported as absent, which sends the event down
 // the estimate path where the flag says so.
-func passthroughUsage(body []byte) (usage, bool, bool) {
+func passthroughUsage(body []byte) (string, usage, bool, bool) {
 	var envelope struct {
+		Model string `json:"model"`
 		Usage *struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
@@ -516,10 +542,10 @@ func passthroughUsage(body []byte) (usage, bool, bool) {
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return usage{}, false, false
+		return "", usage{}, false, false
 	}
 	if envelope.Usage == nil {
-		return usage{}, false, true
+		return envelope.Model, usage{}, false, true
 	}
 	u := usage{
 		PromptTokens:     envelope.Usage.PromptTokens,
@@ -532,7 +558,7 @@ func passthroughUsage(body []byte) (usage, bool, bool) {
 	}
 	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 		if u.TotalTokens == 0 {
-			return usage{}, false, true
+			return envelope.Model, usage{}, false, true
 		}
 		// A total with no split. The event has no field for a total, and
 		// recording the split as two zeros would report a metered request as
@@ -542,7 +568,7 @@ func passthroughUsage(body []byte) (usage, bool, bool) {
 		// split is simply not knowable from what the vendor sent.
 		u.PromptTokens = u.TotalTokens
 	}
-	return u, true, true
+	return envelope.Model, u, true, true
 }
 
 // passthroughHeaderAllowlist is which client headers reach the upstream. It is

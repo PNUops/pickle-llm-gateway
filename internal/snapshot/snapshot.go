@@ -99,30 +99,86 @@ const (
 // silently never match (a test pins this).
 var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 
-// routerModelNames are public names that are not models. The vendor resolves
-// each to some other model at request time, by its own criteria, and bills the
-// request as whatever it picked — its documentation says the response's model
-// field is how you find out which one answered.
+// routerVendorPrefix is the vendor whose whole namespace selects models rather
+// than naming them. Each name under it resolves to some other model at request
+// time, by the vendor's own criteria, and the request is billed as whatever it
+// picked — the vendor's documentation says the response's model field is how
+// you find out which one answered.
 //
 // That makes them unfenceable by the money lists, which judge the one name a
 // request asked for. Unlike a fallback candidate list there is nothing to walk:
-// the choice does not exist until the vendor makes it.
+// the choice does not exist until after the fence has run.
 //
-// The list follows the vendor and is the cost of closing this. Today it holds
-// one entry; a new router is a line here, the same maintenance the reserved
-// prefixes above already carry. Missing an entry fails open, so a name that
-// looks like a router and is not listed is worth adding before it is needed.
-var routerModelNames = map[string]bool{
-	"openrouter/auto": true,
-}
+// THIS IS A PREFIX AND NOT A LIST OF NAMES, and the difference is the point. A
+// list was written first with the one name then known; it missed four more that
+// already existed and would have missed every one added later. That is how the
+// same defect was found three times in one round, the third time created by the
+// list itself. A full read of the vendor catalogue (431 models, 2026-09-05)
+// found six names under this vendor and no real model among them: auto,
+// auto-beta, free, fusion, pareto-code and bodybuilder. Closing the vendor
+// closes whatever it adds next, without anyone having to notice in time.
+//
+// The cost is that a real model shipped under this vendor would be refused.
+// That is the safe direction, and the catalogue says there are none.
+const routerVendorPrefix = "openrouter/"
 
 // IsRouterModelName reports whether a public name selects a model rather than
-// naming one. The leading tilde is stripped for the same reason it is above:
-// the vendor marks floating aliases that way and a caller may spell one.
+// naming one.
+//
+// The leading tilde is stripped because the vendor really does use it: the same
+// catalogue read found 13 tilde ids, every one a "-latest" floating alias. So a
+// caller can spell one, and without stripping it this guard would be one
+// character from being walked past.
+//
+// Those aliases leave a gap this does not close: a key denying
+// anthropic/claude-opus-4 can still reach that model as
+// ~anthropic/claude-opus-latest. That is a standing decision — "~vendor/*" and
+// "vendor/*" are deliberately separate prefixes and the approval screen says
+// so — not something this guard should quietly change.
 func IsRouterModelName(publicName string) bool {
-	lower := strings.TrimPrefix(strings.ToLower(publicName), "~")
-	return routerModelNames[lower]
+	// Surrounding space is stripped because a prefix test is defeated by a
+	// single leading byte. A variant suffix is not stripped and needs no
+	// handling: ":nitro" is at the end and cannot move what a name starts with,
+	// which is one of the things a prefix buys over a set of exact names.
+	lower := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(publicName)), "~")
+	return strings.HasPrefix(lower, routerVendorPrefix)
 }
+
+// presetMarker attaches a saved configuration to a request. The vendor accepts
+// it three ways: a top-level "preset" field, a model named "@preset/slug", and
+// a model with one appended, "openai/gpt-4@preset/slug". A preset can carry the
+// model and the fallback list, so it stands in for everything the money fence
+// judges and reaches it from outside the fields the fence reads.
+//
+// It is refused rather than judged, and refused for every key rather than only
+// fenced ones, because presets live on the platform's own vendor account: every
+// student key is issued under it, so one preset created there is reachable by
+// all of them. Nothing is lost by refusing — a full read of the vendor
+// catalogue (431 models, 2026-09-05) found no model id containing this
+// character.
+const presetMarker = "@"
+
+// PresetField is the top-level request field that names a preset directly.
+const PresetField = "preset"
+
+// IsPresetModelName reports whether a model name carries a preset.
+func IsPresetModelName(publicName string) bool {
+	return strings.Contains(publicName, presetMarker)
+}
+
+// A NOTE ON ALL OF THE ABOVE, worth reading before adding a sixth guard.
+//
+// The money fence assumes one thing: that the name a request asks for is the
+// model that gets billed. Five separate channels have broken that assumption —
+// a repeated `model` member, the `models` fallback list, this vendor's router
+// namespace, the tilde floating aliases, and presets — and each arrived through
+// a different door. The guards here close those five. They do not close the
+// class, and nothing here can: the structural answer is to admit only names the
+// vendor's catalogue calls a concrete model, and the gateway does not have that
+// catalogue (the control plane does).
+//
+// So when a sixth appears, the question is not which guard to add. It is
+// whether the catalogue belongs here.
 
 // IsReservedModelName reports whether a public model name sits under a
 // reserved self-serve prefix, current or retired. Such a name is served only
@@ -358,7 +414,28 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	if len(k.CreditAllowedModels) > 0 && !matchesAnyCreditModel(k.CreditAllowedModels, name) {
 		return false
 	}
-	return !matchesAnyCreditModel(k.CreditDeniedModels, name)
+	// The two lists deliberately part company on the tilde, and this is the one
+	// place the "an entry means the same thing in either list" symmetry does
+	// not hold.
+	//
+	// The allow list keeps the strict reading: "~anthropic/*" and "anthropic/*"
+	// stay separate prefixes there, because an approver who opened a vendor did
+	// not thereby choose a moving target that points somewhere new next week.
+	// That reasoning is about granting, and it does not survive being copied
+	// onto a list that only ever takes away — read strictly on the deny side it
+	// left a key that denied "anthropic/*" still able to reach that vendor's
+	// newest model through "~anthropic/claude-opus-latest".
+	//
+	// So a denial is tested against the tilde-stripped name as well. Denying
+	// wider costs nothing: the worst case is refusing an alias of a model
+	// somebody had already decided this key may not use.
+	if matchesAnyCreditModel(k.CreditDeniedModels, name) {
+		return false
+	}
+	if stripped := strings.TrimPrefix(name, "~"); stripped != name {
+		return !matchesAnyCreditModel(k.CreditDeniedModels, stripped)
+	}
+	return true
 }
 
 // matchesAnyCreditModel reports whether any pattern in one already-normalized
@@ -390,10 +467,19 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 	if pattern == "" || pattern == "*" {
 		return false
 	}
+	// A variant suffix (":nitro", ":batch", ":free") is the same model at
+	// another rate, so every exact comparison below is made against the bare
+	// name as well. The leading-star branch already did this and the exact ones
+	// did not, which left one function keeping two rules: a deny list naming
+	// openai/gpt-5-pro fenced that model and let openai/gpt-5-pro:nitro past.
+	// Matching wider costs nothing on a deny list, which only ever takes away,
+	// and on an allow list it admits another rate for a model already chosen.
+	baseName, _, _ := strings.Cut(lowerName, ":")
+
 	vendor, seg, hasVendor := strings.Cut(pattern, "/")
 	if !hasVendor {
 		// A name with no vendor segment ("pickle-general") is an exact entry.
-		return pattern == lowerName
+		return pattern == lowerName || pattern == baseName
 	}
 	rest, ok := strings.CutPrefix(lowerName, vendor+"/")
 	if !ok || rest == "" {
@@ -433,7 +519,11 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 		}
 		return false
 	default:
-		return rest == seg
+		if rest == seg {
+			return true
+		}
+		base, _, _ := strings.Cut(rest, ":")
+		return base == seg
 	}
 }
 

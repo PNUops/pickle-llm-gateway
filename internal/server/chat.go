@@ -43,6 +43,11 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 	// the guard into a billable request. Retired prefixes stay guarded too.
 	if doc.PassthroughRef == "" ||
 		snapshot.IsReservedModelName(publicName) ||
+		// A preset stands in for the model and its fallbacks, so a name
+		// carrying one is not a name this fence can judge. Guarded here rather
+		// than at the call sites because this is the one door every
+		// uncatalogued name goes through.
+		snapshot.IsPresetModelName(publicName) ||
 		len(publicName) > maxPassthroughNameBytes {
 		return nil
 	}
@@ -115,6 +120,17 @@ func fenceCandidateModels(doc *snapshot.Document, modelLookup func(string) *snap
 // after being refused as a primary.
 func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
 	key *snapshot.Key, name string) bool {
+	// An empty candidate is refused rather than ignored. The primary `model`
+	// already refuses an empty string, and a list that quietly tolerates one is
+	// the asymmetry a fail-closed claim cannot afford — `[null]` decodes to
+	// exactly this.
+	if name == "" {
+		return false
+	}
+	// A preset in a candidate is the same refusal as a preset in `model`.
+	if snapshot.IsPresetModelName(name) {
+		return false
+	}
 	// A reserved self-serve name is never a candidate, catalogued or not. The
 	// list goes to the vendor, so such a name there is either a typo or our own
 	// naming leaving the platform; the catalogue lookup below would otherwise
@@ -128,6 +144,16 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 		m = passthroughModel(doc, name)
 	}
 	if m == nil {
+		return false
+	}
+	// The axis has to be checked, not inferred. AllowsCreditModel answers true
+	// for anything off the money axis — that is what makes it a money fence —
+	// so a candidate that resolves to a TOKEN-axis catalogue row would sail
+	// through every check here. Requiring the money axis closes that
+	// structurally rather than by naming the shapes that could reach it, and
+	// costs nothing: a self-hosted model is not something the vendor can serve,
+	// so it is meaningless as a fallback anyway.
+	if !m.CreditAxis() {
 		return false
 	}
 	return key.AllowsModel(m) && key.AllowsCreditModel(m)
@@ -413,6 +439,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// Re-reading the two predicates here decides only which message to
 			// send; the refusal itself was already decided above, and this
 			// branch cannot admit anything the fence turned away.
+			if snapshot.IsPresetModelName(publicModel) {
+				refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
+				return
+			}
 			if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
 				refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
 					"router_model_not_allowed")
@@ -420,6 +450,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
 				"credit_model_not_allowed")
+			return
+		}
+		// A preset carries its own model and fallback list, so it reaches past
+		// every check here from outside the fields they read. Refused rather
+		// than judged: presets live on the platform's vendor account, which
+		// every student key is issued under, so one created there is reachable
+		// by all of them.
+		if _, present := params[snapshot.PresetField]; present {
+			refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
 			return
 		}
 		// The same fence over the fallback candidates. Without this the field

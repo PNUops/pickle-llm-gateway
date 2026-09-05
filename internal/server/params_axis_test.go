@@ -385,9 +385,126 @@ func TestRouterNameVariantsAreCaught(t *testing.T) {
 			t.Fatalf("%q was not recognised as a router name", name)
 		}
 	}
-	for _, name := range []string{"openai/gpt-5", "openrouter/auto-x", ""} {
+	// The whole vendor namespace is a router namespace, so every one of these
+	// is caught without being named. A list held one of them and missed four.
+	for _, name := range []string{
+		"openrouter/auto-beta", "openrouter/free", "openrouter/fusion",
+		"openrouter/pareto-code", "openrouter/bodybuilder",
+		"openrouter/whatever-ships-next",
+		// Normalization: a prefix test is defeated by one leading byte.
+		" openrouter/auto", "~openrouter/auto", "openrouter/auto:nitro",
+	} {
+		if !snapshot.IsRouterModelName(name) {
+			t.Fatalf("%q was not recognised as a router name", name)
+		}
+	}
+	for _, name := range []string{"openai/gpt-5", "openrouterx/auto", ""} {
 		if snapshot.IsRouterModelName(name) {
 			t.Fatalf("%q was wrongly treated as a router name", name)
+		}
+	}
+}
+
+// A preset stands in for the model and its fallback list, so it reaches past
+// the fence from outside the fields the fence reads. All three shapes the
+// vendor accepts are refused, for every key: presets live on the platform's own
+// vendor account, which every student key is issued under.
+func TestPresetIsRefusedInEveryShape(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"top-level field", `{"model":"vendor-model","messages":[],"preset":"my-slug"}`},
+		{"model position", `{"model":"@preset/my-slug","messages":[]}`},
+		{"appended to a model", `{"model":"openai/gpt-5@preset/my-slug","messages":[]}`},
+		{"in a candidate", `{"model":"vendor-model","messages":[],"models":["openai/gpt-5@preset/s"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, creditPassthroughDoc, nil)
+			status, resp := h.chat(t, testToken, tc.body)
+			if status == 200 {
+				t.Fatalf("a preset was served: %s", resp)
+			}
+			if h.mock.callCount() != 0 {
+				t.Fatalf("a preset reached the upstream")
+			}
+		})
+	}
+	// An unfenced key is refused too — the reachability is the point, not the
+	// money.
+	h := newHarness(t, creditPassthroughDoc, nil)
+	status, resp := h.chat(t, testToken, `{"model":"vendor-model","messages":[],"preset":"s"}`)
+	if status != 400 || errCode(t, resp) != "preset_not_supported" {
+		t.Fatalf("%d %s", status, resp)
+	}
+	if msg := errMessage(t, resp); !strings.Contains(msg, "직접 지정") {
+		t.Fatalf("message does not say what to do: %s", msg)
+	}
+}
+
+// A deny list has to match wider than an allow list, because it only ever takes
+// away. Reading the tilde strictly on the deny side left a key that denied a
+// vendor still able to reach its newest model through a floating alias.
+func TestDenyListCatchesFloatingAliases(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditDeniedModels = []string{"anthropic/*"}
+	}, nil)
+	for _, name := range []string{"anthropic/claude-opus-4", "~anthropic/claude-opus-latest"} {
+		body := `{"model":"` + name + `","messages":[{"role":"user","content":"hi"}]}`
+		status, resp := h.chat(t, testToken, body)
+		if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+			t.Fatalf("%s: %d %s", name, status, resp)
+		}
+	}
+	// The allow list keeps the strict reading: opening a vendor does not open
+	// its moving targets.
+	h2 := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditAllowedModels = []string{"anthropic/*"}
+	}, nil)
+	status, resp := h2.chat(t, testToken,
+		`{"model":"~anthropic/claude-opus-latest","messages":[{"role":"user","content":"hi"}]}`)
+	if status != http.StatusForbidden {
+		t.Fatalf("an allow list must not pick up a floating alias: %d %s", status, resp)
+	}
+}
+
+// A variant suffix is the same model at another rate, so an exact deny entry
+// has to reach it. One function was keeping two rules: the leading-star branch
+// stripped variants and the exact branch did not.
+func TestExactDenyCatchesVariantSuffixes(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Keys[0].CreditDeniedModels = []string{"openai/gpt-5-pro"}
+	}, nil)
+	for _, name := range []string{"openai/gpt-5-pro", "openai/gpt-5-pro:nitro", "openai/gpt-5-pro:free"} {
+		body := `{"model":"` + name + `","messages":[{"role":"user","content":"hi"}]}`
+		status, resp := h.chat(t, testToken, body)
+		if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+			t.Fatalf("%s: %d %s", name, status, resp)
+		}
+	}
+	// A different model that merely shares the prefix is untouched.
+	if status, resp := h.chat(t, testToken,
+		`{"model":"openai/gpt-5-pro-max","messages":[{"role":"user","content":"hi"}]}`); status != 200 {
+		t.Fatalf("a neighbouring model was caught: %d %s", status, resp)
+	}
+}
+
+// A candidate that resolves to a self-hosted row would sail through the money
+// fence, because AllowsCreditModel answers true for anything off that axis.
+func TestCandidateMustBeOnTheMoneyAxis(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	// pickle-general is a real catalogue row on the TOKEN axis.
+	body := `{"model":"vendor-model","messages":[],"models":["pickle-general"]}`
+	status, resp := h.chat(t, testToken, body)
+	if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+		t.Fatalf("%d %s", status, resp)
+	}
+	// An empty candidate is refused rather than ignored; [null] decodes to it.
+	for _, list := range []string{`[""]`, `[null]`, `["openai/gpt-5",""]`} {
+		body := `{"model":"vendor-model","messages":[],"models":` + list + `}`
+		status, resp := h.chat(t, testToken, body)
+		if status != http.StatusForbidden {
+			t.Fatalf("%s: %d %s", list, status, resp)
 		}
 	}
 }

@@ -133,6 +133,14 @@ func errParamNeedsCreditModel(name string) apiError {
 			". 유료 모델에서만 사용할 수 있습니다."}
 }
 
+// A preset. It stands in for the model and its fallback list, so it reaches
+// past the money fence from outside the fields the fence reads, and it is
+// refused for every key because presets live on the platform's own vendor
+// account rather than the caller's.
+var errPresetNotAllowed = apiError{http.StatusBadRequest, "invalid_request_error",
+	"preset_not_supported",
+	"이 게이트웨이는 preset을 지원하지 않습니다. 모델 이름을 직접 지정해주세요."}
+
 // A router name on a key that carries a model fence. The generic refusal is
 // wrong here: the caller did not ask for a model somebody excluded, they asked
 // for a name that picks one later, and the remedy is to name a model rather
