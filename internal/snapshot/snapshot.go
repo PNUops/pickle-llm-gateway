@@ -113,9 +113,13 @@ var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 // list was written first with the one name then known; it missed four more that
 // already existed and would have missed every one added later. That is how the
 // same defect was found three times in one round, the third time created by the
-// list itself. A full read of the vendor catalogue (431 models, 2026-09-05)
-// found six names under this vendor and no real model among them: auto,
-// auto-beta, free, fusion, pareto-code and bodybuilder. Closing the vendor
+// list itself. A read of the vendor's model listing (431 models, 2026-09-05)
+// found six names under this vendor: auto, auto-beta, free, fusion,
+// pareto-code and bodybuilder, none of them a real model. **That listing is
+// not the whole catalogue** — the image models sit on a separate listing and
+// 41 of its 50 do not appear on the general one, which was found out on
+// 2026-09-06 by asserting a model was absent when it was not. The image
+// listing was then checked too, and carries no name under this vendor. Closing the vendor
 // closes whatever it adds next, without anyone having to notice in time.
 //
 // A real model CAN ship under this vendor, so the cost is not zero and the
@@ -171,9 +175,10 @@ func IsRouterModelName(publicName string) bool {
 // It is refused rather than judged, and refused for every key rather than only
 // fenced ones, because presets live on the platform's own vendor account: every
 // student key is issued under it, so one preset created there is reachable by
-// all of them. Nothing is lost by refusing — a full read of the vendor
-// catalogue (431 models, 2026-09-05) found no model id containing this
-// character.
+// all of them. Nothing is lost by refusing: neither of the vendor's two
+// listings carries a model id containing this character — the general one
+// (431 models, 2026-09-05) nor the image one (50 models, 2026-09-06). Both
+// had to be read, because the second is not a subset of the first.
 const presetMarker = "@"
 
 // PresetField is the top-level request field that names a preset directly.
