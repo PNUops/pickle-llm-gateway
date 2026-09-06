@@ -69,12 +69,12 @@ type Event struct {
 	// capability while one of them spends money and the other reads a
 	// catalogue for free.
 	Endpoint string `json:"endpoint,omitempty"`
-	// ServedModelName is the model the upstream answered with, before the
-	// response's own field is rewritten to the public name. Without it a
-	// vendor fallback to a different model leaves nothing in the record to say
-	// so. Written on every metered response rather than only on a mismatch: a
-	// field that appears only when the two differ makes an empty value mean
-	// both "not reported" and "same as requested".
+	// ServedModelName is the model the upstream answered with, written only
+	// when it differed from the one it was asked for. Without it a vendor
+	// fallback leaves nothing in the record to say so, and its presence is the
+	// finding: the pair worth comparing is two upstream model ids, and only
+	// this side holds both. See noteServedModel for why comparing it against
+	// the public name downstream was wrong in both directions.
 	ServedModelName string `json:"servedModelName,omitempty"`
 	// CostUsd is what the vendor charged for this one request, from
 	// usage.cost. Absent is not zero — a free paid model genuinely costs zero

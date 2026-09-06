@@ -52,8 +52,14 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 		return nil
 	}
 	return &snapshot.Model{
-		PublicName:    publicName,
-		UpstreamRef:   doc.PassthroughRef,
+		PublicName:  publicName,
+		UpstreamRef: doc.PassthroughRef,
+		// The two names are deliberately the same string, and something now
+		// depends on it: the passthrough surface has no upstream name in scope
+		// where it records a served model, so it passes the public one. That is
+		// correct only while this identity holds. Mapping a name here without
+		// threading the upstream one down there turns that comparison into the
+		// public-versus-upstream one that was wrong everywhere else.
 		UpstreamModel: publicName,
 		BudgetAxis:    snapshot.AxisCredit,
 	}
@@ -475,6 +481,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		refuse(errBadJSON, spool.StatusBadRequest)
 		return
 	}
+	// Stamped here rather than where the stream is set up, because every fence
+	// between the two refuses requests that did ask for one. Reading it off a
+	// refusal as false would understate streaming by exactly the traffic that
+	// never got through, which is the traffic a limit question is about.
+	if raw, ok := params["stream"]; ok {
+		var streamed bool
+		_ = json.Unmarshal(raw, &streamed)
+		ev.Streamed = streamed
+	}
 	var publicModel string
 	if raw, ok := params["model"]; !ok || json.Unmarshal(raw, &publicModel) != nil || publicModel == "" {
 		refuse(errMissingParam("model"), spool.StatusBadRequest)
@@ -717,11 +732,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streaming := false
-	if raw, ok := params["stream"]; ok {
-		_ = json.Unmarshal(raw, &streaming)
-	}
-	ev.Streamed = streaming
+	// Already on the event, stamped before the fences above.
+	streaming := ev.Streamed
 	// Usage must always come back from the upstream for metering, but the
 	// usage chunk is only forwarded when the student asked for it — clients
 	// that never opted in would break on a chunk with an empty choices array.
@@ -843,23 +855,30 @@ const upstreamResponseCapBytes = 8 << 20
 // model field is rewritten to the public name a line later, which makes this
 // the only place the fact exists at all.
 //
-// It is recorded on every metered response, not only on a mismatch. A field
-// that appears only when the two differ makes an empty value mean both "the
-// vendor reported nothing" and "the same model we asked for", and every reader
-// downstream then has to guess which. The warning stays for the mismatch case,
-// where somebody may want to look now rather than at the next report.
+// It is recorded only when the answer differs from what was asked for, and
+// that is a correction of the reasoning this function first shipped with.
+//
+// The argument for recording it always was that an absent value otherwise
+// means both "the vendor reported nothing" and "the same model we asked for".
+// True, and it cost more than it was worth: the two names it compares live in
+// different namespaces. What goes on the wire is the upstream model id, while
+// the event's public model name is the name this service issues, and for every
+// catalogue model those differ by design -- hiding the upstream name is what a
+// public name is for. Anything downstream comparing the two therefore reported
+// a fallback on every ordinary self-hosted request.
+//
+// Comparing here is the only place the right pair is in hand. The distinction
+// that was lost is one nobody had a use for; the count that was wrong is read
+// by an aggregate.
 //
 // The name comes from an upstream response body, so it is bounded here rather
 // than left to the control plane's own limit: an oversized one would otherwise
 // reach the spool on a small disk with a 90-day retention.
 func (s *Server) noteServedModel(ev *spool.Event, requested, served string) {
-	if served == "" {
+	if served == "" || requested == "" || strings.EqualFold(requested, served) {
 		return
 	}
 	ev.ServedModelName = boundServedModel(served)
-	if requested == "" || strings.EqualFold(requested, served) {
-		return
-	}
 	s.log.Warn("upstream served a different model than requested",
 		"keyId", ev.KeyID, "publicModel", ev.PublicModelName,
 		"requested", requested, "served", served, "eventUuid", ev.EventUUID)

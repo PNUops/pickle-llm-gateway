@@ -136,10 +136,38 @@ func TestCostLiteralRefusesWhatWouldBreakTheLine(t *testing.T) {
 	}
 }
 
-// An old spool line has none of the seven, and that shape stays legal: the
-// gateway ships them only after the control plane can store them, so the two
-// versions coexist on disk.
-func TestOldSpoolLineKeepsTheMetricsGroupAbsent(t *testing.T) {
+// An old spool line has none of the seven, and a line carrying them all still
+// round trips. Two versions coexist on disk because the gateway ships these
+// only after the control plane can store them.
+//
+// Reading an old line back is a weak half of this on its own: absent members
+// leave zero values whatever the struct looks like, so no change to this file
+// could redden it. What it is paired with is the half that can fail -- a
+// marshal and unmarshal of a fully populated event, which breaks the moment a
+// type stops surviving the trip. It does not catch a misspelled tag -- the same
+// struct writes and reads it, so both sides agree on the wrong name. The
+// allowlist test above is what sees that, by looking at the marshaled keys.
+func TestTheMetricsGroupSurvivesTheWireAndIsAbsentFromOldLines(t *testing.T) {
+	full := Event{
+		EventUUID: "u", Status: StatusOK, RequestedAt: time.Now().UTC().Truncate(time.Second),
+		Endpoint: EndpointImages, ServedModelName: "vendor/model", CostUsd: "0.242",
+		ImageCount: 2, CachedInputTokens: 80, ReasoningTokens: 25, Streamed: true,
+	}
+	raw, err := json.Marshal(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Event
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Endpoint != full.Endpoint || back.ServedModelName != full.ServedModelName ||
+		back.CostUsd != full.CostUsd || back.ImageCount != full.ImageCount ||
+		back.CachedInputTokens != full.CachedInputTokens ||
+		back.ReasoningTokens != full.ReasoningTokens || back.Streamed != full.Streamed {
+		t.Fatalf("round trip lost a metric:\n got %+v\nwant %+v", back, full)
+	}
+
 	old := []byte(`{"eventUuid":"old","status":"OK","inputTokens":1,"outputTokens":2,` +
 		`"latencyMs":1,"requestedAt":"2026-08-10T00:00:00Z"}`)
 	var ev Event

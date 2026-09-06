@@ -97,22 +97,58 @@ func TestStreamedIsRecordedAndIsNotInferableFromTtft(t *testing.T) {
 	}
 }
 
-// The served name is written on every metered response rather than only on a
-// mismatch. Writing it only when the two differ makes an empty value mean both
-// "the vendor reported nothing" and "the same model we asked for".
-func TestServedModelIsRecordedEvenWhenItMatches(t *testing.T) {
+// A request refused before the stream is ever set up still says it asked for
+// one. Reading the flag off a refusal as false would understate streaming by
+// exactly the traffic that never got through.
+func TestARefusedRequestStillSaysItAskedForAStream(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	if status, body := h.chat(t, testToken, chatBody); status != 200 {
-		t.Fatalf("%d %s", status, body)
+	status, _ := h.chat(t, testToken, `{"model":"no-such-model","stream":true,"messages":[]}`)
+	if status == 200 {
+		t.Fatal("expected a refusal")
 	}
 	evs := h.spoolEvents(t)
-	if len(evs) != 1 || evs[0].ServedModelName != upstreamModel {
-		t.Fatalf("served name: %+v", evs)
+	if len(evs) != 1 || !evs[0].Streamed {
+		t.Fatalf("refusal did not record the stream request: %+v", evs)
 	}
-	// The client still sees the public name; the record is where the upstream
-	// one lives.
-	if evs[0].PublicModelName == evs[0].ServedModelName {
-		t.Fatal("the public and served names are the same, so this test proves nothing")
+}
+
+// The served name is written only when the upstream answered with something
+// other than what it was asked for.
+//
+// The pair being compared is what makes this the right rule. Both names here
+// are upstream model ids; the event's public model name is in a different
+// namespace and differs from the upstream one on every catalogue model by
+// design. Recording the name unconditionally left anything downstream
+// comparing those two reporting a fallback on every ordinary request.
+func TestServedModelIsRecordedOnlyOnAMismatch(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("ordinary: %d %s", status, body)
+	}
+	evs := h.spoolEvents(t)
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	// The upstream echoed the model it was asked for, which is the ordinary
+	// case and not a fallback -- even though the public name differs from it.
+	if evs[0].ServedModelName != "" {
+		t.Fatalf("ordinary request recorded a served name %q", evs[0].ServedModelName)
+	}
+	if evs[0].PublicModelName == upstreamModel {
+		t.Fatal("public and upstream names are equal here, so this proves nothing")
+	}
+
+	h.mock.set(func(o *mockOpts) {
+		o.rawResp = `{"id":"c1","object":"chat.completion","model":"vendor/something-else",` +
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},` +
+			`"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+	})
+	if status, body := h.chat(t, testToken, chatBody); status != 200 {
+		t.Fatalf("fallback: %d %s", status, body)
+	}
+	evs = h.spoolEvents(t)
+	if len(evs) != 2 || evs[1].ServedModelName != "vendor/something-else" {
+		t.Fatalf("fallback not recorded: %+v", evs)
 	}
 }
 

@@ -520,6 +520,13 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// The caller sees the vendor's own model field here, since this surface
 	// forwards the body untouched — but nothing on our side would, and a
 	// fallback is exactly the case somebody later has to explain.
+	//
+	// The public name stands in for the upstream one, and that is only correct
+	// because passthroughModel sets them to the same string. Everywhere else a
+	// public name is deliberately not the upstream id, and comparing the two is
+	// the defect this argument list would otherwise reproduce. If this surface
+	// ever maps a name, the right value has to be threaded down here — the
+	// identity is asserted where it is created.
 	s.noteServedModel(ev, ev.PublicModelName, served)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -545,7 +552,14 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// many images arrived is known even when the vendor priced none of them.
 	// Images bill per image, so an event without this reads as a few hundred
 	// tokens and nothing else says otherwise.
-	ev.ImageCount = images
+	//
+	// Guarded by route, because `data` is a list on the embedding route too
+	// and counting its length there reports one image per input vector on a
+	// route that produces no image at all. The shape of the two responses is
+	// the same; only the route says which one this was.
+	if route.name == spool.EndpointImages {
+		ev.ImageCount = images
+	}
 	record()
 }
 
