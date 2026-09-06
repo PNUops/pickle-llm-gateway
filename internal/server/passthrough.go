@@ -46,7 +46,13 @@ type passthroughRoute struct {
 	// image catalogue read travels with image generation rather than needing a
 	// grant of its own.
 	capability string
-	method     string
+	// name is what the accounting calls this route. It is separate from
+	// capability because they answer different questions: a capability is what
+	// a key was granted, and several routes share one, while this says which
+	// route ran. Counting image generation and the free catalogue read under
+	// one name would put a paid call and a lookup in the same bucket.
+	name   string
+	method string
 	// upstreamPath is appended to the upstream's base URL. The client-facing
 	// path is the same string under /v1, which is the whole point of a
 	// passthrough surface — there is no mapping to keep in step.
@@ -61,6 +67,7 @@ type passthroughRoute struct {
 var (
 	routeImages = passthroughRoute{
 		capability:   snapshot.EndpointImages,
+		name:         spool.EndpointImages,
 		method:       http.MethodPost,
 		upstreamPath: "/images",
 		readsBody:    true,
@@ -71,11 +78,13 @@ var (
 	// money fence still refuses at call time, so nothing here grants a model.
 	routeImageModels = passthroughRoute{
 		capability:   snapshot.EndpointImages,
+		name:         spool.EndpointImageModels,
 		method:       http.MethodGet,
 		upstreamPath: "/images/models",
 	}
 	routeEmbeddings = passthroughRoute{
 		capability:   snapshot.EndpointEmbeddings,
+		name:         spool.EndpointEmbeddings,
 		method:       http.MethodPost,
 		upstreamPath: "/embeddings",
 		readsBody:    true,
@@ -119,7 +128,11 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			return
 		}
 		start := s.now()
-		ev := spool.Event{EventUUID: spool.NewEventUUID(), RequestedAt: start}
+		ev := spool.Event{
+			EventUUID:   spool.NewEventUUID(),
+			RequestedAt: start,
+			Endpoint:    route.name,
+		}
 		w.Header().Set("X-Request-Id", ev.EventUUID)
 		record := func() {
 			ev.LatencyMs = time.Since(start).Milliseconds()
@@ -489,7 +502,7 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// A response that does not parse as JSON is not something the gateway can
 	// vouch for, and forwarding it verbatim could hand back whatever the
 	// upstream put in it. Same answer chat gives.
-	served, u, haveUsage, ok := passthroughUsage(body)
+	served, u, images, haveUsage, ok := passthroughUsage(body)
 	if !ok {
 		writeAPIError(w, errUpstream)
 		ev.Status = spool.StatusUpstreamErr
@@ -527,11 +540,19 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// the degraded path and its `estimated` flag is the signal that the
 	// vendor stopped reporting — see settleUsage.
 	s.settleUsage(ev, u, haveUsage, inputBytes, 0)
+	// Outside settleUsage because the count comes from the response body
+	// rather than the usage object, and it survives the estimate path: how
+	// many images arrived is known even when the vendor priced none of them.
+	// Images bill per image, so an event without this reads as a few hundred
+	// tokens and nothing else says otherwise.
+	ev.ImageCount = images
 	record()
 }
 
-// passthroughUsage lifts the token counts out of a response. ok=false means
-// the body is not JSON at all.
+// passthroughUsage lifts the token counts, the vendor's price and the image
+// count out of a response. The returns are, in order: the model the vendor
+// named, the usage, how many images came back, whether usage was reported at
+// all, and whether the body parsed as JSON at all.
 //
 // It reads both field namings because this surface does not control which one
 // the vendor uses per route, and a struct that quietly fills with zeros would
@@ -539,27 +560,41 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 // — a wrong number that says it is exact. A usage object that yields nothing
 // on either naming is therefore reported as absent, which sends the event down
 // the estimate path where the flag says so.
-func passthroughUsage(body []byte) (string, usage, bool, bool) {
+func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 	var envelope struct {
 		Model string `json:"model"`
+		// Data is the image list. Counting what came back rather than trusting
+		// the requested n is the honest figure: the vendor may return fewer,
+		// and the billing follows what arrived.
+		Data  []json.RawMessage `json:"data"`
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-			InputTokens      int `json:"input_tokens"`
-			OutputTokens     int `json:"output_tokens"`
+			PromptTokens        int         `json:"prompt_tokens"`
+			CompletionTokens    int         `json:"completion_tokens"`
+			TotalTokens         int         `json:"total_tokens"`
+			InputTokens         int         `json:"input_tokens"`
+			OutputTokens        int         `json:"output_tokens"`
+			Cost                json.Number `json:"cost"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return "", usage{}, false, false
+		return "", usage{}, 0, false, false
 	}
 	if envelope.Usage == nil {
-		return envelope.Model, usage{}, false, true
+		return envelope.Model, usage{}, len(envelope.Data), false, true
 	}
 	u := usage{
-		PromptTokens:     envelope.Usage.PromptTokens,
-		CompletionTokens: envelope.Usage.CompletionTokens,
-		TotalTokens:      envelope.Usage.TotalTokens,
+		PromptTokens:            envelope.Usage.PromptTokens,
+		CompletionTokens:        envelope.Usage.CompletionTokens,
+		TotalTokens:             envelope.Usage.TotalTokens,
+		Cost:                    envelope.Usage.Cost,
+		PromptTokensDetails:     envelope.Usage.PromptTokensDetails,
+		CompletionTokensDetails: envelope.Usage.CompletionTokensDetails,
 	}
 	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 		u.PromptTokens = envelope.Usage.InputTokens
@@ -567,7 +602,11 @@ func passthroughUsage(body []byte) (string, usage, bool, bool) {
 	}
 	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 		if u.TotalTokens == 0 {
-			return envelope.Model, usage{}, false, true
+			// The price is dropped along with the counts. A charge recorded
+			// beside zero tokens would be read as an unmetered request that
+			// still cost money, which is a different and more alarming claim
+			// than the estimate this actually falls back to.
+			return envelope.Model, usage{}, len(envelope.Data), false, true
 		}
 		// A total with no split. The event has no field for a total, and
 		// recording the split as two zeros would report a metered request as
@@ -577,7 +616,7 @@ func passthroughUsage(body []byte) (string, usage, bool, bool) {
 		// split is simply not knowable from what the vendor sent.
 		u.PromptTokens = u.TotalTokens
 	}
-	return envelope.Model, u, true, true
+	return envelope.Model, u, len(envelope.Data), true, true
 }
 
 // passthroughHeaderAllowlist is which client headers reach the upstream. It is

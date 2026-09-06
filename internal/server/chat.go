@@ -345,6 +345,20 @@ type usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Cost is what the vendor charged for this request. It reaches the client
+	// verbatim either way; reading it here is what puts a dollar figure in the
+	// accounting, which until now had only the vendor's own cumulative meters.
+	// json.Number so the vendor's precision survives — it reports down to
+	// about 1e-7 and a float64 round trip is not something to spend on a
+	// number that is added up across a month.
+	Cost json.Number `json:"cost"`
+	// The two details are subsets of the counts above, not additions.
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -353,7 +367,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := s.now()
-	ev := spool.Event{EventUUID: spool.NewEventUUID(), RequestedAt: start}
+	// Set before every fence, so a refused request still says which route it
+	// came in on. The one shape that never reaches the spool at all is an
+	// unauthenticated attempt, which belongs to nobody.
+	ev := spool.Event{
+		EventUUID:   spool.NewEventUUID(),
+		RequestedAt: start,
+		Endpoint:    spool.EndpointChat,
+	}
 	// The request id is the usage event's id, echoed on every response so a
 	// student can quote it in a support request (requirements §13) and so it
 	// ties their report to the metered event. OpenAI SDKs surface this header.
@@ -700,6 +721,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if raw, ok := params["stream"]; ok {
 		_ = json.Unmarshal(raw, &streaming)
 	}
+	ev.Streamed = streaming
 	// Usage must always come back from the upstream for metering, but the
 	// usage chunk is only forwarded when the student asked for it — clients
 	// that never opted in would break on a chunk with an empty choices array.
@@ -821,17 +843,38 @@ const upstreamResponseCapBytes = 8 << 20
 // model field is rewritten to the public name a line later, which makes this
 // the only place the fact exists at all.
 //
-// It is logged rather than spooled. The usage event has no field for a served
-// model, and adding one is a change the control plane has to accept first —
-// the same ordering that governed budgetAxis — so the log is what closes the
-// gap today.
+// It is recorded on every metered response, not only on a mismatch. A field
+// that appears only when the two differ makes an empty value mean both "the
+// vendor reported nothing" and "the same model we asked for", and every reader
+// downstream then has to guess which. The warning stays for the mismatch case,
+// where somebody may want to look now rather than at the next report.
+//
+// The name comes from an upstream response body, so it is bounded here rather
+// than left to the control plane's own limit: an oversized one would otherwise
+// reach the spool on a small disk with a 90-day retention.
 func (s *Server) noteServedModel(ev *spool.Event, requested, served string) {
-	if requested == "" || served == "" || strings.EqualFold(requested, served) {
+	if served == "" {
+		return
+	}
+	ev.ServedModelName = boundServedModel(served)
+	if requested == "" || strings.EqualFold(requested, served) {
 		return
 	}
 	s.log.Warn("upstream served a different model than requested",
 		"keyId", ev.KeyID, "publicModel", ev.PublicModelName,
 		"requested", requested, "served", served, "eventUuid", ev.EventUUID)
+}
+
+// servedModelMax is shorter than the control plane's own text bound on
+// purpose. Nothing legitimate approaches it, and the cost of a long one is
+// paid on this side first.
+const servedModelMax = 128
+
+func boundServedModel(served string) string {
+	if len(served) > servedModelMax {
+		return served[:servedModelMax]
+	}
+	return served
 }
 
 func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
@@ -1224,10 +1267,25 @@ func (s *Server) settleUsage(ev *spool.Event, u usage, haveUsage bool, inputByte
 	if haveUsage {
 		ev.InputTokens = u.PromptTokens
 		ev.OutputTokens = u.CompletionTokens
+		ev.CostUsd = spool.CostLiteral(u.Cost)
+		ev.CachedInputTokens = nonNegative(u.PromptTokensDetails.CachedTokens)
+		ev.ReasoningTokens = nonNegative(u.CompletionTokensDetails.ReasoningTokens)
 		return
 	}
+	// The estimate path writes no price and no breakdown. An estimate has
+	// neither, and leaving a value from somewhere else would be a number
+	// claiming to be exact next to a flag saying the tokens are not. Every
+	// caller reaches this function, which is why the rule lives here rather
+	// than at each of the four call sites.
 	ev.InputTokens, ev.OutputTokens = estimateTokens(inputBytes, contentChars)
 	ev.Estimated = true
+}
+
+func nonNegative(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // estimateTokens is the byte-based fallback when no upstream usage arrived.

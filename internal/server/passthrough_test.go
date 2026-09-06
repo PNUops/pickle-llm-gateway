@@ -284,6 +284,59 @@ func TestPassthroughMetering(t *testing.T) {
 	if emb.InputTokens != 9 || emb.OutputTokens != 0 || emb.Estimated {
 		t.Fatalf("embedding usage: %+v", emb)
 	}
+	// Tokens do not represent what an image cost. The vendor's own price and
+	// the number of images that came back are what make the row readable.
+	if img.CostUsd != "0.04" || img.ImageCount != 1 {
+		t.Fatalf("image price: %+v", img)
+	}
+	if img.Endpoint != spool.EndpointImages || emb.Endpoint != spool.EndpointEmbeddings {
+		t.Fatalf("routes: %q %q", img.Endpoint, emb.Endpoint)
+	}
+	// A passthrough route refuses `stream`, so nothing here is ever streamed.
+	if img.Streamed || emb.Streamed {
+		t.Fatalf("passthrough claimed a stream: %+v %+v", img, emb)
+	}
+}
+
+// The catalogue read and image generation share one capability and must not
+// share one accounting bucket: one of them spends money per call and the other
+// is a free lookup.
+func TestPassthroughRoutesAreCountedApartWithinOneCapability(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), nil)
+	if status, body := h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody); status != 200 {
+		t.Fatalf("images: %d %s", status, body)
+	}
+	if status, body := h.passthrough(t, http.MethodGet, "/v1/images/models", testToken, ""); status != 200 {
+		t.Fatalf("catalogue: %d %s", status, body)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 2 {
+		t.Fatalf("want 2 events, got %d", len(events))
+	}
+	if events[0].Endpoint != spool.EndpointImages {
+		t.Fatalf("generation route: %q", events[0].Endpoint)
+	}
+	if events[1].Endpoint != spool.EndpointImageModels {
+		t.Fatalf("catalogue route: %q", events[1].Endpoint)
+	}
+	// The catalogue read costs nothing and returns no image, and both of those
+	// are known rather than guessed.
+	if events[1].CostUsd != "" || events[1].ImageCount != 0 {
+		t.Fatalf("catalogue event: %+v", events[1])
+	}
+}
+
+// A refusal carries its route too. The route is stamped before every fence, so
+// "which capability are people being refused on" is answerable.
+func TestPassthroughRefusalStillCarriesItsRoute(t *testing.T) {
+	h := newHarness(t, passthroughDoc(), nil)
+	if status, _ := h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody); status != 403 {
+		t.Fatalf("want 403, got %d", status)
+	}
+	events := h.spoolEvents(t)
+	if len(events) != 1 || events[0].Endpoint != spool.EndpointImages {
+		t.Fatalf("refusal event: %+v", events)
+	}
 }
 
 // A response that carries no usage at all drops to the estimate and says so,
