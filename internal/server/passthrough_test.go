@@ -296,6 +296,12 @@ func TestPassthroughMetering(t *testing.T) {
 	if img.Streamed || emb.Streamed {
 		t.Fatalf("passthrough claimed a stream: %+v %+v", img, emb)
 	}
+	// An embedding response is also a list under `data`, and counting its
+	// length would report one image per input vector on a route that produces
+	// no images at all.
+	if emb.ImageCount != 0 {
+		t.Fatalf("embedding event counted %d images", emb.ImageCount)
+	}
 }
 
 // The catalogue read and image generation share one capability and must not
@@ -866,6 +872,21 @@ func TestPassthroughMetersTheMeasuredImageEnvelope(t *testing.T) {
 	}
 	if events[0].InputTokens != 19 || events[0].OutputTokens != 1290 || events[0].Estimated {
 		t.Fatalf("image usage: %+v", events[0])
+	}
+	// The price and the count are the reason this envelope was measured. An
+	// image billed per image reads as a few hundred tokens without them, so a
+	// test that walks a real envelope past them proves less than its name says.
+	if events[0].CostUsd != "0.242" {
+		t.Fatalf("price %q", events[0].CostUsd)
+	}
+	if events[0].ImageCount != 1 {
+		t.Fatalf("image count %d", events[0].ImageCount)
+	}
+	// The vendor put its breakdown under a member this event does not carry
+	// (`image_tokens`), so the two it does carry stay zero rather than picking
+	// up a neighbouring number.
+	if events[0].CachedInputTokens != 0 || events[0].ReasoningTokens != 0 {
+		t.Fatalf("breakdown picked up a foreign member: %+v", events[0])
 	}
 }
 
