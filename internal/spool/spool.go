@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +63,88 @@ type Event struct {
 	LatencyMs    int64     `json:"latencyMs"`
 	TtftMs       int64     `json:"ttftMs,omitempty"`
 	RequestedAt  time.Time `json:"requestedAt"`
+	// Endpoint names the route this request came in on. It is set before any
+	// fence runs, so a refused request carries it too, and it is deliberately
+	// not the capability name: /v1/images and /v1/images/models share one
+	// capability while one of them spends money and the other reads a
+	// catalogue for free.
+	Endpoint string `json:"endpoint,omitempty"`
+	// ServedModelName is the model the upstream answered with, before the
+	// response's own field is rewritten to the public name. Without it a
+	// vendor fallback to a different model leaves nothing in the record to say
+	// so. Written on every metered response rather than only on a mismatch: a
+	// field that appears only when the two differ makes an empty value mean
+	// both "not reported" and "same as requested".
+	ServedModelName string `json:"servedModelName,omitempty"`
+	// CostUsd is what the vendor charged for this one request, from
+	// usage.cost. Absent is not zero — a free paid model genuinely costs zero
+	// and says so, while a self-hosted one has no dollar figure at all. It is
+	// a json.Number so that absence and zero stay distinguishable under
+	// omitempty and no float ever touches the value. Always assign it through
+	// CostLiteral.
+	CostUsd json.Number `json:"costUsd,omitempty"`
+	// ImageCount is how many images came back, counted from the response
+	// rather than taken from the requested n: the vendor may return fewer and
+	// the billing follows what arrived.
+	ImageCount int `json:"imageCount,omitempty"`
+	// CachedInputTokens and ReasoningTokens are breakdowns of the two counts
+	// above, never additions to them. Adding either to a total double-counts.
+	CachedInputTokens int `json:"cachedInputTokens,omitempty"`
+	ReasoningTokens   int `json:"reasoningTokens,omitempty"`
+	// Streamed cannot be inferred from TtftMs, which is stamped when the
+	// upstream's response headers arrive and so is present on non-streaming
+	// requests too.
+	Streamed bool `json:"streamed,omitempty"`
+}
+
+// Route names. An open vocabulary: the control plane stores one it does not
+// recognise rather than refusing the event.
+const (
+	EndpointChat        = "chat"
+	EndpointImages      = "images"
+	EndpointImageModels = "images_models"
+	EndpointEmbeddings  = "embeddings"
+)
+
+// costLiteralMax bounds the marshaled price. A real one is a handful of
+// characters; anything longer is a malfunction on the other side of the wire.
+const costLiteralMax = 32
+
+// costExponentMax bounds the exponent a price literal may carry.
+//
+// Finiteness is not enough on its own. `1E-2147483647` parses to exactly zero
+// with no error, so every check below it passes, and the literal travels
+// intact — where a reader that keeps a decimal exponent as a scale has to
+// build a power of ten that large before it can round. Prices live between
+// roughly 1e-9 and 1e6, so anything past this is a malformed writer rather
+// than a cheap request.
+const costExponentMax = 30
+
+// CostLiteral bounds one vendor-reported price before it reaches the spool.
+//
+// An unvalidated json.Number marshals its raw bytes, so a hostile or malformed
+// literal would produce a JSONL line that is not valid JSON. The reporter
+// ships that line in a batch, the api answers 400, and a 400 is precisely the
+// answer that makes the reporter skip the batch and advance its checkpoint
+// past it — so one bad body would take every healthy event beside it.
+//
+// A value that fails is dropped to absent rather than taking the event with
+// it: the token counts on that event are still good.
+func CostLiteral(n json.Number) json.Number {
+	if len(n) == 0 || len(n) > costLiteralMax {
+		return ""
+	}
+	f, err := n.Float64()
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return ""
+	}
+	if i := strings.IndexAny(string(n), "eE"); i >= 0 {
+		exp, err := strconv.Atoi(string(n[i+1:]))
+		if err != nil || exp > costExponentMax || exp < -costExponentMax {
+			return ""
+		}
+	}
+	return n
 }
 
 // Writer appends events to a per-day file (usage-YYYYMMDD.jsonl, UTC) in the

@@ -59,7 +59,9 @@ func TestWriteRoundTripAndDailyFiles(t *testing.T) {
 func TestEventCarriesOnlyAccountingFields(t *testing.T) {
 	ev := Event{EventUUID: "u", KeyID: "k", PublicModelName: "m", BudgetAxis: "CREDIT", Status: StatusOK,
 		ErrorType: "e", InputTokens: 1, OutputTokens: 2, Estimated: true,
-		LatencyMs: 3, TtftMs: 4, RequestedAt: time.Now()}
+		LatencyMs: 3, TtftMs: 4, RequestedAt: time.Now(),
+		Endpoint: EndpointImages, ServedModelName: "vendor/model", CostUsd: "0.242",
+		ImageCount: 1, CachedInputTokens: 1, ReasoningTokens: 1, Streamed: true}
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		t.Fatal(err)
@@ -72,11 +74,82 @@ func TestEventCarriesOnlyAccountingFields(t *testing.T) {
 		"eventUuid": true, "generation": true, "keyId": true, "publicModelName": true,
 		"budgetAxis": true, "status": true, "errorType": true, "inputTokens": true, "outputTokens": true,
 		"estimated": true, "latencyMs": true, "ttftMs": true, "requestedAt": true,
+		// The seven below were judged one at a time against the rule above.
+		// Six are plainly measurements: a route name, a price, a count of
+		// images, two token subtotals and a boolean.
+		//
+		// servedModelName is the one that needed deciding. It is a string
+		// taken from an upstream response body, which is where content would
+		// come from — but the value is the vendor's identifier for a model,
+		// chosen from the vendor's own catalogue, and nothing a caller writes
+		// can steer it anywhere else. It is bounded on the way in for the same
+		// reason: it comes from the network, so it does not get to be any
+		// length it likes.
+		"endpoint": true, "servedModelName": true, "costUsd": true,
+		"imageCount": true, "cachedInputTokens": true, "reasoningTokens": true,
+		"streamed": true,
 	}
 	for k := range m {
 		if !allowed[k] {
 			t.Fatalf("event carries unexpected field %q", k)
 		}
+	}
+}
+
+// A price is marshaled as its raw literal, so an unvalidated one produces a
+// line that is not valid JSON. The reporter ships it, the api answers 400, and
+// a 400 is the answer that makes the reporter skip the batch and move its
+// checkpoint past it — taking every healthy event beside it. The guard drops
+// the price and keeps the event.
+func TestCostLiteralRefusesWhatWouldBreakTheLine(t *testing.T) {
+	for _, bad := range []json.Number{
+		"1e999", "NaN", "-0.5", "0.1; drop", "", json.Number(strings.Repeat("9", 40)),
+		// A degenerate negative exponent is the one that gets past every check
+		// above it: Float64 returns exactly zero with no error, so nothing
+		// here objects, and the literal travels intact to a reader that keeps
+		// the exponent as a scale and has to build that power of ten to round.
+		"1E-2147483647", "1e-600000000", "1E+2147483647",
+	} {
+		if got := CostLiteral(bad); got != "" {
+			t.Fatalf("CostLiteral(%q) = %q, want empty", bad, got)
+		}
+	}
+	for _, good := range []json.Number{"0", "0.242", "0.00000001", "12.5"} {
+		if got := CostLiteral(good); got != good {
+			t.Fatalf("CostLiteral(%q) = %q, want it kept", good, got)
+		}
+	}
+	// Every accepted literal has to survive a round trip, which is the
+	// property the guard exists for.
+	for _, good := range []json.Number{"0", "0.242", "0.00000001", "12.5"} {
+		raw, err := json.Marshal(Event{EventUUID: "u", Status: StatusOK, CostUsd: CostLiteral(good)})
+		if err != nil {
+			t.Fatalf("marshal %q: %v", good, err)
+		}
+		var back Event
+		if err := json.Unmarshal(raw, &back); err != nil {
+			t.Fatalf("unmarshal %q: %v (%s)", good, err, raw)
+		}
+		if back.CostUsd != good {
+			t.Fatalf("round trip %q became %q", good, back.CostUsd)
+		}
+	}
+}
+
+// An old spool line has none of the seven, and that shape stays legal: the
+// gateway ships them only after the control plane can store them, so the two
+// versions coexist on disk.
+func TestOldSpoolLineKeepsTheMetricsGroupAbsent(t *testing.T) {
+	old := []byte(`{"eventUuid":"old","status":"OK","inputTokens":1,"outputTokens":2,` +
+		`"latencyMs":1,"requestedAt":"2026-08-10T00:00:00Z"}`)
+	var ev Event
+	if err := json.Unmarshal(old, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Endpoint != "" || ev.ServedModelName != "" || ev.CostUsd != "" ||
+		ev.ImageCount != 0 || ev.CachedInputTokens != 0 || ev.ReasoningTokens != 0 ||
+		ev.Streamed {
+		t.Fatalf("old event gained a metric: %+v", ev)
 	}
 }
 
