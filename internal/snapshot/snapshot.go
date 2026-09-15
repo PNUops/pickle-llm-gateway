@@ -497,8 +497,8 @@ func matchesAnyCreditModel(patterns []string, lowerName string) bool {
 //
 // Four shapes for the model segment: an exact name, a whole vendor ("openai/*"),
 // a trailing star ("openai/gpt-5-*") and a leading star ("openai/*-pro"). The
-// vendor itself never takes a star, because vendor names prefix one another
-// (meta and meta-llama), so "openai*" would silently reach a neighbour.
+// vendor can be a literal name or one whole "*", which also covers floating
+// aliases. Partial vendor wildcards are not supported.
 func MatchesCreditModel(pattern, lowerName string) bool {
 	// A bare "*" is refused here as well as at load. The loader already drops a
 	// key carrying one, so this is the second lock on the same door — and the
@@ -522,6 +522,11 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 		return pattern == lowerName || pattern == baseName
 	}
 	rest, ok := strings.CutPrefix(lowerName, vendor+"/")
+	if vendor == "*" {
+		var nameVendor string
+		nameVendor, rest, ok = strings.Cut(lowerName, "/")
+		ok = ok && nameVendor != ""
+	}
 	if !ok || rest == "" {
 		return false
 	}
@@ -577,17 +582,15 @@ func MatchesCreditModel(pattern, lowerName string) bool {
 // They route today — passthrough forwards the name verbatim — so a fence that
 // could not spell them was the one place a restricted key was narrower than an
 // unrestricted one for no stated reason. `~vendor/*` and `vendor/*` stay
-// separate prefixes, which falls out of the matcher below rather than being
-// special-cased: an alias points at a model that changes under it, so a fence
-// naming the vendor must not silently pick up a moving target the approver
-// never chose.
+// separate prefixes. A whole-provider "*" explicitly includes both named
+// vendors and aliases; "~*" and partial provider wildcards are not accepted.
 //
 // The model segment takes one star and only at an end: a star in the middle
 // ("openai/*gpt*") describes a set nobody can predict the size of, and a
 // leading star whose tail is empty or ends in a separator ("openai/*-") ends
 // up naming most of a vendor by accident.
 var creditModelPattern = regexp.MustCompile(
-	`^~?[a-z0-9][a-z0-9._:-]*(/([a-z0-9][a-z0-9._:-]*\*?|\*[a-z0-9._:-]*[a-z0-9]|\*))?$`)
+	`^(~?[a-z0-9][a-z0-9._:-]*|(~?[a-z0-9][a-z0-9._:-]*|\*)/([a-z0-9][a-z0-9._:-]*\*?|\*[a-z0-9._:-]*[a-z0-9]|\*))$`)
 
 // state is one loaded document plus the lookup maps derived from it.
 type state struct {
