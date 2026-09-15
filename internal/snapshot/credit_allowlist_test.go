@@ -108,7 +108,7 @@ func TestCreditPatternsMatchWhateverTheCase(t *testing.T) {
 		}
 	}
 	// The shapes the pattern check drops, and with them the key that carried
-	// one. A star on the vendor would reach the vendors whose names merely
+	// one. A partial vendor wildcard would reach vendors whose names merely
 	// begin the same way; a star loose in the middle, or one with nothing but
 	// a separator after it, describes a set nobody can size by reading it.
 	for _, bad := range []string{
