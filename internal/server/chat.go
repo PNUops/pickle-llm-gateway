@@ -1046,6 +1046,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	haveUsage := false
 	contentChars := 0
 	dropped := 0
+	upstreamError := false
 	// Assembled assistant text, only when the key opted into capture.
 	var answer strings.Builder
 
@@ -1082,11 +1083,12 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			notedServed = true
 			s.noteServedModel(ev, a.sentModel, c.servedModel)
 		}
+		upstreamError = upstreamError || c.upstreamError
 		if c.usage != nil {
 			u = *c.usage
 			haveUsage = true
 			if !a.forwardUsage {
-				if c.choicesEmpty {
+				if c.choicesEmpty && !c.upstreamError {
 					// The gateway-requested usage chunk; the student did not
 					// opt in, so it is consumed for metering and not sent.
 					return true
@@ -1168,6 +1170,11 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		// record it as degraded rather than let it read as a clean success.
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_chunk_unreadable"
+	case upstreamError:
+		// HTTP 200 is already committed; an explicit payload error still
+		// makes this request a failure even if the stream ends cleanly.
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errUpstream.code
 	default:
 		ev.Status = spool.StatusOK
 	}
@@ -1218,13 +1225,14 @@ func capRequest(raw json.RawMessage) (json.RawMessage, bool) {
 
 // chunk is one parsed and rewritten SSE payload.
 type chunk struct {
-	out          []byte
-	parsed       map[string]any
-	servedModel  string // the upstream's own model name, before it is rewritten
-	usage        *usage
-	content      string // this chunk's assistant text, for capture
-	contentChars int
-	choicesEmpty bool
+	out           []byte
+	parsed        map[string]any
+	servedModel   string // the upstream's own model name, before it is rewritten
+	usage         *usage
+	content       string // this chunk's assistant text, for capture
+	contentChars  int
+	choicesEmpty  bool
+	upstreamError bool
 }
 
 // stripUsage re-marshals the chunk without its usage field, for the case
@@ -1248,7 +1256,7 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	if dec.Decode(&m) != nil {
 		return chunk{}, false
 	}
-	c := chunk{parsed: m, choicesEmpty: true}
+	c := chunk{parsed: m, choicesEmpty: true, upstreamError: m["error"] != nil}
 	if raw, has := m["model"]; has {
 		c.servedModel, _ = raw.(string)
 		m["model"] = publicName
@@ -1263,6 +1271,11 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	}
 	if choices, _ := m["choices"].([]any); len(choices) > 0 {
 		c.choicesEmpty = false
+		for _, choice := range choices {
+			if item, _ := choice.(map[string]any); item != nil && item["finish_reason"] == "error" {
+				c.upstreamError = true
+			}
+		}
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {
