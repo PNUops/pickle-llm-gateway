@@ -1250,6 +1250,9 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	// forwarded: a verbatim chunk would leak the upstream model identifier.
 	var dataLines [][]byte
 	notedServed := false
+	// sawDone is the upstream's own terminator. A stream that ends without it
+	// ended early, however cleanly the connection closed.
+	sawDone := false
 	flushEvent := func() bool {
 		if len(dataLines) == 0 {
 			return true
@@ -1257,6 +1260,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		payload := bytes.Join(dataLines, []byte("\n"))
 		dataLines = nil
 		if bytes.Equal(payload, []byte("[DONE]")) {
+			sawDone = true
 			return writeRaw([]byte("data: [DONE]\n\n"))
 		}
 		c, ok := rewriteChunk(payload, a.publicName)
@@ -1301,7 +1305,11 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	// allocation until it finds a newline, so an upstream that emits a long
 	// line without one grows it without limit — times the in-flight cap, on a
 	// host with half a gigabyte.
-	br := bufio.NewReaderSize(io.LimitReader(resp.Body, upstreamResponseCapBytes), 64<<10)
+	//
+	// The bound fails loudly. A plain io.LimitReader reports EOF at the cap,
+	// which reads exactly like an upstream that finished, so a truncated
+	// answer went out as complete and was recorded as a success.
+	br := bufio.NewReaderSize(&cappedReader{r: resp.Body, remaining: upstreamResponseCapBytes}, 64<<10)
 	var readErr error
 	for {
 		line, err := br.ReadBytes('\n')
@@ -1321,6 +1329,12 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			// surface and are dropped.
 		}
 		if writeFailed {
+			break
+		}
+		if sawDone {
+			// The answer is complete. Whatever the upstream does after its
+			// terminator (more bytes past the bound, a reset) must not turn a
+			// finished answer into an error, or send a second [DONE].
 			break
 		}
 		if err != nil {
@@ -1348,14 +1362,33 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	case writeFailed || a.clientCtx.Err() != nil:
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
-	case errors.Is(readErr, context.DeadlineExceeded) || errors.Is(a.upCtx.Err(), context.DeadlineExceeded):
+	case !sawDone && (errors.Is(readErr, context.DeadlineExceeded) || errors.Is(a.upCtx.Err(), context.DeadlineExceeded)):
 		// The gateway's own duration cap, not an upstream fault.
 		ev.Status = spool.StatusTimeout
 		ev.ErrorType = "request_deadline_exceeded"
 		emitStreamError("request_deadline_exceeded", "요청 전체 시간 상한을 초과해 스트림을 종료했습니다.")
+	case errors.Is(readErr, errResponseOverCap):
+		// This service's own relay bound, not an upstream fault, and the
+		// caller can act on it, so it is named rather than reported as an
+		// interrupted stream. The public code is the passthrough's for the
+		// same condition.
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errPassthroughResponseTooLarge.code
+		emitStreamError(errPassthroughResponseTooLarge.code,
+			"모델 서버 응답이 중계 가능한 크기를 넘어 스트림을 종료했습니다. 응답이 불완전합니다. 최대 출력 길이(max_tokens)를 줄여주세요.")
 	case readErr != nil:
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_interrupted"
+		emitStreamError("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.")
+	case !sawDone && !upstreamError:
+		// The connection closed cleanly but the upstream never said it was
+		// done, so the answer may stop mid-sentence. To the caller this is the
+		// same fact as an interrupted read, and gets the same public code; the
+		// record keeps the two apart. An upstream that reported its own error
+		// before closing is the next case: that error already went out and is
+		// the more specific cause.
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = "upstream_stream_unterminated"
 		emitStreamError("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.")
 	case dropped > 0:
 		// The stream reached its end, but some chunks could not be forwarded,
@@ -1369,6 +1402,10 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		// makes this request a failure even if the stream ends cleanly.
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = errUpstream.code
+		if !sawDone {
+			// The error itself was forwarded; only the terminator is missing.
+			writeRaw([]byte("data: [DONE]\n\n"))
+		}
 	default:
 		ev.Status = spool.StatusOK
 	}
@@ -1380,6 +1417,36 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		s.metrics.bodiesCaptured.Add(1)
 	}
 	record()
+}
+
+// errResponseOverCap is what cappedReader returns once an upstream sends more
+// than the relay bound. It is an error, not EOF, so a caller reading to the end
+// cannot mistake a cut response for a finished one.
+var errResponseOverCap = errors.New("upstream response exceeds the relay bound")
+
+// cappedReader passes through at most remaining bytes and fails if the
+// upstream has more. Reaching the bound exactly is not an error: only a byte
+// past it is, which takes one extra read to learn.
+type cappedReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.remaining <= 0 {
+		var probe [1]byte
+		n, err := c.r.Read(probe[:])
+		if n > 0 {
+			return 0, errResponseOverCap
+		}
+		return 0, err
+	}
+	if int64(len(p)) > c.remaining {
+		p = p[:c.remaining]
+	}
+	n, err := c.r.Read(p)
+	c.remaining -= int64(n)
+	return n, err
 }
 
 // capString bounds one captured answer. A cut record says so rather than
