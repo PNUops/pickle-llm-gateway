@@ -24,7 +24,10 @@ import (
 //     object carries the organisation's guardrail verdicts, so it shows the
 //     caller whatever guardrails the organisation runs. Opened when every
 //     organisation was found to run none (2026-10-11); adding a guardrail is
-//     the moment to decide again.
+//     the moment to decide again. The object is relayed as the vendor wrote
+//     it, so for a catalogued money-axis alias it names the upstream model id
+//     the public name otherwise stands in for; on the student's own paid
+//     request that is accepted.
 //
 // Two groups are deliberately absent, each for a reason of its own.
 //
@@ -55,7 +58,7 @@ var chatHeaderAllowlist = []string{
 const forwardedHeaderValueMax = 1024
 
 // chatForwardedHeaders copies the allowlisted client headers, the first value
-// of each only. Both take one value (a comma-separated list for the beta
+// of each only. Each takes one value (a comma-separated list for the beta
 // opt-ins), so repeated lines could only pile bytes onto the vendor request.
 func chatForwardedHeaders(h http.Header) http.Header {
 	var out http.Header
