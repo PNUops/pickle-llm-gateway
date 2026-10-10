@@ -89,6 +89,41 @@ func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model
 // every record, the spool included, still shows the name that was judged.
 const candidateModelsField = "models"
 
+// firstCandidateModel reads the first entry of the fallback list for a request
+// that has no `model`. present is false when there is no usable list at all
+// (absent, null or empty), which is the same missing `model` as before; valid
+// is false when the list is there but its first entry cannot be a model name.
+func firstCandidateModel(params map[string]json.RawMessage) (first string, present, valid bool) {
+	raw, ok := params[candidateModelsField]
+	if !ok || string(bytes.TrimSpace(raw)) == "null" {
+		return "", false, false
+	}
+	var names []string
+	if json.Unmarshal(raw, &names) != nil {
+		return "", true, false
+	}
+	if len(names) == 0 {
+		return "", false, false
+	}
+	return names[0], true, names[0] != ""
+}
+
+// renameFirstCandidate puts the primary's upstream name in place of the name
+// the caller used, which is what `model` gets on every other request. Only the
+// first entry: the others go out as written, exactly as they do beside an
+// explicit `model`. The list was already parsed and fenced whole, so the
+// decode cannot fail here.
+func renameFirstCandidate(params map[string]json.RawMessage, upstream string) {
+	var names []string
+	if json.Unmarshal(params[candidateModelsField], &names) != nil || len(names) == 0 {
+		return
+	}
+	names[0] = upstream
+	if out, err := json.Marshal(names); err == nil {
+		params[candidateModelsField] = out
+	}
+}
+
 // fenceCandidateModels applies the money fence to every entry of that list,
 // returning the first entry that fails.
 //
@@ -680,9 +715,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ev.Streamed = streamed
 	}
 	var publicModel string
-	if raw, ok := params["model"]; !ok || json.Unmarshal(raw, &publicModel) != nil || publicModel == "" {
+	// fromCandidates marks a request that named its models only through the
+	// fallback list. The vendor documents that shape (`model` is optional when
+	// `models` is given, and the first entry is then the primary), so it is
+	// served rather than refused: the first entry stands in for `model` in
+	// every check below, the axis and the naming rules included, and the
+	// candidate fence still judges every entry, that first one too.
+	fromCandidates := false
+	if raw, ok := params["model"]; ok && json.Unmarshal(raw, &publicModel) != nil {
 		refuse(errMissingParam("model"), spool.StatusBadRequest)
 		return
+	}
+	if publicModel == "" {
+		first, present, valid := firstCandidateModel(params)
+		switch {
+		case !present:
+			refuse(errMissingParam("model"), spool.StatusBadRequest)
+			return
+		case !valid:
+			refuse(errInvalidParamValue(candidateModelsField), spool.StatusBadRequest)
+			return
+		}
+		publicModel, fromCandidates = first, true
 	}
 	messagesRaw, ok := params["messages"]
 	if !ok {
@@ -939,7 +993,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(raw, &opts)
 		studentWantsUsage = opts.IncludeUsage
 	}
-	params["model"] = json.RawMessage(strconv.Quote(model.UpstreamModel))
+	if fromCandidates {
+		// Forwarded in the shape the caller sent, the one the vendor documents:
+		// no `model`, and the list with its first entry in the upstream name.
+		// Moving that entry into `model` instead would depend on how the vendor
+		// orders `model` against the list, which only its prose describes.
+		delete(params, "model")
+		renameFirstCandidate(params, model.UpstreamModel)
+	} else {
+		params["model"] = json.RawMessage(strconv.Quote(model.UpstreamModel))
+	}
 	if streaming {
 		params["stream_options"] = withIncludeUsage(params["stream_options"])
 	}
