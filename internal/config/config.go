@@ -66,6 +66,37 @@ type Config struct {
 	UpstreamHeaderWait   time.Duration // how long to wait for upstream response headers
 	RequestMaxDuration   time.Duration // hard cap on one request, streaming included
 	MaxInFlight          int           // gateway-wide concurrent request cap
+	// A chat body above RequestBodyMaxBytes is admitted only through a pool
+	// of its own, so the memory it can hold is a multiplication with a small
+	// count in it rather than one with the gateway-wide slot count. Measured
+	// 2026-10-10: a request costs three to four times its size while it is
+	// decoded and re-serialised, about twice once GOMEMLIMIT presses, and eight
+	// 25 MiB requests held at once peaked at 752 MiB. With the gateway-wide
+	// pool instead, 25 MiB would reach the unit's MemoryMax in a few dozen
+	// requests, all of which one key can send.
+	//
+	// The pool is judged on the declared Content-Length, before the body is
+	// read: the edge buffers the whole body and sets the header, and a request
+	// that declares nothing or declares a small size is still read through the
+	// small cap, so lying about the length cannot reach the large one. The
+	// request cap is the vendor's documented 25 MB, the same as passthrough.
+	//
+	// A slot is held until the upstream's response headers arrive and then
+	// released together with every reference to the request body; a stream
+	// that runs for ten minutes after that does not keep it. PerKey bounds how
+	// much of the pool one key can take, because the money axis has no
+	// per-key concurrency limit of its own. ChatLargeBodySlots = 0 turns the
+	// pool off, which is the old behaviour: anything above
+	// RequestBodyMaxBytes is refused.
+	//
+	// The same pool admits a non-streamed response that outgrows the 8 MiB
+	// relay bound, up to ChatLargeResponseMaxBytes (the passthrough's 32 MiB);
+	// eight of those measured about 1 GiB. With no slot free the response is
+	// refused by name, after the vendor has billed it.
+	ChatLargeBodyMaxBytes     int64
+	ChatLargeResponseMaxBytes int64
+	ChatLargeBodySlots        int
+	ChatLargeBodySlotsPerKey  int
 	// UpstreamRetries is how many extra attempts one upstream gets after a
 	// transient failure, before the model's fallback (if any) is tried. Only
 	// ever applied before any of the response has reached the client.
@@ -182,8 +213,15 @@ func FromEnv() (*Config, error) {
 		ControlTimeout:       10 * time.Second,
 		SnapshotPollInterval: 5 * time.Second,
 		RequestBodyMaxBytes:  2 << 20,
-		UpstreamHeaderWait:   60 * time.Second,
-		RequestMaxDuration:   10 * time.Minute,
+		// The passthrough's value. Long reasoning and vendor server-tool
+		// chains send no headers until they start answering; the large-body
+		// pool bounds what a longer wait can hold.
+		UpstreamHeaderWait:        180 * time.Second,
+		ChatLargeBodyMaxBytes:     25 << 20,
+		ChatLargeResponseMaxBytes: 32 << 20,
+		ChatLargeBodySlots:        8,
+		ChatLargeBodySlotsPerKey:  2,
+		RequestMaxDuration:        10 * time.Minute,
 		// Sized for a 512 MB gateway container, which is the smallest one this
 		// daemon is expected to run in. Measured 2026-09-02 against this
 		// binary: an in-flight request costs about 75 KB with a typical
@@ -245,6 +283,7 @@ func FromEnv() (*Config, error) {
 		dst  *int
 	}{
 		{"MAX_IN_FLIGHT", &cfg.MaxInFlight},
+		{"CHAT_LARGE_BODY_SLOTS_PER_KEY", &cfg.ChatLargeBodySlotsPerKey},
 		{"PASSTHROUGH_MAX_IN_FLIGHT", &cfg.PassthroughMaxInFlight},
 		{"BODY_QUEUE_SIZE", &cfg.BodyQueueSize},
 		{"BODY_BATCH_SIZE", &cfg.BodyBatchSize},
@@ -259,6 +298,15 @@ func FromEnv() (*Config, error) {
 				continue
 			}
 			*opt.dst = n
+		}
+	}
+	// Zero is meaningful here: it closes the large-body pool.
+	if v := getenv("CHAT_LARGE_BODY_SLOTS", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			errs = append(errs, envPrefix+"CHAT_LARGE_BODY_SLOTS must be a non-negative integer")
+		} else {
+			cfg.ChatLargeBodySlots = n
 		}
 	}
 	if v := getenv("UPSTREAM_RETRIES", ""); v != "" {
@@ -328,6 +376,8 @@ func FromEnv() (*Config, error) {
 		{"REQUEST_BODY_MAX_BYTES", &cfg.RequestBodyMaxBytes},
 		{"PASSTHROUGH_REQUEST_BODY_MAX_BYTES", &cfg.PassthroughRequestBodyMaxBytes},
 		{"PASSTHROUGH_RESPONSE_MAX_BYTES", &cfg.PassthroughResponseMaxBytes},
+		{"CHAT_LARGE_BODY_MAX_BYTES", &cfg.ChatLargeBodyMaxBytes},
+		{"CHAT_LARGE_RESPONSE_MAX_BYTES", &cfg.ChatLargeResponseMaxBytes},
 	} {
 		if v := getenv(opt.name, ""); v != "" {
 			n, err := strconv.ParseInt(v, 10, 64)
@@ -337,6 +387,10 @@ func FromEnv() (*Config, error) {
 			}
 			*opt.dst = n
 		}
+	}
+
+	if cfg.ChatLargeBodySlots > 0 && cfg.ChatLargeBodyMaxBytes < cfg.RequestBodyMaxBytes {
+		errs = append(errs, envPrefix+"CHAT_LARGE_BODY_MAX_BYTES must not be below "+envPrefix+"REQUEST_BODY_MAX_BYTES")
 	}
 
 	ups, upErrs := upstreamsFromEnv(os.Environ())

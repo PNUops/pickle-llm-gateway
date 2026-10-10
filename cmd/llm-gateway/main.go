@@ -124,8 +124,10 @@ func main() {
 		// taken before the body is read (the per-key limits cannot be, since
 		// they depend on the budget axis and the axis is in the body), so an
 		// unbounded read would let a slow client hold that slot for as long as
-		// nginx allows; chat bodies are small, so a request that cannot be
-		// read in 30s is stuck.
+		// nginx allows. 30s holds even for a 25 MiB chat body, because nginx
+		// buffers the whole body before it forwards any of it: what this
+		// times is a local copy, not the student's upload, so a request that
+		// cannot be read in 30s is stuck.
 		ReadTimeout: 30 * time.Second,
 	}
 

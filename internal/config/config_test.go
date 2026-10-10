@@ -217,7 +217,8 @@ func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
 		case strings.HasSuffix(n, "_BYTES"), strings.HasSuffix(n, "_SIZE"),
 			strings.HasSuffix(n, "_DAYS"), strings.HasSuffix(n, "_RETRIES"),
 			strings.HasSuffix(n, "_RPM"), strings.HasSuffix(n, "_TPM"),
-			strings.HasSuffix(n, "_CONCURRENCY"), strings.HasSuffix(n, "_IN_FLIGHT"):
+			strings.HasSuffix(n, "_CONCURRENCY"), strings.HasSuffix(n, "_IN_FLIGHT"),
+			strings.HasSuffix(n, "_SLOTS"), strings.HasSuffix(n, "_PER_KEY"):
 			return "7"
 		case strings.HasSuffix(n, "_LISTEN"):
 			return "127.0.0.1:9999"
@@ -275,8 +276,10 @@ func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
 	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 16 {
 		t.Fatalf("wait/pool defaults: %v %d", cfg.PassthroughHeaderWait, cfg.PassthroughMaxInFlight)
 	}
-	// The four the chat path reads are untouched by all of this.
-	if cfg.RequestBodyMaxBytes != 2<<20 || cfg.UpstreamHeaderWait != 60*time.Second || cfg.MaxInFlight != 16 {
+	// The four the chat path reads are untouched by all of this. The chat
+	// header wait moved to the passthrough's 180s on its own account
+	// (measured 2026-10-10), not because of these settings.
+	if cfg.RequestBodyMaxBytes != 2<<20 || cfg.UpstreamHeaderWait != 180*time.Second || cfg.MaxInFlight != 16 {
 		t.Fatalf("chat limits moved: %d %v %d", cfg.RequestBodyMaxBytes, cfg.UpstreamHeaderWait, cfg.MaxInFlight)
 	}
 
@@ -295,7 +298,7 @@ func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
 		t.Fatalf("overrides: %v %d", cfg.PassthroughHeaderWait, cfg.PassthroughMaxInFlight)
 	}
 	// Overriding the passthrough copies still leaves chat where it was.
-	if cfg.RequestBodyMaxBytes != 2<<20 || cfg.UpstreamHeaderWait != 60*time.Second {
+	if cfg.RequestBodyMaxBytes != 2<<20 || cfg.UpstreamHeaderWait != 180*time.Second {
 		t.Fatalf("chat limits moved: %d %v", cfg.RequestBodyMaxBytes, cfg.UpstreamHeaderWait)
 	}
 }
@@ -310,5 +313,41 @@ func TestPassthroughLimitsRejectBadValues(t *testing.T) {
 	t.Setenv("LLMGW_PASSTHROUGH_MAX_IN_FLIGHT", "-1")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("a negative slot count must not start the daemon")
+	}
+}
+
+// The chat large-body pool carries defaults, each is settable, and zero slots
+// is a valid way to close it.
+func TestChatLargeBodyDefaultsAndOverride(t *testing.T) {
+	setRequired(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ChatLargeBodyMaxBytes != 25<<20 || cfg.ChatLargeResponseMaxBytes != 32<<20 ||
+		cfg.ChatLargeBodySlots != 8 || cfg.ChatLargeBodySlotsPerKey != 2 {
+		t.Fatalf("defaults: %d %d %d %d", cfg.ChatLargeBodyMaxBytes, cfg.ChatLargeResponseMaxBytes,
+			cfg.ChatLargeBodySlots, cfg.ChatLargeBodySlotsPerKey)
+	}
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS", "0")
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS_PER_KEY", "1")
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_MAX_BYTES", "10485760")
+	t.Setenv("LLMGW_CHAT_LARGE_RESPONSE_MAX_BYTES", "16777216")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ChatLargeBodySlots != 0 || cfg.ChatLargeBodySlotsPerKey != 1 ||
+		cfg.ChatLargeBodyMaxBytes != 10<<20 || cfg.ChatLargeResponseMaxBytes != 16<<20 {
+		t.Fatalf("overrides: %+v", cfg)
+	}
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS", "-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a negative slot count was accepted")
+	}
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS", "8")
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_MAX_BYTES", "1024")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a large-body cap below the ordinary cap was accepted")
 	}
 }

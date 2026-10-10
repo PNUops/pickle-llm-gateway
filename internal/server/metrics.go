@@ -57,6 +57,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"maxInFlight":            s.cfg.MaxInFlight,
 		"passthroughInFlight":    s.PassthroughInFlight(),
 		"passthroughMaxInFlight": s.cfg.PassthroughMaxInFlight,
+		"chatLargeBodiesInUse":   s.chatLarge.inUse(),
+		"chatLargeBodySlots":     s.cfg.ChatLargeBodySlots,
 		"generation":             s.store.Generation(),
 		"reloadFailures":         s.store.ReloadFailures(),
 		"rejectedEntries":        s.store.RejectedEntries(),

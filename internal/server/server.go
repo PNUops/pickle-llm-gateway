@@ -36,7 +36,10 @@ type Server struct {
 	// multiplication with a bounded slot count in it — see config.
 	passthroughClient   *http.Client
 	passthroughInFlight chan struct{}
-	now                 func() time.Time
+	// chatLarge admits chat bodies and non-streamed chat responses above the
+	// ordinary bound; nil when the pool is configured off.
+	chatLarge *largeBodySlots
+	now       func() time.Time
 }
 
 // New wires a Server. The shared HTTP client waits bounded time for upstream
@@ -64,6 +67,7 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 			},
 		},
 		passthroughInFlight: make(chan struct{}, cfg.PassthroughMaxInFlight),
+		chatLarge:           newLargeBodySlots(cfg.ChatLargeBodySlots, cfg.ChatLargeBodySlotsPerKey),
 		health:              newUpstreamHealth(nil),
 		metrics:             &counters{},
 		now:                 time.Now,
