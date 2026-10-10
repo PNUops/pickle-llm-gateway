@@ -28,6 +28,9 @@ type attemptError struct {
 	// generic upstream failure.
 	throttled bool
 	refusal   *apiError
+	// retryAfter is the vendor's own wait on a 429 or 503, in seconds, empty
+	// when it gave none. It is relayed only on the money axis.
+	retryAfter string
 }
 
 // upstreamHealth tracks consecutive failures per upstream so a dead one stops
@@ -176,7 +179,7 @@ func (h *upstreamHealth) recordSuccess(ref string) {
 // one that succeeded: 1 is the ordinary path and anything above it means the
 // request cost more than it looks like it did.
 func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *snapshot.Key,
-	params map[string]json.RawMessage, outputCap int) (*http.Response, config.Upstream, int, *attemptError) {
+	params map[string]json.RawMessage, outputCap int, clientHeaders http.Header) (*http.Response, config.Upstream, int, *attemptError) {
 	attempts := 0
 
 	refs := []string{model.UpstreamRef}
@@ -201,6 +204,10 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 	}
 
 	var last *attemptError
+	// waitFor is the longest wait any upstream asked for. A fallback that
+	// answers with a shorter one does not make the first one's request to
+	// back off any less true.
+	waitFor := ""
 	// The last upstream a request was actually sent to. On total failure the
 	// caller still has to record who was tried, and `up` below is scoped to
 	// the loop. It stays zero-valued while nothing has been contacted, which
@@ -236,12 +243,15 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
 			s.health.recordAttempt(ref)
-			resp, ae := s.do(ctx, up, chatAttempt(s.client, body, cred, model))
+			resp, ae := s.do(ctx, up, chatAttempt(s.client, body, cred, model, clientHeaders))
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
 			}
 			s.health.recordPassiveFailure(ref, ae.kind)
+			if longerWait(ae.retryAfter, waitFor) {
+				waitFor = ae.retryAfter
+			}
 			last = ae
 			if ae.refusal != nil {
 				// The upstream understood and refused: another upstream would
@@ -289,6 +299,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 	if last == nil {
 		last = &attemptError{err: errUnconfiguredUpstream}
 	}
+	last.retryAfter = waitFor
 	return nil, lastUp, attempts, last
 }
 
@@ -337,9 +348,17 @@ type attemptSpec struct {
 	publicModel   string
 }
 
-// chatAttempt is the shape of one chat-completions call for a model.
-func chatAttempt(client *http.Client, body []byte, cred string, model *snapshot.Model) attemptSpec {
+// chatAttempt is the shape of one chat-completions call for a model. Client
+// headers go only to a money-axis model: those are the vendor's features on
+// the student's own vendor key, while a self-hosted server has no use for
+// them and they would describe the student to the platform's own upstream.
+func chatAttempt(client *http.Client, body []byte, cred string, model *snapshot.Model, clientHeaders http.Header) attemptSpec {
+	var headers http.Header
+	if model.CreditAxis() {
+		headers = chatForwardedHeaders(clientHeaders)
+	}
 	return attemptSpec{
+		headers:       headers,
 		client:        client,
 		method:        http.MethodPost,
 		path:          "/chat/completions",
@@ -430,7 +449,8 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if creditAxis {
 			kind = failureKeyThrottled
 		}
-		return nil, &attemptError{err: errUpstreamThrottled, throttled: true, kind: kind}
+		return nil, &attemptError{err: errUpstreamThrottled, throttled: true, kind: kind,
+			retryAfter: upstreamRetryAfter(resp.Header)}
 	case http.StatusUnauthorized, http.StatusForbidden:
 		// Our credential, not the student's problem — and not something a
 		// retry fixes. Fall through to another upstream if one exists.
@@ -460,7 +480,11 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if resp.StatusCode >= http.StatusInternalServerError {
 			kind = failureUpstream
 		}
-		return nil, &attemptError{err: errUpstreamStatus, kind: kind}
+		ae := &attemptError{err: errUpstreamStatus, kind: kind}
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			ae.retryAfter = upstreamRetryAfter(resp.Header)
+		}
+		return nil, ae
 	}
 }
 
