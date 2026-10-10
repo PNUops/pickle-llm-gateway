@@ -1,7 +1,9 @@
 // Error responses in the OpenAI envelope: {"error": {message, type, code}}.
 // Messages are Korean because students read them; type and code are stable
 // machine-readable identifiers. Nothing here ever carries an upstream
-// address, an upstream error body, or a credential.
+// address, an upstream error body, or a credential. The one upstream text that
+// does reach a caller is the cleaned message of a 400 or 422, never the body
+// around it; rejection.go says what is removed and why.
 package server
 
 import (

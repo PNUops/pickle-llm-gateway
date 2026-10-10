@@ -237,7 +237,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
 			s.health.recordAttempt(ref)
-			resp, ae := s.attempt(ctx, up, body, cred, model.CreditAxis())
+			resp, ae := s.do(ctx, up, chatAttempt(s.client, body, cred, model))
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
@@ -329,6 +329,27 @@ type attemptSpec struct {
 	// headers are the client headers an allowlist chose to forward. The
 	// gateway's own Content-Type and Authorization are set after these and win.
 	headers http.Header
+	// upstreamModel and publicModel let a relayed rejection name the model the
+	// way the caller does. The swap has to happen on the raw message, before
+	// it is cleaned and cut: a cut through the id leaves a fragment no later
+	// replacement can recognise. Empty on the passthrough surface, where the
+	// name forwarded is already the caller's own.
+	upstreamModel string
+	publicModel   string
+}
+
+// chatAttempt is the shape of one chat-completions call for a model.
+func chatAttempt(client *http.Client, body []byte, cred string, model *snapshot.Model) attemptSpec {
+	return attemptSpec{
+		client:        client,
+		method:        http.MethodPost,
+		path:          "/chat/completions",
+		body:          body,
+		cred:          cred,
+		creditAxis:    model.CreditAxis(),
+		upstreamModel: model.UpstreamModel,
+		publicModel:   model.PublicName,
+	}
 }
 
 // attempt performs one chat-completions call carrying the given bearer (empty
@@ -381,14 +402,16 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 	if resp.StatusCode == http.StatusOK {
 		return resp, nil
 	}
-	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	detail, _ := io.ReadAll(io.LimitReader(resp.Body, rejectionReadLimit))
 	resp.Body.Close()
 	s.log.Warn("upstream refused request", "status", resp.StatusCode,
 		"upstreamRef", up.Ref, "detail", upstreamReason(detail))
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		// The request itself is wrong; no other upstream will like it better.
-		return nil, &attemptError{refusal: &errUpstreamRejected, kind: failureRequestRejected}
+		// The caller gets the upstream's reason, cleaned (see rejection.go).
+		refusal := upstreamRejection(resp.StatusCode, detail, spec.upstreamModel, spec.publicModel)
+		return nil, &attemptError{refusal: &refusal, kind: failureRequestRejected}
 	case http.StatusTooManyRequests:
 		// The upstream is throttling us. Retrying immediately makes it worse,
 		// and the student should be told the service is busy rather than that
