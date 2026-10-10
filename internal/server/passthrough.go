@@ -11,6 +11,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,6 +63,12 @@ type passthroughRoute struct {
 	// does not run — stated here rather than inferred from the method, so that
 	// adding a route makes the question unavoidable.
 	readsBody bool
+	// openAIImages marks the OpenAI SDK's image path. The body goes to the
+	// vendor unchanged, as on /v1/images, but the fields an OpenAI client may
+	// send that the vendor cannot honour are refused first (see
+	// refuseOpenAIImageFields), because the vendor would drop them without a
+	// word and the caller would get something other than what they asked for.
+	openAIImages bool
 }
 
 var (
@@ -71,6 +78,20 @@ var (
 		method:       http.MethodPost,
 		upstreamPath: "/images",
 		readsBody:    true,
+	}
+	// The path the OpenAI SDK's images.generate posts to. The vendor's own path
+	// is /images, so this is the same route under the SDK's name: the same
+	// capability, fences, metering and caps, and the same name in the usage
+	// record, because it is the same call. The OpenAI SDK's edit and
+	// variation paths are not opened: the vendor has neither path, and an
+	// edit from a reference image goes through input_references on this one.
+	routeImageGenerations = passthroughRoute{
+		capability:   snapshot.EndpointImages,
+		name:         spool.EndpointImages,
+		method:       http.MethodPost,
+		upstreamPath: "/images",
+		readsBody:    true,
+		openAIImages: true,
 	}
 	// The image catalogue is served unfiltered, unlike GET /v1/models. That
 	// list is the platform's own and says what we serve; this one is the
@@ -266,6 +287,14 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			if v, ok := params["model"]; !ok || json.Unmarshal(v, &publicModel) != nil || publicModel == "" {
 				refuse(errMissingParam("model"), spool.StatusBadRequest)
 				return
+			}
+			// Request-shape refusals come before the permission fences, as on
+			// chat, so a malformed request answers 400 rather than 403.
+			if route.openAIImages {
+				if e := refuseOpenAIImageFields(params); e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
 			}
 
 			// The model fence, unchanged and not rebuilt. passthroughModel
@@ -680,4 +709,53 @@ func passthroughForwardedHeaders(h http.Header) http.Header {
 		out[http.CanonicalHeaderKey(name)] = append([]string(nil), v...)
 	}
 	return out
+}
+
+// refuseOpenAIImageFields refuses the OpenAI image fields the vendor's image
+// endpoint cannot honour. None of them is in the vendor's request schema and
+// its documentation does not say what happens to them, so the likely outcome
+// is that they are dropped, and each one dropped changes the result without an
+// error:
+//
+//   - response_format "url": the vendor always answers base64, so data[].url
+//     would be empty and code reading it would fail later, away from the
+//     call. "b64_json" is what the vendor returns anyway and passes.
+//   - style: has no effect, so the image comes back without the style asked
+//     for. OpenAI itself retired it for its current image models.
+//   - moderation: the vendor takes it only as a provider option for OpenAI
+//     models (provider.options.openai.moderation); at the top level the
+//     default filtering applies instead of the level asked for.
+//
+// partial_images is not refused. It only acts on a stream, and this surface
+// refuses stream:true, so dropping it changes nothing the caller receives.
+func refuseOpenAIImageFields(params map[string]json.RawMessage) *apiError {
+	present := func(name string) (json.RawMessage, bool) {
+		raw, ok := params[name]
+		if !ok || string(bytes.TrimSpace(raw)) == "null" {
+			return nil, false
+		}
+		return raw, true
+	}
+	if raw, ok := present("response_format"); ok {
+		var format string
+		if json.Unmarshal(raw, &format) != nil {
+			e := errInvalidParamValue("response_format")
+			return &e
+		}
+		if format != "b64_json" {
+			e := errUnsupportedValue("response_format",
+				"이 경로는 이미지를 b64_json으로만 돌려줍니다. response_format을 빼거나 b64_json으로 보내주세요.")
+			return &e
+		}
+	}
+	if _, ok := present("style"); ok {
+		e := errUnsupportedValue("style", "style은 지원하지 않습니다. 원하는 스타일은 prompt에 적어주세요.")
+		return &e
+	}
+	if _, ok := present("moderation"); ok {
+		e := errUnsupportedValue("moderation",
+			"moderation은 이 위치에서 지원하지 않습니다. OpenAI 모델이면 provider.options.openai.moderation으로 보내주세요.")
+		return &e
+	}
+	return nil
 }
