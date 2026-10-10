@@ -19,8 +19,14 @@ import (
 //     session_id already passes. Stickiness is tracked per account, so two
 //     students choosing the same value share a provider choice and nothing
 //     else.
+//   - X-OpenRouter-Metadata: routing metadata in the response body, the
+//     provider, the fallback order and BYOK use for this request. The same
+//     object carries the organisation's guardrail verdicts, so it shows the
+//     caller whatever guardrails the organisation runs. Opened when every
+//     organisation was found to run none (2026-10-10); adding a guardrail is
+//     the moment to decide again.
 //
-// Three groups are deliberately absent, each for a reason of its own.
+// Two groups are deliberately absent, each for a reason of its own.
 //
 //   - App attribution (HTTP-Referer, X-OpenRouter-Title, X-Title,
 //     X-OpenRouter-Categories). The vendor publishes attributed traffic: its
@@ -30,11 +36,6 @@ import (
 //     headers would let one student put the platform account's traffic on a
 //     public page under any URL, somebody else's included. Hiding an app works
 //     only when it is first created.
-//   - Routing metadata (X-OpenRouter-Metadata). It adds the provider, the
-//     fallback order, BYOK use and the organisation's guardrail verdicts to
-//     the response body. Whether the organisation runs guardrails can only be
-//     checked with the management credential; until it is, the header stays
-//     out.
 //   - Response caching (X-OpenRouter-Cache, -Cache-TTL, -Cache-Clear). A cache
 //     hit is billed nothing and reports zero tokens while looking like a
 //     normal success; only a response header tells it apart, and the usage
@@ -44,6 +45,7 @@ import (
 var chatHeaderAllowlist = []string{
 	"X-Anthropic-Beta",
 	"X-Session-Id",
+	"X-OpenRouter-Metadata",
 }
 
 // forwardedHeaderValueMax bounds one forwarded value. Every header above

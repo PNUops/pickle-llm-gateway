@@ -33,8 +33,9 @@ func chatWithHeaders(t *testing.T, h *harness, model string, headers map[string]
 }
 
 var vendorFeatureHeaders = map[string]string{
-	"x-anthropic-beta": "structured-outputs-2025-11-13",
-	"x-session-id":     "student-session-1",
+	"x-anthropic-beta":      "structured-outputs-2025-11-13",
+	"x-session-id":          "student-session-1",
+	"X-OpenRouter-Metadata": "enabled",
 }
 
 // refusedVendorHeaders are vendor headers deliberately not forwarded; see
@@ -44,7 +45,6 @@ var refusedVendorHeaders = map[string]string{
 	"X-OpenRouter-Title":       "Student App",
 	"X-Title":                  "Student App",
 	"X-OpenRouter-Categories":  "education",
-	"X-OpenRouter-Metadata":    "enabled",
 	"X-OpenRouter-Cache":       "true",
 	"X-OpenRouter-Cache-TTL":   "600",
 	"X-OpenRouter-Cache-Clear": "true",
