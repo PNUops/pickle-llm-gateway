@@ -442,10 +442,16 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				}
 				refuse(*ae.refusal, status)
 			case ae.throttled:
+				if ae.retryAfter != "" {
+					w.Header().Set("Retry-After", ae.retryAfter)
+				}
 				refuse(errServerBusy, spool.StatusUpstreamErr)
 			default:
 				s.log.Error("passthrough upstream request failed", "keyId", key.KeyID,
 					"path", r.URL.Path, "error", ae.err)
+				if ae.retryAfter != "" {
+					w.Header().Set("Retry-After", ae.retryAfter)
+				}
 				refuse(errUpstream, spool.StatusUpstreamErr)
 			}
 			return
@@ -563,6 +569,7 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// identity is asserted where it is created.
 	s.noteServedModel(ev, ev.PublicModelName, served)
 
+	relayGenerationID(w, resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := w.Write(body); err != nil {
 		ev.Status = spool.StatusCanceled
@@ -688,10 +695,13 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 //
 // The rest are not close calls. `Accept-Encoding` would hand back a body this
 // surface cannot read. `User-Agent` describes the student's machine to a third
-// party for no benefit. Vendor attribution headers name the vendor in code
-// that is deliberately vendor-neutral, and would attribute a student's call to
-// our account regardless. `Content-Type` and `Authorization` are set by the
-// gateway itself and are not the client's to choose.
+// party for no benefit. Vendor attribution headers are refused on chat too,
+// because the vendor publishes attributed traffic under a URL anybody can name
+// (see chatHeaderAllowlist). The two chat forwards have no counterpart here:
+// the vendor documents its beta opt-ins for chat, and on these routes a
+// session id only groups requests in the account's own logs. `Content-Type`
+// and `Authorization` are set by the gateway itself and are not the client's
+// to choose.
 var passthroughHeaderAllowlist = []string{}
 
 // passthroughForwardedHeaders copies the allowlisted client headers, dropping

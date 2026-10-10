@@ -1056,7 +1056,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Try the model's upstream, then its fallback if it has one. Nothing has
 	// been written to the client yet, so switching upstreams here is invisible
 	// to the student; once the response starts, it is not.
-	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, key, params, outputCap)
+	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, key, params, outputCap, r.Header)
 	ev.TtftMs = time.Since(start).Milliseconds()
 	// Which upstream was reached, and how many tries it took. The response's
 	// own model field is rewritten to the public name before the student sees
@@ -1087,10 +1087,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			refuse(*attemptErr.refusal, status)
 		case attemptErr.throttled:
 			// Every upstream is throttling us: the service really is busy.
+			relayRetryAfter(w, model, attemptErr)
 			refuse(errServerBusy, spool.StatusUpstreamErr)
 		default:
 			s.log.Error("upstream request failed", "keyId", key.KeyID,
 				"model", publicModel, "error", attemptErr.err)
+			relayRetryAfter(w, model, attemptErr)
 			refuse(errUpstream, spool.StatusUpstreamErr)
 		}
 		return
@@ -1121,8 +1123,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	releaseLarge()
 
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, charge, &ev, record, inputBytes, capture)
+		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, model.CreditAxis(), charge, &ev, record, inputBytes, capture)
 		return
+	}
+	// A stream commits its 200 before the body is read, so the id goes out
+	// with it; whatever happens later is reported inside the stream.
+	if model.CreditAxis() {
+		relayGenerationID(w, resp.Header)
 	}
 	s.finishStream(w, resp, streamArgs{
 		capture:      capture,
@@ -1208,7 +1215,7 @@ func boundServedModel(served string) string {
 	return served
 }
 
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
+func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, creditAxis bool, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	// releaseLargeResponse frees a large-body slot taken below. It runs once
 	// the output is marshalled, before the write: the slot bounds what parsing
 	// costs, and a client that reads slowly must not hold it while it reads
@@ -1328,6 +1335,11 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 	}
 	body, m = nil, nil
 	releaseLargeResponse()
+	// Only on the answer actually relayed: a refusal above is the gateway's
+	// own error, not the vendor's generation.
+	if creditAxis {
+		relayGenerationID(w, resp.Header)
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := w.Write(out); err != nil {
 		ev.Status = spool.StatusCanceled

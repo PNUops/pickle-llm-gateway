@@ -190,6 +190,24 @@ response_format  tools  tool_choice  parallel_tool_calls
 필드를 스스로 붙이므로, 막아 두면 추론 가능한 유료 모델이 이 게이트웨이로는 못 쓰게 되고
 호출자가 할 수 있는 일이 없습니다.
 
+**요청 헤더는 유료 모델의 채팅 요청에서 둘만 전달합니다.** `x-anthropic-beta`(Anthropic 베타 기능,
+예: strict 도구 사용)와 `x-session-id`(프롬프트 캐싱을 위한 공급자 고정)입니다. 값이 1 KiB를 넘으면
+버립니다. 자체 서빙 모델에는 어떤 헤더도 전달하지 않습니다. 일부러 전달하지 않는 것은 셋입니다.
+
+- 앱 귀속 헤더(`HTTP-Referer`, `X-OpenRouter-Title`, `X-Title`, `X-OpenRouter-Categories`): 공급자가 귀속된
+  트래픽을 공개 순위와 앱 페이지에 싣고, 앱을 계정이 아니라 URL로 묶습니다. 전달하면 학생 한 명이
+  플랫폼 계정의 트래픽을 아무 URL 아래에, 남의 앱 아래에도 공개할 수 있습니다.
+- 라우팅 메타데이터(`X-OpenRouter-Metadata`): 응답 본문에 공급자, 폴백 순서, 조직 가드레일 판정을
+  싣습니다. 조직 설정이 드러나는지 확인하기 전까지는 닫아 둡니다.
+- 응답 캐싱(`X-OpenRouter-Cache`, `-Cache-TTL`, `-Cache-Clear`): 캐시 적중은 토큰 0, 금액 0의 정상
+  응답처럼 보이고 응답 헤더로만 구별됩니다. 사용량 기록이 적중을 표시하기 전까지는 열지 않습니다.
+
+**응답 헤더는 둘만 돌려줍니다.** 유료 모델의 성공 응답에는 공급자의 생성 id(`X-Generation-Id`)를,
+공급자가 429나 503으로 답할 때는 게이트웨이의 오류 응답(429는 503 `server_busy`, 503은 502
+`upstream_error`)에 공급자가 정한 대기 시간(`Retry-After`, 1시간 이하의 초)을 실어 보냅니다. 폴백
+업스트림까지 시도했으면 가장 긴 대기 시간입니다. 이미지와 임베딩 경로도 같습니다. 계정 전체의 한도를 말하는 `X-RateLimit-*`, 계정 예산이 찼을
+때의 402에 붙는 `Retry-After`, 캐시 헤더는 돌려주지 않습니다.
+
 **TOKEN 축에서는 그 둘이 계속 거절됩니다.** `chat_template_kwargs`와
 `thinking_token_budget`도 마찬가지입니다. 서빙 프로세스가 그 필드에 실패하기 때문이 아닙니다.
 실측하면 `reasoning_effort`를 받아들이고 사고를 켜서 답을 `content`에서 `reasoning`으로
