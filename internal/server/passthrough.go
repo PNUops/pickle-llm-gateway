@@ -328,6 +328,11 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 				return
 			}
+			if e := s.fencePlugins(&doc, func(string) *snapshot.Model { return nil },
+				key, params); e != nil {
+				refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
+				return
+			}
 			// Streaming is refused rather than forwarded. Every route this
 			// surface opens is non-streamed, and the metering here reads a
 			// whole JSON body — a streamed answer would parse as nothing, be

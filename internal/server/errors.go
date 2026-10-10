@@ -148,6 +148,44 @@ func errToolModelNotAllowed(name string) apiError {
 			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
 }
 
+// A server tool left without a model on a fenced key. The vendor would pick one
+// this gateway never sees, so the caller is asked to name it. Both arguments
+// are constants from the fence's own table, never the request's spelling.
+func errToolModelRequired(toolType, param string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 tools의 " + toolType +
+			"에 parameters." + param + "을(를) 직접 지정해야 합니다. " +
+			"지정하지 않으면 요청 밖에서 모델이 정해져 허용 여부를 판단할 수 없기 때문입니다."}
+}
+
+// A model named by a `plugins` entry. Same rule and code as the tools refusal;
+// the advice says where the name was for the same reason.
+func errPluginModelNotAllowed(name string) apiError {
+	if name == "" || len(name) > maxPassthroughNameBytes {
+		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+			"이 API Key로는 plugins가 지정한 모델을 사용할 수 없습니다. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key로는 plugins가 지정한 " + name + "을(를) 사용할 수 없습니다. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
+// A router plugin on a fenced key. Like the router name, the remedy is to name
+// a model. The id echoed is the canonical one, not the caller's spelling.
+func errRouterPluginNotAllowed(id string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 plugins의 " + id + " 설정을 쓸 수 없습니다. " +
+			"어떤 모델이 답할지 미리 알 수 없어 허용 여부를 판단할 수 없기 때문입니다. " +
+			"모델 이름을 직접 지정해주세요."}
+}
+
+// The fusion plugin's preset or an empty panel on a fenced key: either leaves
+// the panel to the vendor's side, out of the fence's sight.
+var errFusionPluginNeedsModels = apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+	"이 API Key에는 사용할 수 있는 모델이 정해져 있어 plugins의 fusion에 preset이나 빈 analysis_models를 쓸 수 없습니다. " +
+		"model과 analysis_models를 직접 지정해주세요."}
+
 // toolRefusalType names the tools refusal in the usage record. It reuses the
 // existing types rather than adding one: the contract already enumerates these,
 // and a refusal here is the same event as the same refusal one field over.

@@ -125,6 +125,21 @@ response_format  tools  tool_choice  parallel_tool_calls
 도구는 `images` 기능 권한도 함께 요구합니다** — 전용 경로로 부를 때는 필요하고 채팅으로 부를
 때는 필요 없다면 그것은 권한이 아니기 때문입니다.
 
+모델 제한이 걸린 Key에서는 **모델을 비워 둔 서버 도구도 거절합니다.** `openrouter:advisor`는
+`parameters.model`이 없으면 답을 만드는 모델이 생성 도중에 자문 모델을 고르고,
+`openrouter:fusion`은 `model`과 `analysis_models`가 없으면 공급자 기본값을 씁니다. 어느 쪽도
+요청에 이름이 드러나지 않아 판정할 수 없습니다. `openrouter:subagent`는 모델이 없으면 요청의
+`model`을 쓰므로 그대로 통과합니다. 도구가 안쪽 호출용으로 다시 받는 `parameters.tools`도 같은
+규칙으로 판정합니다.
+
+**`plugins`도 펜스를 지납니다.** `fusion` 플러그인의 `model`과 `analysis_models`는 같은 규칙으로
+판정하고, 공급자 쪽에서 모델 묶음으로 펼쳐지는 `preset`은 모델 제한이 걸린 Key에서 거절합니다.
+라우터 플러그인(`auto-router`, `auto-beta-router`, `pareto-router`, `jev-router`,
+`switchyard-router`)은 모델 제한이 걸린 Key에서 거절합니다. 후보가 와일드카드나 점수라 판정할 수
+없고, 그 설정을 읽는 라우터 모델(`openrouter/*`)은 그 Key에서 이미 쓸 수 없기 때문입니다.
+`context-compression`은 모델 이름을 받지 않고 작은 컨텍스트 모델에서는 지정하지 않아도 켜지므로
+판정 대상에 넣지 않았습니다.
+
 **`preset`도 거절합니다.** preset은 모델과 폴백 목록을 통째로 담을 수 있어 펜스가 읽는 필드
 바깥에서 판정을 지나갑니다. 최상위 `preset` 필드, `@preset/slug` 모델명, `모델@preset/slug`
 형태 셋 다 막습니다. **제한이 없는 Key에서도 막습니다** — preset은 플랫폼 계정에 저장되고 모든

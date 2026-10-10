@@ -166,6 +166,36 @@ func IsRouterModelName(publicName string) bool {
 	return strings.HasPrefix(lower, routerVendorPrefix)
 }
 
+// routerPluginIDs are the `plugins` entries that configure one of the vendor's
+// routers. Each steers which model a router picks, and none names a model this
+// fence can judge: auto-router, auto-beta-router and jev-router take wildcard
+// patterns, pareto-router takes a score and a price, and switchyard-router
+// takes a judge model on top of picking the answering one. The vendor documents
+// each as read by its own router model, which a fenced key cannot call, so on
+// such a key the entry is either inert or steering something nobody judged.
+//
+// fusion is not here. It names its models outright and is judged rather than
+// refused (see the server's plugin fence).
+var routerPluginIDs = []string{
+	"auto-router",
+	"auto-beta-router",
+	"pareto-router",
+	"jev-router",
+	"switchyard-router",
+}
+
+// RouterPluginID returns the canonical id when a plugin id names a router, or
+// "" otherwise. The canonical form is what a refusal may echo, since the id as
+// sent is client input.
+func RouterPluginID(id string) string {
+	for _, known := range routerPluginIDs {
+		if strings.EqualFold(strings.TrimSpace(id), known) {
+			return known
+		}
+	}
+	return ""
+}
+
 // presetMarker attaches a saved configuration to a request. The vendor accepts
 // it three ways: a top-level "preset" field, a model named "@preset/slug", and
 // a model with one appended, "openai/gpt-4@preset/slug". A preset can carry the
@@ -207,6 +237,12 @@ func IsPresetModelName(publicName string) bool {
 //
 // When a seventh appears, the question is not which guard to add. It is whether
 // the catalogue belongs here.
+//
+// The seventh appeared (2026-10-10): the `plugins` field configures routers
+// and a fusion panel, and server tools left without a model have the vendor
+// choose one. They were closed the same way, case by case, because moving the
+// catalogue here is a separate decision that was not this change's to make.
+// The question above still stands.
 
 // IsReservedModelName reports whether a public model name sits under a
 // reserved self-serve prefix, current or retired. Such a name is served only

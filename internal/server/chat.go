@@ -219,6 +219,31 @@ const imageGenerationTool = "openrouter:image_generation"
 // see the decision recorded above; that is a choice, not a gap nobody noticed.
 var toolModelParams = []string{"model", "analysis_models"}
 
+// toolModelsRequiredOnFencedKey are the parameters a server tool must name on a
+// key that carries a model fence, because leaving them out does not mean "no
+// model" — it means the vendor picks one this fence never sees. The advisor's
+// documented order is the tool definition's model, then whatever the executing
+// model passes in its own tool call, then the outer model; the middle step is
+// decided mid-generation and never appears in the request. Fusion defaults its
+// panel to the vendor's quality preset (floating aliases), and its two
+// documents disagree on the analyst's default. The subagent is absent because
+// its documented fallback is the outer model, which is already judged.
+var toolModelsRequiredOnFencedKey = map[string][]string{
+	"openrouter:advisor": {"model"},
+	"openrouter:fusion":  {"model", "analysis_models"},
+}
+
+// nestedToolsParam carries server tools for a tool's own inner calls: the
+// subagent's worker and the fusion panel each take one. Every entry there runs
+// on the same key, so it is fenced exactly like a top-level tool.
+const nestedToolsParam = "tools"
+
+// maxNestedToolDepth bounds the recursion through nestedToolsParam. The vendor
+// documents one level (the subagent refuses to nest itself); a few more are
+// tolerated so a shape the vendor adds later is fenced rather than refused, and
+// anything deeper fails closed rather than being forwarded unread.
+const maxNestedToolDepth = 3
+
 // fenceServerTools judges every model a server tool names, and applies the
 // image capability to the tool that generates images. It returns the refusal to
 // send, or nil.
@@ -228,6 +253,11 @@ func (s *Server) fenceServerTools(doc *snapshot.Document, modelLookup func(strin
 	if !present || string(bytes.TrimSpace(raw)) == "null" {
 		return nil
 	}
+	return fenceToolList(doc, modelLookup, key, raw, 0)
+}
+
+func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, raw json.RawMessage, depth int) *apiError {
 	var tools []json.RawMessage
 	if json.Unmarshal(raw, &tools) != nil {
 		// Unreadable is unfenceable, and this field can carry a model.
@@ -235,46 +265,205 @@ func (s *Server) fenceServerTools(doc *snapshot.Document, modelLookup func(strin
 		return &e
 	}
 	for _, rawTool := range tools {
-		var tool struct {
-			Type       string                     `json:"type"`
-			Parameters map[string]json.RawMessage `json:"parameters"`
-		}
+		// Decoded into maps, not a tagged struct. Go matches struct tags
+		// case-insensitively with the last duplicate winning, so a tool carrying
+		// both "type" and "Type" would be judged by one key while the vendor,
+		// which receives these bytes verbatim, reads the other. A map reads the
+		// exact key, as the vendor does.
+		var tool map[string]json.RawMessage
 		if json.Unmarshal(rawTool, &tool) != nil {
 			e := errInvalidParamValue(toolsField)
 			return &e
 		}
-		if !strings.HasPrefix(strings.ToLower(tool.Type), serverToolPrefix) {
+		var rawType string
+		if v, ok := tool["type"]; ok && json.Unmarshal(v, &rawType) != nil {
+			e := errInvalidParamValue(toolsField)
+			return &e
+		}
+		var parameters map[string]json.RawMessage
+		if v, ok := tool["parameters"]; ok && json.Unmarshal(v, &parameters) != nil {
+			e := errInvalidParamValue(toolsField)
+			return &e
+		}
+		toolType := strings.ToLower(strings.TrimSpace(rawType))
+		if !strings.HasPrefix(toolType, serverToolPrefix) {
 			continue
 		}
-		if strings.EqualFold(tool.Type, imageGenerationTool) &&
+		if toolType == imageGenerationTool &&
 			!key.AllowsEndpoint(snapshot.EndpointImages) {
 			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
 			return &e
 		}
 		for _, name := range toolModelParams {
-			v, ok := tool.Parameters[name]
+			v, ok := parameters[name]
 			if !ok {
 				continue
 			}
-			// The vendor spells these both ways: one model, or a list.
-			var one string
-			if json.Unmarshal(v, &one) == nil {
-				if !allowsCandidateModel(doc, modelLookup, key, one) {
-					e := errToolModelNotAllowed(one)
-					return &e
-				}
-				continue
-			}
-			var many []string
-			if json.Unmarshal(v, &many) != nil {
+			bad, refused, unreadable := judgeModelValue(doc, modelLookup, key, v)
+			if unreadable {
 				e := errInvalidParamValue(toolsField)
 				return &e
 			}
-			for _, candidate := range many {
-				if !allowsCandidateModel(doc, modelLookup, key, candidate) {
-					e := errToolModelNotAllowed(candidate)
+			if refused {
+				e := errToolModelNotAllowed(bad)
+				return &e
+			}
+		}
+		if key.HasCreditFence() {
+			for _, name := range toolModelsRequiredOnFencedKey[toolType] {
+				// An empty value is as good as none: the vendor falls back to
+				// its default either way, and an empty list judged nothing.
+				if v, ok := parameters[name]; !ok || emptyModelValue(v) {
+					e := errToolModelRequired(toolType, name)
 					return &e
 				}
+			}
+		}
+		if nested, ok := parameters[nestedToolsParam]; ok && string(bytes.TrimSpace(nested)) != "null" {
+			if depth >= maxNestedToolDepth {
+				e := errInvalidParamValue(toolsField)
+				return &e
+			}
+			if e := fenceToolList(doc, modelLookup, key, nested, depth+1); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+// judgeModelValue applies the candidate fence to a field the vendor spells both
+// ways, one model or a list. It reports the first refused name, or that the
+// value could not be read at all — which the caller refuses too, since a value
+// this build cannot read is one it cannot fence.
+func judgeModelValue(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, v json.RawMessage) (bad string, refused, unreadable bool) {
+	// null is the field left out, not a model named "". Whether leaving it out
+	// is acceptable is the caller's question (see toolModelsRequiredOnFencedKey),
+	// and answering it here would refuse a key that carries no list at all.
+	if string(bytes.TrimSpace(v)) == "null" {
+		return "", false, false
+	}
+	var one string
+	if json.Unmarshal(v, &one) == nil {
+		if !allowsCandidateModel(doc, modelLookup, key, one) {
+			return one, true, false
+		}
+		return "", false, false
+	}
+	var many []string
+	if json.Unmarshal(v, &many) != nil {
+		return "", false, true
+	}
+	for _, candidate := range many {
+		if !allowsCandidateModel(doc, modelLookup, key, candidate) {
+			return candidate, true, false
+		}
+	}
+	return "", false, false
+}
+
+// The `plugins` field is the seventh channel. Its entries configure work the
+// vendor does around the completion, and two kinds choose models:
+//
+//   - The routers (snapshot.RouterPluginID) steer which model a router picks.
+//     They are refused on a fenced key, judged by nothing: their candidates are
+//     wildcard patterns or a score, which the fence cannot judge, and the
+//     vendor documents each as read only by its own router model, which a
+//     fenced key cannot call anyway. Refusing costs such a key nothing.
+//   - fusion names its analyst and its panel outright, and configures a fusion
+//     run however that run was started — including by the server tool, which a
+//     fenced key can call. Its names are judged like a tool's. Its `preset`
+//     expands into a panel on the vendor's side, so on a fenced key it is
+//     refused; it is not the account preset refused for every key elsewhere.
+//
+// context-compression is deliberately not fenced. Its documentation says it
+// may move a request to a model with a longer context but not from which set,
+// and it switches itself on for small-context endpoints without the field, so
+// refusing the entry would not close it. It waits on a live call.
+//
+// A plugin this build does not know is forwarded, for the same reason and on
+// the same reversal condition as an unknown server tool (see above).
+const pluginsField = "plugins"
+
+const fusionPluginID = "fusion"
+
+// emptyModelValue reports a model field that names nothing: null, "", or [].
+func emptyModelValue(v json.RawMessage) bool {
+	var one string
+	if json.Unmarshal(v, &one) == nil {
+		return one == ""
+	}
+	var many []json.RawMessage
+	return json.Unmarshal(v, &many) == nil && len(many) == 0
+}
+
+// fusionPluginPreset is the fusion plugin's own panel selector.
+const fusionPluginPreset = "preset"
+
+// fencePlugins judges the models plugin entries name and refuses router
+// configuration on a fenced key. It returns the refusal to send, or nil.
+func (s *Server) fencePlugins(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
+	key *snapshot.Key, params map[string]json.RawMessage) *apiError {
+	raw, present := params[pluginsField]
+	if !present || string(bytes.TrimSpace(raw)) == "null" {
+		return nil
+	}
+	var plugins []map[string]json.RawMessage
+	if json.Unmarshal(raw, &plugins) != nil {
+		e := errInvalidParamValue(pluginsField)
+		return &e
+	}
+	for _, plugin := range plugins {
+		var id string
+		if json.Unmarshal(plugin["id"], &id) != nil {
+			// A missing id decodes from nil and fails here too: an entry the
+			// vendor will dispatch somewhere is one this has to be able to name.
+			// A null id decodes to "" without error and is forwarded like any
+			// unknown plugin; it names nothing the vendor can dispatch.
+			e := errInvalidParamValue(pluginsField)
+			return &e
+		}
+		if router := snapshot.RouterPluginID(id); router != "" {
+			if key.HasCreditFence() {
+				e := errRouterPluginNotAllowed(router)
+				return &e
+			}
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(id), fusionPluginID) {
+			continue
+		}
+		for _, name := range toolModelParams {
+			v, ok := plugin[name]
+			if !ok {
+				continue
+			}
+			bad, refused, unreadable := judgeModelValue(doc, modelLookup, key, v)
+			if unreadable {
+				e := errInvalidParamValue(pluginsField)
+				return &e
+			}
+			if refused {
+				e := errPluginModelNotAllowed(bad)
+				return &e
+			}
+		}
+		if key.HasCreditFence() {
+			// The preset expands on the vendor's side, and an empty panel may
+			// fall back to the vendor's default one; neither is judged.
+			if v, ok := plugin[fusionPluginPreset]; ok && string(bytes.TrimSpace(v)) != "null" {
+				e := errFusionPluginNeedsModels
+				return &e
+			}
+			if v, ok := plugin["analysis_models"]; ok && string(bytes.TrimSpace(v)) != "null" && emptyModelValue(v) {
+				e := errFusionPluginNeedsModels
+				return &e
+			}
+		}
+		if nested, ok := plugin[nestedToolsParam]; ok && string(bytes.TrimSpace(nested)) != "null" {
+			if e := fenceToolList(doc, modelLookup, key, nested, 1); e != nil {
+				return e
 			}
 		}
 	}
@@ -628,6 +817,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// And over the models the vendor's own server tools name, which reach
 		// past everything above from inside `tools`.
 		if e := s.fenceServerTools(&doc, modelLookup, key, params); e != nil {
+			refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
+			return
+		}
+		// And over the models `plugins` entries name or steer.
+		if e := s.fencePlugins(&doc, modelLookup, key, params); e != nil {
 			refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 			return
 		}
