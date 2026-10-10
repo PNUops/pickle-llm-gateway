@@ -101,6 +101,7 @@ func (s *Server) Handler() http.Handler {
 	// /v1/models/{id} still matches the more specific subtree pattern, and
 	// /v1/images/models matches its own exact pattern rather than either.
 	mux.HandleFunc("/v1/images", s.handlePassthrough(routeImages))
+	mux.HandleFunc("/v1/images/generations", s.handlePassthrough(routeImageGenerations))
 	mux.HandleFunc("/v1/images/models", s.handlePassthrough(routeImageModels))
 	mux.HandleFunc("/v1/embeddings", s.handlePassthrough(routeEmbeddings))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

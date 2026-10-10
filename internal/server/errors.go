@@ -105,7 +105,7 @@ var (
 		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
 		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, " +
-			"POST /v1/images, GET /v1/images/models, POST /v1/embeddings입니다."}
+			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
 	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",
@@ -257,6 +257,13 @@ func errCandidateModelNotAllowed(name string) apiError {
 func errUnsupportedParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
 		"지원하지 않는 파라미터입니다: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해주세요."}
+}
+
+// A field this route recognises but cannot honour, with the advice that fits
+// it. Same public code as an unknown field: to an SDK the fact is the same.
+func errUnsupportedValue(name, advice string) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
+		"지원하지 않는 파라미터입니다: " + name + ". " + advice}
 }
 
 func errInvalidParamValue(name string) apiError {

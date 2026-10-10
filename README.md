@@ -10,7 +10,7 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 ```
 학생 코드 (OpenAI SDK + API Key)
     │  POST /v1/chat/completions, GET /v1/models
-    │  POST /v1/images, GET /v1/images/models, POST /v1/embeddings
+    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
     │
@@ -21,13 +21,14 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 학생 코드에는 공개 모델명만 보입니다. 실제 모델과 업스트림 주소는 게이트웨이 설정에만
 있으므로, 업스트림을 교체해도 학생 코드는 바뀌지 않습니다.
 
-아래 셋은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
+아래 넷은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
 돌려줍니다. 전부 유료 모델이므로 비용은 그 Key에 부여된 금액 한도에서 나갑니다. Key마다
 허용된 경로만 열리고 기본값은 전부 닫힘입니다.
 
 | 경로 | 필요한 기능 |
 |---|---|
 | `POST /v1/images` | 이미지 생성 (`images`) |
+| `POST /v1/images/generations` | 이미지 생성 (`images`) |
 | `GET /v1/images/models` | 이미지 생성 (`images`) |
 | `POST /v1/embeddings` | 임베딩 (`embeddings`) |
 
@@ -41,6 +42,24 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 전달합니다. `model`이 없으면 거절하고, `n`이 상한을 넘으면 업스트림에 보내기 전에 상한을
 말하며 거절합니다. 응답이 중계 상한을 넘으면 `upstream_response_too_large`로 무엇을 줄여야
 하는지 알려줍니다.
+
+`POST /v1/images/generations`는 OpenAI SDK의 `images.generate()`가 보내는 경로입니다. 외부
+공급자의 경로는 `/images`라서, 같은 경로를 SDK 이름으로도 받는 것입니다. 기능 권한, 모델
+펜스, 사용량 기록, 상한은 `/v1/images`와 같고 본문과 응답도 그대로 전달합니다. 다만 공급자가
+조용히 무시해 학생이 요청과 다른 결과를 받게 되는 OpenAI 필드는 이 경로에서 400
+`unsupported_parameter`로 거절합니다.
+
+- `response_format: "url"`: 공급자는 언제나 base64로 돌려주므로 `data[].url`이 비어 옵니다.
+  `b64_json`은 통과합니다.
+- `style`: 효과가 없습니다. 원하는 스타일은 `prompt`에 적습니다.
+- `moderation`: 공급자는 OpenAI 모델에 한해 `provider.options.openai.moderation`으로만 받습니다.
+
+`partial_images`는 스트림에서만 의미가 있고 이 경로는 스트림을 받지 않으므로 거절하지
+않습니다.
+
+정리하면 OpenAI SDK의 `images.generate()`는 `b64_json`으로만 동작하고 URL 응답은 지원하지
+않습니다. SDK의 편집과 변형 경로(`/images/edits`, `/images/variations`)도 열지 않습니다. 참조
+이미지로 편집하려면 이 경로의 `input_references`에 이미지를 담아 보냅니다.
 
 JSON 객체는 같은 이름을 두 번 담을 수 있고 파서는 마지막 것을 씁니다. 그래서 전달하는
 본문은 게이트웨이가 판정에 쓴 그 값으로 다시 직렬화한 것입니다. 판정한 이름과 업스트림이
@@ -247,8 +266,8 @@ Key에는 CREDIT 축 전용 허용 목록 `creditAllowedModels`가 있습니다.
 제한 없음이 되고, 차단 목록은 항목만 빼면 막고 있던 모델이 도로 열립니다.
 
 Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 기능 이름이고 현재 어휘는
-`images`(이미지 생성)와 `embeddings`(임베딩) 둘입니다. `images` 하나가 `POST /v1/images`와
-`GET /v1/images/models`를 함께 엽니다. 경로가 아니라 기능을 적으므로 벤더가 같은 기능 아래에
+`images`(이미지 생성)와 `embeddings`(임베딩) 둘입니다. `images` 하나가 `POST /v1/images`,
+`POST /v1/images/generations`, `GET /v1/images/models`를 함께 엽니다. 경로가 아니라 기능을 적으므로 벤더가 같은 기능 아래에
 하위 경로를 더해도 목록은 그대로 둡니다.
 
 **비어 있으면 한 경로도 열리지 않습니다.** 위의 두 모델 목록과 기본값이 반대이고 의도한
