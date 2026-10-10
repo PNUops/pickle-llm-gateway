@@ -23,7 +23,7 @@ import (
 //     provider, the fallback order and BYOK use for this request. The same
 //     object carries the organisation's guardrail verdicts, so it shows the
 //     caller whatever guardrails the organisation runs. Opened when every
-//     organisation was found to run none (2026-10-10); adding a guardrail is
+//     organisation was found to run none (2026-10-11); adding a guardrail is
 //     the moment to decide again.
 //
 // Two groups are deliberately absent, each for a reason of its own.
