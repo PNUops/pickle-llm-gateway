@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -369,13 +368,23 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 
 // do performs one upstream call and classifies its outcome.
 func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (*http.Response, *attemptError) {
-	var reader io.Reader = http.NoBody
+	// The body goes through a holder the caller can empty once the headers
+	// are in (see upstreamBody), found again through the request context.
+	var holder *upstreamBody
 	if spec.body != nil {
-		reader = bytes.NewReader(spec.body)
+		holder = &upstreamBody{b: spec.body}
+		ctx = context.WithValue(ctx, upstreamBodyKey{}, holder)
 	}
-	req, err := http.NewRequestWithContext(ctx, spec.method, up.BaseURL+spec.path, reader)
+	req, err := http.NewRequestWithContext(ctx, spec.method, up.BaseURL+spec.path, http.NoBody)
 	if err != nil {
 		return nil, &attemptError{err: err, kind: failureInvalidResponse}
+	}
+	if holder != nil {
+		// Set by hand: net/http only infers the length and the rewind for its
+		// own reader types, and without a length the body would go chunked.
+		req.Body = holder.reader()
+		req.GetBody = func() (io.ReadCloser, error) { return holder.reader(), nil }
+		req.ContentLength = int64(len(spec.body))
 	}
 	for name, values := range spec.headers {
 		req.Header[name] = values

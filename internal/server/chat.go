@@ -689,15 +689,57 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// The per-key limits are applied further down, once the model has told us
 	// the budget axis. They all protect self-hosted serving capacity, which a
 	// commercial call never touches — see the TOKEN branch below.
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.RequestBodyMaxBytes)
-	rawBody, err := io.ReadAll(r.Body)
+	//
+	// A body above the ordinary bound needs a large-body slot, judged on the
+	// declared length before anything is read: refusing after reading would
+	// already have spent the memory the slot exists to bound. A request that
+	// declares no length, or a small one, is read through the small cap, so a
+	// false declaration cannot reach the large one (see config).
+	bodyLimit := s.cfg.RequestBodyMaxBytes
+	releaseLarge := func() {}
+	if r.ContentLength > bodyLimit {
+		if s.chatLarge == nil || r.ContentLength > s.cfg.ChatLargeBodyMaxBytes {
+			refuse(errRequestTooLarge, spool.StatusBadRequest)
+			return
+		}
+		release, ok := s.chatLarge.acquire(key.KeyID)
+		if !ok {
+			refuse(errLargeRequestBusy, spool.StatusRateLimited)
+			return
+		}
+		releaseLarge = release
+		defer release()
+		bodyLimit = s.cfg.ChatLargeBodyMaxBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
+	// Sized from the declared length when there is one, so a 25 MiB body is
+	// one allocation rather than a doubling series that peaks near twice it.
+	var buf bytes.Buffer
+	if r.ContentLength > 0 && r.ContentLength <= bodyLimit {
+		buf.Grow(int(r.ContentLength) + bytes.MinRead)
+	}
+	_, err := buf.ReadFrom(r.Body)
+	rawBody := buf.Bytes()
+	// The buffer still points at the same bytes; only rawBody may, so that
+	// dropping it below actually lets them go.
+	buf = bytes.Buffer{}
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			refuse(errRequestTooLarge, spool.StatusBadRequest)
-		} else {
-			refuse(errBadJSON, spool.StatusBadRequest)
+			return
 		}
+		// Not a malformed body: the upload itself stopped (the connection
+		// closed or the read deadline passed). Recording it as invalid_json
+		// blamed the caller's JSON for a transport fault, and there is nobody
+		// left to answer.
+		// The answer is written anyway: when the peer is still there (a
+		// malformed chunked body, a read deadline) it would otherwise get an
+		// empty 200, and when it is gone the write is harmless.
+		writeAPIError(w, errRequestBodyUnreadable)
+		ev.Status = spool.StatusCanceled
+		ev.ErrorType = "request_body_read_failed"
+		record()
 		return
 	}
 	var params map[string]json.RawMessage
@@ -975,6 +1017,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// gateway does not have. This guard only refuses what cannot possibly
 	// fit (bytes far beyond the token budget); exact enforcement is the
 	// upstream's context-window error.
+	inputBytes := len(messagesRaw)
 	if model.MaxInputTokens > 0 && len(messagesRaw) > model.MaxInputTokens*6 {
 		refuse(errInputTooLong, spool.StatusBadRequest)
 		return
@@ -1067,8 +1110,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		capture.Request, capture.RequestTruncated = capRequest(messagesRaw)
 	}
 
+	// The upstream is answering, so the request body has done its job. Every
+	// copy of it is let go here rather than when the handler returns: the
+	// read bytes, the decoded members, and the re-serialised body the
+	// transport would otherwise keep reachable for the whole response. That
+	// is what lets the large-body slot go now, so a long stream does not
+	// hold one.
+	releaseUpstreamBody(resp)
+	rawBody, params, messagesRaw = nil, nil, nil
+	releaseLarge()
+
 	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, charge, &ev, record, len(messagesRaw), capture)
+		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, charge, &ev, record, inputBytes, capture)
 		return
 	}
 	s.finishStream(w, resp, streamArgs{
@@ -1077,7 +1130,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		sentModel:    model.UpstreamModel,
 		keyID:        key.KeyID,
 		charge:       charge,
-		inputBytes:   len(messagesRaw),
+		inputBytes:   inputBytes,
 		forwardUsage: studentWantsUsage,
 		clientCtx:    r.Context(),
 		upCtx:        upCtx,
@@ -1100,10 +1153,12 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 }
 
 // upstreamResponseCapBytes bounds what one upstream response may cost this
-// process. A chat completion is text; the previous 32 MiB allowed for was
-// several times what any model produces, and the non-stream path holds the raw
-// bytes, the decoded map and the re-marshalled output at once — so the real
-// cost is a multiple of this, times the in-flight cap.
+// process without a large-body slot: a whole non-streamed response, or one
+// event of a stream (a stream holds one event at a time, so its total length
+// is left to the duration cap). The non-stream path holds the raw bytes, the
+// decoded map and the re-marshalled output at once, so the real cost is a
+// multiple of this, times the in-flight cap. A non-streamed response past it
+// is read further only with a slot, up to ChatLargeResponseMaxBytes.
 const upstreamResponseCapBytes = 8 << 20
 
 // servedModelMismatch records that the vendor answered with a model other than
@@ -1154,7 +1209,34 @@ func boundServedModel(served string) string {
 }
 
 func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes))
+	// releaseLargeResponse frees a large-body slot taken below. It runs once
+	// the output is marshalled, before the write: the slot bounds what parsing
+	// costs, and a client that reads slowly must not hold it while it reads
+	// (the edge does not buffer responses).
+	releaseLargeResponse := func() {}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes+1))
+	if err == nil && len(body) > upstreamResponseCapBytes {
+		// Past the ordinary bound. The rest is read only with a large-body
+		// slot, because a response is the same size-times-count problem as a
+		// request. The vendor has already billed it either way, which is why
+		// the refusal points at streaming rather than at a retry.
+		release, ok := s.chatLarge.acquire(ev.KeyID)
+		if !ok || s.cfg.ChatLargeResponseMaxBytes <= upstreamResponseCapBytes {
+			release()
+			s.refuseResponseTooLarge(w, ev, charge, record, inputBytes)
+			return
+		}
+		defer release()
+		releaseLargeResponse = release
+		limit := s.cfg.ChatLargeResponseMaxBytes - int64(len(body))
+		buf := bytes.NewBuffer(body)
+		_, err = buf.ReadFrom(io.LimitReader(resp.Body, limit+1))
+		body = buf.Bytes()
+		if err == nil && int64(len(body)) > s.cfg.ChatLargeResponseMaxBytes {
+			s.refuseResponseTooLarge(w, ev, charge, record, inputBytes)
+			return
+		}
+	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			writeAPIError(w, errUpstreamTimeout)
@@ -1244,6 +1326,8 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 		record()
 		return
 	}
+	body, m = nil, nil
+	releaseLargeResponse()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := w.Write(out); err != nil {
 		ev.Status = spool.StatusCanceled
@@ -1257,6 +1341,18 @@ func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, pub
 	if capture != nil {
 		s.metrics.bodiesCaptured.Add(1)
 	}
+	record()
+}
+
+// refuseResponseTooLarge answers a non-streamed response this service will
+// not relay. Its usage cannot be read, so the input side is estimated the way
+// a failed read is: a client looping on oversized answers is still metered.
+func (s *Server) refuseResponseTooLarge(w http.ResponseWriter, ev *spool.Event, charge func(int), record func(), inputBytes int) {
+	writeAPIError(w, errChatResponseTooLarge)
+	ev.Status = spool.StatusUpstreamErr
+	ev.ErrorType = errChatResponseTooLarge.code
+	s.settleUsage(ev, usage{}, false, inputBytes, 0)
+	charge(ev.InputTokens + ev.OutputTokens)
 	record()
 }
 
@@ -1316,12 +1412,15 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	// sawDone is the upstream's own terminator. A stream that ends without it
 	// ended early, however cleanly the connection closed.
 	sawDone := false
+	// eventBytes is what the event being assembled holds so far. One event is
+	// what this loop keeps in memory, so it is what the bound applies to.
+	eventBytes := 0
 	flushEvent := func() bool {
 		if len(dataLines) == 0 {
 			return true
 		}
 		payload := bytes.Join(dataLines, []byte("\n"))
-		dataLines = nil
+		dataLines, eventBytes = nil, 0
 		if bytes.Equal(payload, []byte("[DONE]")) {
 			sawDone = true
 			return writeRaw([]byte("data: [DONE]\n\n"))
@@ -1364,18 +1463,34 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		return writeRaw(append(append([]byte("data: "), c.out...), '\n', '\n'))
 	}
 
-	// Bounded like the non-stream read. ReadBytes accumulates into one growing
-	// allocation until it finds a newline, so an upstream that emits a long
-	// line without one grows it without limit — times the in-flight cap, on a
-	// host with half a gigabyte.
+	// Bounded per event, not in total. The memory a stream costs is the one
+	// event being assembled: lines are gathered until the blank line that
+	// ends an event, then joined into one more copy. Measured 2026-10-10,
+	// sixteen 60 MiB streams of ordinary chunks peaked at 116 MiB, while one
+	// event the size of a non-streamed response costs what that response
+	// does. So one event, and one line within it, gets the non-stream bound,
+	// and the total length is left to the request's duration cap.
 	//
-	// The bound fails loudly. A plain io.LimitReader reports EOF at the cap,
-	// which reads exactly like an upstream that finished, so a truncated
-	// answer went out as complete and was recorded as a success.
-	br := bufio.NewReaderSize(&cappedReader{r: resp.Body, remaining: upstreamResponseCapBytes}, 64<<10)
+	// The bound fails loudly rather than reading as a finished stream, which
+	// is what a plain io.LimitReader at a total cap used to do.
+	br := bufio.NewReaderSize(resp.Body, 64<<10)
+	readLine := func() ([]byte, error) {
+		var line []byte
+		for {
+			frag, err := br.ReadSlice('\n')
+			if len(line)+len(frag)+eventBytes > upstreamResponseCapBytes {
+				return nil, errResponseOverCap
+			}
+			line = append(line, frag...)
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			return line, err
+		}
+	}
 	var readErr error
 	for {
-		line, err := br.ReadBytes('\n')
+		line, err := readLine()
 		trimmed := bytes.TrimRight(line, "\r\n")
 		switch {
 		case len(trimmed) == 0 && len(line) > 0:
@@ -1386,7 +1501,13 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 			writeRaw(append(trimmed, '\n', '\n'))
 		default:
 			if after, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
-				dataLines = append(dataLines, bytes.TrimSpace(after))
+				data := bytes.TrimSpace(after)
+				dataLines = append(dataLines, data)
+				// Charged by what the line costs to keep, not by its payload:
+				// an empty `data:` line still holds its own allocation and a
+				// slice header, so counting only the data would let a stream
+				// of empty lines grow one event without bound.
+				eventBytes += len(trimmed) + dataLineOverhead
 			}
 			// Other SSE fields (event:, id:, retry:) are not part of the
 			// surface and are dropped.
@@ -1438,7 +1559,7 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = errPassthroughResponseTooLarge.code
 		emitStreamError(errPassthroughResponseTooLarge.code,
-			"모델 서버 응답이 중계 가능한 크기를 넘어 스트림을 종료했습니다. 응답이 불완전합니다. 최대 출력 길이(max_tokens)를 줄여주세요.")
+			"모델 서버 응답의 이벤트 하나가 중계 가능한 크기를 넘어 스트림을 종료했습니다. 응답이 불완전합니다.")
 	case readErr != nil:
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_interrupted"
@@ -1482,35 +1603,14 @@ func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a stre
 	record()
 }
 
-// errResponseOverCap is what cappedReader returns once an upstream sends more
-// than the relay bound. It is an error, not EOF, so a caller reading to the end
+// dataLineOverhead is what one buffered `data:` line costs beyond its bytes:
+// its slice header in the event's list, and its separator when joined.
+const dataLineOverhead = 32
+
+// errResponseOverCap is what the stream reader returns once one event, or
+// one line, outgrows the relay bound. It is an error, not EOF, so the loop
 // cannot mistake a cut response for a finished one.
 var errResponseOverCap = errors.New("upstream response exceeds the relay bound")
-
-// cappedReader passes through at most remaining bytes and fails if the
-// upstream has more. Reaching the bound exactly is not an error: only a byte
-// past it is, which takes one extra read to learn.
-type cappedReader struct {
-	r         io.Reader
-	remaining int64
-}
-
-func (c *cappedReader) Read(p []byte) (int, error) {
-	if c.remaining <= 0 {
-		var probe [1]byte
-		n, err := c.r.Read(probe[:])
-		if n > 0 {
-			return 0, errResponseOverCap
-		}
-		return 0, err
-	}
-	if int64(len(p)) > c.remaining {
-		p = p[:c.remaining]
-	}
-	n, err := c.r.Read(p)
-	c.remaining -= int64(n)
-	return n, err
-}
 
 // capString bounds one captured answer. A cut record says so rather than
 // looking like a short answer.

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -52,15 +51,52 @@ func TestStreamWithoutDoneIsNotASuccess(t *testing.T) {
 	}
 }
 
-// A stream past the relay bound ends with an error naming the bound, and its
-// usage record is not a success. Before, the reader returned EOF at the bound
-// and the cut answer was recorded OK.
-func TestStreamOverCapIsReported(t *testing.T) {
+// One event past the relay bound ends the stream with an error naming the
+// bound, and its usage record is not a success. The bound used to apply to
+// the whole stream; it now applies to the event being assembled, which is
+// what the stream holds in memory.
+func TestStreamEventOverCapIsReported(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		event string
+	}{
+		{"one long line", `data: {"model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"` +
+			strings.Repeat("x", upstreamResponseCapBytes) + `"}}]}` + "\n\n"},
+		{"many lines in one event", strings.Repeat("data: "+strings.Repeat("y", 1<<20)+"\n", 9) + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil, nil)
+			stream := `data: {"model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"ok"}}]}` + "\n\n" +
+				tc.event + "data: [DONE]\n\n"
+			h.srv.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(stream))}, nil
+			})}
+			status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			if status != http.StatusOK {
+				t.Fatalf("status %d", status)
+			}
+			text := string(body)
+			if !strings.Contains(text, "upstream_response_too_large") || !strings.HasSuffix(text, "data: [DONE]\n\n") ||
+				strings.Count(text, "data: [DONE]") != 1 {
+				t.Fatalf("stream end: %s", text[max(0, len(text)-400):])
+			}
+			evs := h.spoolEvents(t)
+			if len(evs) != 1 || evs[0].Status != spool.StatusUpstreamErr || evs[0].ErrorType != "upstream_response_too_large" {
+				t.Fatalf("events: %+v", evs)
+			}
+		})
+	}
+}
+
+// A long stream of ordinary events is not bounded in total: its duration cap
+// bounds it, and its memory is one event at a time.
+func TestLongStreamOfSmallEventsSucceeds(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	frame := `data: {"model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"` +
 		strings.Repeat("x", 4000) + `"}}]}` + "\n\n"
 	var stream strings.Builder
-	for stream.Len() <= upstreamResponseCapBytes+len(frame) {
+	for stream.Len() <= 2*upstreamResponseCapBytes {
 		stream.WriteString(frame)
 	}
 	stream.WriteString(`data: {"model":"` + upstreamModel + `","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5}}` + "\n\n")
@@ -70,30 +106,11 @@ func TestStreamOverCapIsReported(t *testing.T) {
 			Body: io.NopCloser(strings.NewReader(stream.String()))}, nil
 	})}
 	status, body := h.chat(t, testToken, `{"model":"pickle-general","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
-	if status != http.StatusOK {
-		t.Fatalf("status %d", status)
+	if status != http.StatusOK || strings.Contains(string(body), "upstream_response_too_large") {
+		t.Fatalf("a long stream of small events was cut: %d", status)
 	}
-	text := string(body)
-	if !strings.Contains(text, "upstream_response_too_large") || !strings.HasSuffix(text, "data: [DONE]\n\n") {
-		t.Fatalf("stream end: %s", text[max(0, len(text)-400):])
-	}
-	if strings.Count(text, "data: [DONE]") != 1 {
-		t.Fatal("more than one terminator")
-	}
-	evs := h.spoolEvents(t)
-	if len(evs) != 1 || evs[0].Status != spool.StatusUpstreamErr || evs[0].ErrorType != "upstream_response_too_large" {
+	if evs := h.spoolEvents(t); len(evs) != 1 || evs[0].Status != spool.StatusOK || evs[0].OutputTokens != 5 {
 		t.Fatalf("events: %+v", evs)
-	}
-}
-
-func TestCappedReader(t *testing.T) {
-	exact := &cappedReader{r: strings.NewReader("abcd"), remaining: 4}
-	if b, err := io.ReadAll(exact); err != nil || string(b) != "abcd" {
-		t.Fatalf("exactly at the bound: %q %v", b, err)
-	}
-	over := &cappedReader{r: strings.NewReader("abcde"), remaining: 4}
-	if b, err := io.ReadAll(over); !errors.Is(err, errResponseOverCap) || string(b) != "abcd" {
-		t.Fatalf("past the bound: %q %v", b, err)
 	}
 }
 

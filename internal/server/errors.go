@@ -66,6 +66,16 @@ var (
 		"자체 서빙 모델의 분당 토큰 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateConcurrency = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_concurrency",
 		"자체 서빙 모델의 동시 요청 수 한도를 초과했습니다. 진행 중인 요청이 끝난 뒤 다시 시도해주세요."}
+	// A body above the ordinary bound when every large-body slot, or this
+	// key's share of them, is taken. 429 because waiting is the remedy and
+	// the shortage is a limit rather than a fault.
+	errLargeRequestBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "large_request_busy",
+		"큰 요청(2 MiB 초과)을 처리할 자리가 지금은 없습니다. 잠시 후 다시 시도하거나, 파일과 이미지를 URL로 보내 요청을 줄여주세요."}
+	// The chat response bound, said out loud: a non-streamed answer bigger than
+	// this service relays. Streaming is the remedy, because a stream is bounded
+	// per event rather than in total.
+	errChatResponseTooLarge = apiError{http.StatusBadGateway, "server_error", "upstream_response_too_large",
+		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. stream으로 받거나 최대 출력 길이(max_tokens)를 줄여주세요."}
 	errServerBusy = apiError{http.StatusServiceUnavailable, "server_error", "server_busy",
 		"요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요."}
 	errRequestTooLarge = apiError{http.StatusBadRequest, "invalid_request_error", "request_too_large",
@@ -74,6 +84,10 @@ var (
 		"입력이 모델의 최대 입력 길이를 초과했습니다."}
 	errOutputTooLong = apiError{http.StatusBadRequest, "invalid_request_error", "output_limit_exceeded",
 		"요청한 최대 출력 길이가 모델의 허용치를 초과했습니다."}
+	// The upload stopped before the declared body arrived. Distinct from a
+	// malformed body: nothing the caller sent was wrong, it was cut off.
+	errRequestBodyUnreadable = apiError{http.StatusBadRequest, "invalid_request_error", "request_body_incomplete",
+		"요청 본문을 끝까지 받지 못했습니다. 다시 보내주세요."}
 	errBadJSON = apiError{http.StatusBadRequest, "invalid_request_error", "invalid_json",
 		"요청 본문이 올바른 JSON이 아닙니다."}
 	errUpstreamRejected = apiError{http.StatusBadRequest, "invalid_request_error", "upstream_rejected",
@@ -114,6 +128,9 @@ var retryAfterSeconds = map[string]int{
 	// on a far longer period, so this fits the common case, not the degraded
 	// one — a client that keeps getting 503 is seeing a real fault.
 	"credit_pending": 10,
+	// A large body holds its slot only until the upstream starts answering,
+	// so slots come free on the scale of a generation's first token.
+	"large_request_busy": 5,
 }
 
 // Internal sentinels for upstream failure reasons. They never reach a client;
