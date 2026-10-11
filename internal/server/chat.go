@@ -5,7 +5,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1368,261 +1367,89 @@ func (s *Server) refuseResponseTooLarge(w http.ResponseWriter, ev *spool.Event, 
 	record()
 }
 
-type streamArgs struct {
-	publicName string
-	// sentModel is the upstream model name this request asked for, so a
-	// vendor-side fallback can be noticed before the name is rewritten.
-	sentModel string
-	// keyID is for logging only; metering goes through charge, which already
-	// knows the key and whether this request's axis is metered at all.
-	keyID        string
-	charge       func(int)
-	inputBytes   int
-	forwardUsage bool
-	capture      *bodies.Record // nil unless the key opted into body capture
-	clientCtx    context.Context
-	upCtx        context.Context
+// finishStream relays a chat-completions stream.
+func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a streamArgs, ev *spool.Event, record func()) {
+	s.relayStream(w, resp, &chatStream{s: s, a: a, ev: ev}, a, ev, record)
 }
 
-func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a streamArgs, ev *spool.Event, record func()) {
-	fl, _ := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	if fl != nil {
-		fl.Flush()
-	}
-	writeFailed := false
-	writeRaw := func(b []byte) bool {
-		if writeFailed {
-			return false
-		}
-		if _, err := w.Write(b); err != nil {
-			writeFailed = true
-			return false
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return true
-	}
+// chatStream reads a chat-completions stream: data lines only, ended by
+// `data: [DONE]`. The event:, id: and retry: fields are not part of this
+// surface and are dropped.
+type chatStream struct {
+	s  *Server
+	a  streamArgs
+	ev *spool.Event
 
-	var u usage
-	haveUsage := false
-	contentChars := 0
-	dropped := 0
-	upstreamError := false
+	res streamResult
 	// Assembled assistant text, only when the key opted into capture.
-	var answer strings.Builder
-
-	// SSE events are framed by blank lines and one event's data may span
-	// several `data:` lines, so payloads are assembled per event before
-	// parsing. An assembled payload that still does not parse is dropped, not
-	// forwarded: a verbatim chunk would leak the upstream model identifier.
-	var dataLines [][]byte
-	notedServed := false
+	answer      strings.Builder
+	notedServed bool
 	// sawDone is the upstream's own terminator. A stream that ends without it
 	// ended early, however cleanly the connection closed.
-	sawDone := false
-	// eventBytes is what the event being assembled holds so far. One event is
-	// what this loop keeps in memory, so it is what the bound applies to.
-	eventBytes := 0
-	flushEvent := func() bool {
-		if len(dataLines) == 0 {
-			return true
-		}
-		payload := bytes.Join(dataLines, []byte("\n"))
-		dataLines, eventBytes = nil, 0
-		if bytes.Equal(payload, []byte("[DONE]")) {
-			sawDone = true
-			return writeRaw([]byte("data: [DONE]\n\n"))
-		}
-		c, ok := rewriteChunk(payload, a.publicName)
-		if !ok {
-			// Not valid JSON. A payload that does not even open an object is a
-			// heartbeat/keepalive (`ping`) with nothing structured to leak —
-			// forward it verbatim. One that looks like a truncated object is
-			// dropped rather than risk leaking a partial upstream identifier,
-			// and the answer is now incomplete, so the request is marked
-			// degraded below.
-			if len(payload) == 0 || payload[0] != '{' {
-				return writeRaw(append(append([]byte("data: "), payload...), '\n', '\n'))
-			}
-			dropped++
-			return true
-		}
-		if !notedServed && c.servedModel != "" {
-			notedServed = true
-			s.noteServedModel(ev, a.sentModel, c.servedModel)
-		}
-		upstreamError = upstreamError || c.upstreamError
-		if c.usage != nil {
-			u = *c.usage
-			haveUsage = true
-			if !a.forwardUsage {
-				if c.choicesEmpty && !c.upstreamError {
-					// The gateway-requested usage chunk; the student did not
-					// opt in, so it is consumed for metering and not sent.
-					return true
-				}
-				c.out = c.stripUsage()
-			}
-		}
-		contentChars += c.contentChars
-		if a.capture != nil && c.content != "" && answer.Len() < bodies.ResponseCapBytes {
-			answer.WriteString(c.content)
-		}
-		return writeRaw(append(append([]byte("data: "), c.out...), '\n', '\n'))
-	}
-
-	// Bounded per event, not in total. The memory a stream costs is the one
-	// event being assembled: lines are gathered until the blank line that
-	// ends an event, then joined into one more copy. Measured 2026-10-10,
-	// sixteen 60 MiB streams of ordinary chunks peaked at 116 MiB, while one
-	// event the size of a non-streamed response costs what that response
-	// does. So one event, and one line within it, gets the non-stream bound,
-	// and the total length is left to the request's duration cap.
-	//
-	// The bound fails loudly rather than reading as a finished stream, which
-	// is what a plain io.LimitReader at a total cap used to do.
-	br := bufio.NewReaderSize(resp.Body, 64<<10)
-	readLine := func() ([]byte, error) {
-		var line []byte
-		for {
-			frag, err := br.ReadSlice('\n')
-			if len(line)+len(frag)+eventBytes > upstreamResponseCapBytes {
-				return nil, errResponseOverCap
-			}
-			line = append(line, frag...)
-			if errors.Is(err, bufio.ErrBufferFull) {
-				continue
-			}
-			return line, err
-		}
-	}
-	var readErr error
-	for {
-		line, err := readLine()
-		trimmed := bytes.TrimRight(line, "\r\n")
-		switch {
-		case len(trimmed) == 0 && len(line) > 0:
-			flushEvent()
-		case len(trimmed) == 0:
-		case trimmed[0] == ':':
-			// Comment lines are keepalives; forward as-is.
-			writeRaw(append(trimmed, '\n', '\n'))
-		default:
-			if after, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
-				data := bytes.TrimSpace(after)
-				dataLines = append(dataLines, data)
-				// Charged by what the line costs to keep, not by its payload:
-				// an empty `data:` line still holds its own allocation and a
-				// slice header, so counting only the data would let a stream
-				// of empty lines grow one event without bound.
-				eventBytes += len(trimmed) + dataLineOverhead
-			}
-			// Other SSE fields (event:, id:, retry:) are not part of the
-			// surface and are dropped.
-		}
-		if writeFailed {
-			break
-		}
-		if sawDone {
-			// The answer is complete. Whatever the upstream does after its
-			// terminator (more bytes past the bound, a reset) must not turn a
-			// finished answer into an error, or send a second [DONE].
-			break
-		}
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				readErr = err
-			} else {
-				flushEvent()
-			}
-			break
-		}
-	}
-	if dropped > 0 {
-		s.log.Warn("dropped unparseable stream chunks", "keyId", a.keyID, "count", dropped)
-	}
-
-	// A stream that ends without the upstream's own [DONE] (deadline or an
-	// interrupted read) gets a terminal error event plus [DONE] so the client
-	// can tell a truncated answer from a complete one, rather than guessing
-	// from a missing terminator.
-	emitStreamError := func(code, msg string) {
-		writeRaw([]byte(`data: {"error":{"message":"` + msg + `","type":"server_error","code":"` + code + `"}}` + "\n\n"))
-		writeRaw([]byte("data: [DONE]\n\n"))
-	}
-	switch {
-	case writeFailed || a.clientCtx.Err() != nil:
-		ev.Status = spool.StatusCanceled
-		ev.ErrorType = "client_disconnected"
-	case !sawDone && (errors.Is(readErr, context.DeadlineExceeded) || errors.Is(a.upCtx.Err(), context.DeadlineExceeded)):
-		// The gateway's own duration cap, not an upstream fault.
-		ev.Status = spool.StatusTimeout
-		ev.ErrorType = "request_deadline_exceeded"
-		emitStreamError("request_deadline_exceeded", "요청 전체 시간 상한을 초과해 스트림을 종료했습니다.")
-	case errors.Is(readErr, errResponseOverCap):
-		// This service's own relay bound, not an upstream fault, and the
-		// caller can act on it, so it is named rather than reported as an
-		// interrupted stream. The public code is the passthrough's for the
-		// same condition.
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = errPassthroughResponseTooLarge.code
-		emitStreamError(errPassthroughResponseTooLarge.code,
-			"모델 서버 응답의 이벤트 하나가 중계 가능한 크기를 넘어 스트림을 종료했습니다. 응답이 불완전합니다.")
-	case readErr != nil:
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = "upstream_stream_interrupted"
-		emitStreamError("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.")
-	case !sawDone && !upstreamError:
-		// The connection closed cleanly but the upstream never said it was
-		// done, so the answer may stop mid-sentence. To the caller this is the
-		// same fact as an interrupted read, and gets the same public code; the
-		// record keeps the two apart. An upstream that reported its own error
-		// before closing is the next case: that error already went out and is
-		// the more specific cause.
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = "upstream_stream_unterminated"
-		emitStreamError("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.")
-	case dropped > 0:
-		// The stream reached its end, but some chunks could not be forwarded,
-		// so the answer the student received is incomplete. The upstream's
-		// [DONE] already went out, so this cannot be signalled inline anymore;
-		// record it as degraded rather than let it read as a clean success.
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = "upstream_chunk_unreadable"
-	case upstreamError:
-		// HTTP 200 is already committed; an explicit payload error still
-		// makes this request a failure even if the stream ends cleanly.
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = errUpstream.code
-		if !sawDone {
-			// The error itself was forwarded; only the terminator is missing.
-			writeRaw([]byte("data: [DONE]\n\n"))
-		}
-	default:
-		ev.Status = spool.StatusOK
-	}
-	s.settleUsage(ev, u, haveUsage, a.inputBytes, contentChars)
-	a.charge(ev.InputTokens + ev.OutputTokens)
-	if a.capture != nil {
-		a.capture.Response, a.capture.ResponseTruncated = capString(answer.String())
-		s.bodies.Offer(a.capture)
-		s.metrics.bodiesCaptured.Add(1)
-	}
-	record()
+	sawDone bool
 }
 
-// dataLineOverhead is what one buffered `data:` line costs beyond its bytes:
-// its slice header in the event's list, and its separator when joined.
-const dataLineOverhead = 32
+// An assembled payload that does not parse is dropped, not forwarded: a
+// verbatim chunk would leak the upstream model identifier.
+func (c *chatStream) event(e sseEvent) []byte {
+	payload := e.data
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		c.sawDone = true
+		return []byte("data: [DONE]\n\n")
+	}
+	ck, ok := rewriteChunk(payload, c.a.publicName)
+	if !ok {
+		// Not valid JSON. A payload that does not even open an object is a
+		// heartbeat/keepalive (`ping`) with nothing structured to leak —
+		// forward it verbatim. One that looks like a truncated object is
+		// dropped rather than risk leaking a partial upstream identifier,
+		// and the answer is now incomplete, so the request is marked
+		// degraded.
+		if len(payload) == 0 || payload[0] != '{' {
+			return append(append([]byte("data: "), payload...), '\n', '\n')
+		}
+		c.res.dropped++
+		return nil
+	}
+	if !c.notedServed && ck.servedModel != "" {
+		c.notedServed = true
+		c.s.noteServedModel(c.ev, c.a.sentModel, ck.servedModel)
+	}
+	c.res.upstreamError = c.res.upstreamError || ck.upstreamError
+	if ck.usage != nil {
+		c.res.usage = *ck.usage
+		c.res.haveUsage = true
+		if !c.a.forwardUsage {
+			if ck.choicesEmpty && !ck.upstreamError {
+				// The gateway-requested usage chunk; the student did not
+				// opt in, so it is consumed for metering and not sent.
+				return nil
+			}
+			ck.out = ck.stripUsage()
+		}
+	}
+	c.res.contentChars += ck.contentChars
+	if c.a.capture != nil && ck.content != "" && c.answer.Len() < bodies.ResponseCapBytes {
+		c.answer.WriteString(ck.content)
+	}
+	return append(append([]byte("data: "), ck.out...), '\n', '\n')
+}
 
-// errResponseOverCap is what the stream reader returns once one event, or
-// one line, outgrows the relay bound. It is an error, not EOF, so the loop
-// cannot mistake a cut response for a finished one.
-var errResponseOverCap = errors.New("upstream response exceeds the relay bound")
+func (c *chatStream) done() bool { return c.sawDone }
+
+func (c *chatStream) result() streamResult {
+	r := c.res
+	r.answer = c.answer.String()
+	return r
+}
+
+// errorEvent is an error chunk in the vendor's own shape, then [DONE].
+func (c *chatStream) errorEvent(code, msg string) []byte {
+	return []byte(`data: {"error":{"message":"` + msg + `","type":"server_error","code":"` + code + `"}}` + "\n\n" +
+		"data: [DONE]\n\n")
+}
+
+func (c *chatStream) terminator() []byte { return []byte("data: [DONE]\n\n") }
 
 // capString bounds one captured answer. A cut record says so rather than
 // looking like a short answer.
