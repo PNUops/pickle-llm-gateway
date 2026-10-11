@@ -257,6 +257,7 @@ func defaultDoc() snapshot.Document {
 		}},
 		Keys: []snapshot.Key{{
 			KeyID: "k-test", TokenHash: snapshot.HashToken(testToken), Status: snapshot.KeyActive,
+			PassthroughEndpoints: []string{snapshot.EndpointChat},
 		}},
 	}
 }
@@ -1119,7 +1120,8 @@ func TestRestrictedModelHiddenAndDenied(t *testing.T) {
 			Visibility: snapshot.ModelRestricted})
 		d.Keys = append(d.Keys, snapshot.Key{
 			KeyID: "k-priv", TokenHash: snapshot.HashToken("pickle-priv"), Status: snapshot.KeyActive,
-			AllowedModels: []string{"pickle-general", "pickle-internal"}})
+			AllowedModels:        []string{"pickle-general", "pickle-internal"},
+			PassthroughEndpoints: []string{snapshot.EndpointChat}})
 	}, nil)
 
 	// Open key: list excludes the restricted model, chat is denied, retrieve 404.
@@ -1336,7 +1338,7 @@ func TestBodyCaptureOnlyForOptedInKeys(t *testing.T) {
 		d.Keys[0].RecordBodies = true
 		d.Keys = append(d.Keys, snapshot.Key{
 			KeyID: "k-plain", TokenHash: snapshot.HashToken("pickle-plain"),
-			Status: snapshot.KeyActive})
+			Status: snapshot.KeyActive, PassthroughEndpoints: []string{snapshot.EndpointChat}})
 	}, nil)
 	cb := h.withBodyCapture(t)
 

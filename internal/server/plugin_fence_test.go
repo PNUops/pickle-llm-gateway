@@ -17,12 +17,12 @@ import (
 func fencedPluginDoc(d *snapshot.Document) {
 	creditPassthroughDoc(d)
 	d.Keys[0].CreditDeniedModels = []string{"openai/*-pro", "anthropic/*"}
-	d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointImages}
+	d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointChat, snapshot.EndpointImages, snapshot.EndpointWebSearch}
 }
 
 func unfencedPluginDoc(d *snapshot.Document) {
 	creditPassthroughDoc(d)
-	d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointImages}
+	d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointChat, snapshot.EndpointImages, snapshot.EndpointWebSearch}
 }
 
 func chatWith(field, value string) string {

@@ -87,6 +87,12 @@ const (
 const (
 	EndpointImages     = "images"
 	EndpointEmbeddings = "embeddings"
+	// EndpointChat is the grant the completion surfaces will require, and the
+	// two below are paid parts of chat that will need their own. Test
+	// fixtures carry them before anything enforces them.
+	EndpointChat      = "chat"
+	EndpointWebSearch = "web_search"
+	EndpointPdfOcr    = "pdf_ocr"
 )
 
 // reservedModelPrefixes are the prefixes reserved for curated self-serve

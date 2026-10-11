@@ -21,7 +21,7 @@ func passthroughDoc(endpoints ...string) func(*snapshot.Document) {
 	return func(d *snapshot.Document) {
 		d.PassthroughRef = "mock"
 		d.Keys[0].UpstreamCredentials = map[string]string{"mock": upstreamCred}
-		d.Keys[0].PassthroughEndpoints = endpoints
+		d.Keys[0].PassthroughEndpoints = append([]string{snapshot.EndpointChat}, endpoints...)
 	}
 }
 
