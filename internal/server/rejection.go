@@ -52,14 +52,27 @@ var (
 	rejectionBearer = regexp.MustCompile(`(?i)\bbearer\s+\S+`)
 	rejectionKey    = regexp.MustCompile(`(?i)\b(?:sk|pk|rk)-[a-z0-9_-]{6,}`)
 	rejectionToken  = regexp.MustCompile(`[A-Za-z0-9_+/=-]{32,}`)
-	// rejectionModelName is a vendor model id: a lower-case author, one slash,
-	// then letters, digits, dots and hyphens. Base64 can carry a slash too, but
-	// not a lower-case-only author segment in front of it with no + or = in
-	// the run, so a key or a hash is still redacted.
-	rejectionModelName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,39}/[A-Za-z0-9._-]+$`)
+	// rejectionModelName is a vendor model id: a short lower-case author, one
+	// slash, then a name with a hyphen in it. Standard base64 can carry a
+	// slash but never a hyphen, and the URL-safe alphabet that has a hyphen has
+	// no slash, so a key or a hash does not take this shape.
+	rejectionModelName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,19}/[A-Za-z0-9._]*-[A-Za-z0-9._-]*$`)
+	// rejectionLayoutAuthors are directory names a server puts in front of a
+	// model id on disk. A run starting with one is a path fragment, not a name
+	// the caller sent.
+	rejectionLayoutAuthors = map[string]bool{
+		"models": true, "model": true, "weights": true, "checkpoints": true,
+		"snapshots": true, "hf": true, "huggingface": true, "cache": true,
+	}
 )
 
-func looksLikeModelName(run string) bool { return rejectionModelName.MatchString(run) }
+func looksLikeModelName(run string) bool {
+	if !rejectionModelName.MatchString(run) {
+		return false
+	}
+	author, _, _ := strings.Cut(run, "/")
+	return !rejectionLayoutAuthors[author]
+}
 
 // rejectionMessage extracts the message from an upstream error body, still
 // raw. It returns "" when the body carries no message.

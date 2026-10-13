@@ -249,6 +249,9 @@ func TestCleanRejectionStillHidesSecretsAndHosts(t *testing.T) {
 		"Zm9vYmFyYmF6cXV4/cXV1eHF1dXhxdXV4cXV1eHF1dXg=",
 		"AbCdEfGhIjKlMnOpQr/StUvWxYz0123456789abcdef",
 		"abcdefghijklmnopqrstuvwxyz0123456789ABCDEF",
+		"abcdefghij0123456789/K7MDENGbPxRfiCYEXAMPLEKEY",
+		"abc123/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh",
+		"models/qwen3-235b-a22b-instruct-2507-fp8",
 	} {
 		if got := cleanRejection("bad token "+secret+" here", "", ""); strings.Contains(got, secret) {
 			t.Fatalf("%q survived: %q", secret, got)
