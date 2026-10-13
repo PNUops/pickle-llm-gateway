@@ -100,4 +100,8 @@ type responseResult struct {
 	usage       usage
 	haveUsage   bool
 	answer      string // for the no-usage estimate and capture
+	// upstreamError is the vendor's own error inside a 200 answer. The answer
+	// is still relayed as it came, like the same error inside a stream, but
+	// the request is not recorded as a success.
+	upstreamError bool
 }

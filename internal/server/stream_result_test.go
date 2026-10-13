@@ -144,3 +144,36 @@ func TestStreamResultIncludesPayloadErrors(t *testing.T) {
 		}
 	}
 }
+
+// A non-streamed answer carrying the vendor's own error is relayed as it came
+// and recorded the way the same error inside a stream is: not a success, with
+// the usage it reported kept.
+func TestNonStreamPayloadErrorIsNotASuccess(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"error member", `{"id":"c1","model":"` + upstreamModel + `","error":{"code":502,"message":"provider failure detail"},"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5}}`},
+		{"finish reason", `{"id":"c1","model":"` + upstreamModel + `","choices":[{"index":0,"message":{"role":"assistant","content":"par"},"finish_reason":"error"}],"usage":{"prompt_tokens":7,"completion_tokens":5}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil, nil)
+			h.mock.set(func(o *mockOpts) { o.rawResp = tc.body })
+			status, body := h.chat(t, testToken, chatBody)
+			if status != http.StatusOK || strings.Contains(string(body), upstreamModel) {
+				t.Fatalf("relay changed: %d %s", status, body)
+			}
+			evs := h.spoolEvents(t)
+			if len(evs) != 1 || evs[0].Status != spool.StatusUpstreamErr || evs[0].ErrorType != "upstream_error" ||
+				evs[0].Estimated || evs[0].InputTokens != 7 || evs[0].OutputTokens != 5 {
+				t.Fatalf("events: %+v", evs)
+			}
+		})
+	}
+	// An error member that is null is no error.
+	h := newHarness(t, nil, nil)
+	h.mock.set(func(o *mockOpts) {
+		o.rawResp = `{"id":"c1","model":"` + upstreamModel + `","error":null,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5}}`
+	})
+	h.chat(t, testToken, chatBody)
+	if evs := h.spoolEvents(t); len(evs) != 1 || evs[0].Status != spool.StatusOK {
+		t.Fatalf("events: %+v", evs)
+	}
+}

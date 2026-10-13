@@ -230,9 +230,26 @@ func shapeChat(params map[string]json.RawMessage, req parsedRequest, model *snap
 	}
 }
 
+// chatPayloadError reports whether a chat payload, one stream chunk or a whole
+// non-streamed answer, carries the vendor's own error: an error member, or a
+// choice that finished with "error". The vendor sends both under a 200 when a
+// generation fails part way, so the status alone says nothing.
+func chatPayloadError(m map[string]any) bool {
+	if m["error"] != nil {
+		return true
+	}
+	choices, _ := m["choices"].([]any)
+	for _, choice := range choices {
+		if item, _ := choice.(map[string]any); item != nil && item["finish_reason"] == "error" {
+			return true
+		}
+	}
+	return false
+}
+
 // readChatResponse reads a non-streamed chat completion.
 func readChatResponse(m map[string]any, publicName string) responseResult {
-	var res responseResult
+	res := responseResult{upstreamError: chatPayloadError(m)}
 	if raw, has := m["model"]; has {
 		res.servedModel, _ = raw.(string)
 		m["model"] = publicName
@@ -398,7 +415,7 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	if dec.Decode(&m) != nil {
 		return chunk{}, false
 	}
-	c := chunk{parsed: m, choicesEmpty: true, upstreamError: m["error"] != nil}
+	c := chunk{parsed: m, choicesEmpty: true, upstreamError: chatPayloadError(m)}
 	if raw, has := m["model"]; has {
 		c.servedModel, _ = raw.(string)
 		m["model"] = publicName
@@ -413,11 +430,6 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	}
 	if choices, _ := m["choices"].([]any); len(choices) > 0 {
 		c.choicesEmpty = false
-		for _, choice := range choices {
-			if item, _ := choice.(map[string]any); item != nil && item["finish_reason"] == "error" {
-				c.upstreamError = true
-			}
-		}
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {

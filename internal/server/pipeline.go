@@ -643,10 +643,14 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 		relayGenerationID(w, resp.Header)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if _, err := w.Write(out); err != nil {
+	switch _, err := w.Write(out); {
+	case err != nil:
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
-	} else {
+	case res.upstreamError:
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errUpstream.code
+	default:
 		ev.Status = spool.StatusOK
 	}
 	s.settleUsage(ev, res.usage, res.haveUsage, inputBytes, contentChars)
