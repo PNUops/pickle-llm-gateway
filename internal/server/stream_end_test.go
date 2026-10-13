@@ -133,3 +133,21 @@ func TestStreamAfterDoneIsIgnored(t *testing.T) {
 		t.Fatalf("events: %+v", evs)
 	}
 }
+
+// A bare CR inside a comment or a non-JSON payload would end a line at the
+// client and not here, so what follows it would reach the client unread.
+// Neither is forwarded.
+func TestStreamDoesNotForwardABareCarriageReturn(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.srv.client = streamFrom(": keep\rdata: {\"model\":\"" + upstreamModel + "\"}\n\n" +
+		"data: ping\rdata: {\"model\":\"" + upstreamModel + "\"}\n\n" +
+		`data: {"model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"ok"}}]}` + "\n\n" +
+		"data: [DONE]\n\n")
+	_, body := h.chat(t, testToken, streamRequest)
+	if strings.Contains(string(body), "\r") || strings.Contains(string(body), upstreamModel) {
+		t.Fatalf("a bare CR reached the client: %q", body)
+	}
+	if !strings.Contains(string(body), `"content":"ok"`) {
+		t.Fatalf("the ordinary event was lost: %q", body)
+	}
+}

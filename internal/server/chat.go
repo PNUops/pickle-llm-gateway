@@ -320,6 +320,13 @@ func (c *chatStream) event(e sseEvent) []byte {
 		// and the answer is now incomplete, so the request is marked
 		// degraded.
 		if len(payload) == 0 || payload[0] != '{' {
+			// Not with a bare CR in it, though: this relay ends lines at LF
+			// only and a client also at CR, so the rest would reach the
+			// client as lines nobody here read.
+			if bytes.ContainsRune(payload, '\r') {
+				c.res.dropped++
+				return nil
+			}
 			return append(append([]byte("data: "), payload...), '\n', '\n')
 		}
 		c.res.dropped++
@@ -359,8 +366,19 @@ func (c *chatStream) result() streamResult {
 
 // errorEvent is an error chunk in the vendor's own shape, then [DONE].
 func (c *chatStream) errorEvent(code, msg string) []byte {
-	return []byte(`data: {"error":{"message":"` + msg + `","type":"server_error","code":"` + code + `"}}` + "\n\n" +
-		"data: [DONE]\n\n")
+	// A struct rather than a map keeps the member order the clients have
+	// always received; marshalling rather than concatenating keeps the event
+	// valid JSON whatever the message holds.
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	e.Error.Message, e.Error.Type, e.Error.Code = msg, "server_error", code
+	b, _ := json.Marshal(e)
+	return append(append([]byte("data: "), b...), []byte("\n\ndata: [DONE]\n\n")...)
 }
 
 func (c *chatStream) terminator() []byte { return []byte("data: [DONE]\n\n") }
