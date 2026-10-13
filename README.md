@@ -295,7 +295,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | 기능 | 여는 것 |
 |---|---|
 | `chat` | `POST /v1/chat/completions`. 자체 서빙과 유료 모델 모두 |
-| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보의 `:online` 접미사, `openrouter:web_search` 도구 |
+| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구 |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구) |
 | `embeddings` | `POST /v1/embeddings` |

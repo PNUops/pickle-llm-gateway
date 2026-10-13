@@ -305,6 +305,9 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 				e := errToolModelNotAllowed(bad)
 				return &e
 			}
+			if e := onlineNeedsWebSearch(key, v); e != nil {
+				return e
+			}
 		}
 		if key.HasCreditFence() {
 			for _, name := range toolModelsRequiredOnFencedKey[toolType] {
@@ -444,6 +447,9 @@ func (s *Server) fencePlugins(doc *snapshot.Document, modelLookup func(string) *
 			if refused {
 				e := errPluginModelNotAllowed(bad)
 				return &e
+			}
+			if e := onlineNeedsWebSearch(key, v); e != nil {
+				return e
 			}
 		}
 		if key.HasCreditFence() {
@@ -607,6 +613,30 @@ func fenceChatCapabilities(_ *Server, _ *snapshot.Document, _ func(string) *snap
 					return rf
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// onlineNeedsWebSearch applies the web search grant to a model a tool or a
+// plugin names. A model that answers inside a tool searches the web on this
+// key's money just as the request's own model would. The value was already
+// read by judgeModelValue, so a shape it accepted decodes here.
+func onlineNeedsWebSearch(key *snapshot.Key, v json.RawMessage) *apiError {
+	if key.AllowsEndpoint(snapshot.EndpointWebSearch) {
+		return nil
+	}
+	var names []string
+	var one string
+	if json.Unmarshal(v, &one) == nil {
+		names = []string{one}
+	} else {
+		_ = json.Unmarshal(v, &names)
+	}
+	for _, name := range names {
+		if isOnlineName(name) {
+			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
+			return &e
 		}
 	}
 	return nil
