@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
 
@@ -60,6 +61,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"chatLargeBodiesInUse":   s.chatLarge.inUse(),
 		"chatLargeBodySlots":     s.cfg.ChatLargeBodySlots,
 		"generation":             s.store.Generation(),
+		"activeKeysWithoutChat":  s.activeKeysWithoutChat(),
 		"reloadFailures":         s.store.ReloadFailures(),
 		"rejectedEntries":        s.store.RejectedEntries(),
 		"bodiesDropped":          s.bodies.Dropped(),
@@ -71,6 +73,30 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"bodiesCaptured":         s.metrics.bodiesCaptured.Load(),
 		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
 	})
+}
+
+// activeKeysWithoutChat counts the usable keys in the applied document that
+// lack the chat grant. Every key that existed when the grant was introduced
+// was given it, so on a healthy document this is the number of keys an
+// approver deliberately issued without chat, and a jump to every key means
+// the document came from a control plane that does not know the grant (a
+// cached document after a restart, or the control plane rolled back alone).
+// It is a signal for whoever is deploying, not a switch: nothing here turns
+// enforcement off when it is high.
+func (s *Server) activeKeysWithoutChat() int {
+	doc, _, _ := s.store.Current()
+	now := s.now()
+	n := 0
+	for i := range doc.Keys {
+		k := &doc.Keys[i]
+		if k.Status != snapshot.KeyActive || (k.ExpiresAt != nil && now.After(*k.ExpiresAt)) {
+			continue
+		}
+		if !k.AllowsEndpoint(snapshot.EndpointChat) {
+			n++
+		}
+	}
+	return n
 }
 
 // AdminHandler is the operator-facing surface: metrics and the same health

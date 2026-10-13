@@ -1,9 +1,12 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
@@ -168,5 +171,32 @@ func TestSubCapabilityFieldsOnTheSelfHostedAxis(t *testing.T) {
 	status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"plugins":[{"id":"web"}]}`)
 	if status != http.StatusBadRequest || errCode(t, body) != "unsupported_parameter" {
 		t.Fatalf("got %d %s", status, body)
+	}
+}
+
+// The metrics surface counts the usable keys without the chat grant, so a
+// deploy can read off the gateway itself whether the document it applied
+// knows the grant. Revoked, suspended and expired keys are not counted.
+func TestMetricsCountActiveKeysWithoutChat(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	h := newHarness(t, func(d *snapshot.Document) {
+		d.Keys = append(d.Keys,
+			snapshot.Key{KeyID: "k-images", TokenHash: snapshot.HashToken("pickle-images"), Status: snapshot.KeyActive,
+				PassthroughEndpoints: []string{snapshot.EndpointImages}},
+			snapshot.Key{KeyID: "k-none", TokenHash: snapshot.HashToken("pickle-none"), Status: snapshot.KeyActive},
+			snapshot.Key{KeyID: "k-rev", TokenHash: snapshot.HashToken("pickle-rev"), Status: snapshot.KeyRevoked},
+			snapshot.Key{KeyID: "k-exp", TokenHash: snapshot.HashToken("pickle-exp"), Status: snapshot.KeyActive, ExpiresAt: &past},
+		)
+	}, nil)
+	rec := httptest.NewRecorder()
+	h.srv.AdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	var m struct {
+		ActiveKeysWithoutChat *int `json:"activeKeysWithoutChat"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil || m.ActiveKeysWithoutChat == nil {
+		t.Fatalf("metrics: %s", rec.Body.String())
+	}
+	if *m.ActiveKeysWithoutChat != 2 {
+		t.Fatalf("activeKeysWithoutChat = %d, want 2", *m.ActiveKeysWithoutChat)
 	}
 }
