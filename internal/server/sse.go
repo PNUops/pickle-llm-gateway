@@ -175,8 +175,12 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 			flushEvent()
 		case len(trimmed) == 0:
 		case trimmed[0] == ':':
-			// Comment lines are keepalives; forward as-is.
-			writeRaw(append(trimmed, '\n', '\n'))
+			// Comment lines are keepalives; forward as-is, unless one holds a
+			// bare CR, which a client reads as the end of the line and so as
+			// the start of a line this relay never parsed.
+			if !bytes.ContainsRune(trimmed, '\r') {
+				writeRaw(append(trimmed, '\n', '\n'))
+			}
 		default:
 			if after, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 				data := bytes.TrimSpace(after)

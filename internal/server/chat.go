@@ -230,9 +230,26 @@ func shapeChat(params map[string]json.RawMessage, req parsedRequest, model *snap
 	}
 }
 
+// chatPayloadError reports whether a chat payload, one stream chunk or a whole
+// non-streamed answer, carries the vendor's own error: an error member, or a
+// choice that finished with "error". The vendor sends both under a 200 when a
+// generation fails part way, so the status alone says nothing.
+func chatPayloadError(m map[string]any) bool {
+	if m["error"] != nil {
+		return true
+	}
+	choices, _ := m["choices"].([]any)
+	for _, choice := range choices {
+		if item, _ := choice.(map[string]any); item != nil && item["finish_reason"] == "error" {
+			return true
+		}
+	}
+	return false
+}
+
 // readChatResponse reads a non-streamed chat completion.
 func readChatResponse(m map[string]any, publicName string) responseResult {
-	var res responseResult
+	res := responseResult{upstreamError: chatPayloadError(m)}
 	if raw, has := m["model"]; has {
 		res.servedModel, _ = raw.(string)
 		m["model"] = publicName
@@ -303,6 +320,13 @@ func (c *chatStream) event(e sseEvent) []byte {
 		// and the answer is now incomplete, so the request is marked
 		// degraded.
 		if len(payload) == 0 || payload[0] != '{' {
+			// Not with a bare CR in it, though: this relay ends lines at LF
+			// only and a client also at CR, so the rest would reach the
+			// client as lines nobody here read.
+			if bytes.ContainsRune(payload, '\r') {
+				c.res.dropped++
+				return nil
+			}
 			return append(append([]byte("data: "), payload...), '\n', '\n')
 		}
 		c.res.dropped++
@@ -342,8 +366,19 @@ func (c *chatStream) result() streamResult {
 
 // errorEvent is an error chunk in the vendor's own shape, then [DONE].
 func (c *chatStream) errorEvent(code, msg string) []byte {
-	return []byte(`data: {"error":{"message":"` + msg + `","type":"server_error","code":"` + code + `"}}` + "\n\n" +
-		"data: [DONE]\n\n")
+	// A struct rather than a map keeps the member order the clients have
+	// always received; marshalling rather than concatenating keeps the event
+	// valid JSON whatever the message holds.
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	e.Error.Message, e.Error.Type, e.Error.Code = msg, "server_error", code
+	b, _ := json.Marshal(e)
+	return append(append([]byte("data: "), b...), []byte("\n\ndata: [DONE]\n\n")...)
 }
 
 func (c *chatStream) terminator() []byte { return []byte("data: [DONE]\n\n") }
@@ -398,7 +433,7 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	if dec.Decode(&m) != nil {
 		return chunk{}, false
 	}
-	c := chunk{parsed: m, choicesEmpty: true, upstreamError: m["error"] != nil}
+	c := chunk{parsed: m, choicesEmpty: true, upstreamError: chatPayloadError(m)}
 	if raw, has := m["model"]; has {
 		c.servedModel, _ = raw.(string)
 		m["model"] = publicName
@@ -413,11 +448,6 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	}
 	if choices, _ := m["choices"].([]any); len(choices) > 0 {
 		c.choicesEmpty = false
-		for _, choice := range choices {
-			if item, _ := choice.(map[string]any); item != nil && item["finish_reason"] == "error" {
-				c.upstreamError = true
-			}
-		}
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if delta, _ := first["delta"].(map[string]any); delta != nil {
 				if content, _ := delta["content"].(string); content != "" {

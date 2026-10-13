@@ -45,13 +45,34 @@ var (
 	rejectionPath     = regexp.MustCompile(`(^|[\s'"(=,\[])/[^\s'"),\]]+`)
 	rejectionEmail    = regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+`)
 	// Credentials: bearer values, vendor key prefixes, and any long unbroken
-	// token, which is what a key, a hash or a request id looks like. Model
-	// names and ordinary words never reach 32 characters without punctuation
-	// that breaks the run.
+	// token, which is what a key, a hash or a request id looks like. A model
+	// name can be that long too ("openai/gpt-4o-mini-search-preview"), and the
+	// most common rejection of all quotes it back, so a run shaped like one is
+	// kept (see looksLikeModelName).
 	rejectionBearer = regexp.MustCompile(`(?i)\bbearer\s+\S+`)
 	rejectionKey    = regexp.MustCompile(`(?i)\b(?:sk|pk|rk)-[a-z0-9_-]{6,}`)
 	rejectionToken  = regexp.MustCompile(`[A-Za-z0-9_+/=-]{32,}`)
+	// rejectionModelName is a vendor model id: a short lower-case author, one
+	// slash, then a name with a hyphen in it. Standard base64 can carry a
+	// slash but never a hyphen, and the URL-safe alphabet that has a hyphen has
+	// no slash, so a key or a hash does not take this shape.
+	rejectionModelName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,19}/[A-Za-z0-9._]*-[A-Za-z0-9._-]*$`)
+	// rejectionLayoutAuthors are directory names a server puts in front of a
+	// model id on disk. A run starting with one is a path fragment, not a name
+	// the caller sent.
+	rejectionLayoutAuthors = map[string]bool{
+		"models": true, "model": true, "weights": true, "checkpoints": true,
+		"snapshots": true, "hf": true, "huggingface": true, "cache": true,
+	}
 )
+
+func looksLikeModelName(run string) bool {
+	if !rejectionModelName.MatchString(run) {
+		return false
+	}
+	author, _, _ := strings.Cut(run, "/")
+	return !rejectionLayoutAuthors[author]
+}
 
 // rejectionMessage extracts the message from an upstream error body, still
 // raw. It returns "" when the body carries no message.
@@ -112,26 +133,51 @@ func cleanRejection(msg, upstreamModel, publicModel string) string {
 		return "[address]"
 	})
 	msg = rejectionIPv6.ReplaceAllStringFunc(msg, func(m string) string {
-		// Three colons, or a "::", is an address; two is a clock time.
-		if strings.Count(m, ":") >= 3 || strings.Contains(m, "::") {
+		// Three colons, or a "::", is an address; two is a clock time. An
+		// address also has two hex groups that are not empty: a lone "::" is
+		// punctuation ("Error:: something").
+		if (strings.Count(m, ":") >= 3 || strings.Contains(m, "::")) && nonEmptyGroups(m) >= 2 {
 			return "[address]"
 		}
 		return m
 	})
 	msg = rejectionHostPort.ReplaceAllStringFunc(msg, func(m string) string {
+		host := m[:strings.LastIndex(m, ":")]
 		// A host has a letter in it; "1.5:30" is a number and a ratio.
-		if strings.IndexFunc(m[:strings.LastIndex(m, ":")], unicode.IsLetter) < 0 {
+		if strings.IndexFunc(host, unicode.IsLetter) < 0 {
+			return m
+		}
+		// A word made only of letters is a word ("tokens:12000"), not a host,
+		// unless it is the one such host every server knows. A real host here
+		// carries a digit, a dot or a hyphen ("dgx1", "spark2", "a.b").
+		if !strings.ContainsAny(host, "0123456789.-") && !strings.EqualFold(host, "localhost") {
 			return m
 		}
 		return "[address]"
 	})
-	msg = rejectionToken.ReplaceAllString(msg, "[redacted]")
+	msg = rejectionToken.ReplaceAllStringFunc(msg, func(m string) string {
+		if looksLikeModelName(m) {
+			return m
+		}
+		return "[redacted]"
+	})
 	msg = strings.Join(strings.Fields(msg), " ")
 	if utf8.RuneCountInString(msg) > rejectionMessageMax {
 		runes := []rune(msg)
 		msg = string(runes[:rejectionMessageMax]) + "…"
 	}
 	return msg
+}
+
+// nonEmptyGroups counts the hex groups between the colons of an address match.
+func nonEmptyGroups(m string) int {
+	n := 0
+	for _, g := range strings.FieldsFunc(m, func(r rune) bool { return r == ':' || r == '[' || r == ']' }) {
+		if g != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // upstreamRejection is the refusal for an upstream 400 or 422. The public
