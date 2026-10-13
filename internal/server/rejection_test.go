@@ -223,3 +223,43 @@ func TestCleanRejectionAddresses(t *testing.T) {
 		}
 	}
 }
+
+// The caller's own model names and ordinary words survive the cleaning; the
+// rejection that quotes a model name back is the most common one there is.
+// Measured before the fix: every name below came back as [redacted],
+// "tokens:12000" as an address and "Error::" as an address.
+func TestCleanRejectionKeepsWhatTheCallerSent(t *testing.T) {
+	for _, tc := range []struct{ in, keep string }{
+		{"openai/gpt-4o-mini-search-preview is not a valid model ID", "openai/gpt-4o-mini-search-preview"},
+		{"anthropic/claude-3-7-sonnet-20250219 is not a valid model ID", "anthropic/claude-3-7-sonnet-20250219"},
+		{"meta-llama/llama-4-maverick-17b-128e-instruct: context length exceeded", "meta-llama/llama-4-maverick-17b-128e-instruct"},
+		{"Input tokens:12000 exceed the limit", "tokens:12000"},
+		{"Error:: something odd", "Error:: something odd"},
+	} {
+		if got := cleanRejection(tc.in, "", ""); !strings.Contains(got, tc.keep) {
+			t.Fatalf("%q lost %q: %q", tc.in, tc.keep, got)
+		}
+	}
+}
+
+// What the exemptions must not let through: a key or hash that carries a
+// slash, a mixed-case author, and the hosts the address rule exists for.
+func TestCleanRejectionStillHidesSecretsAndHosts(t *testing.T) {
+	for _, secret := range []string{
+		"Zm9vYmFyYmF6cXV4/cXV1eHF1dXhxdXV4cXV1eHF1dXg=",
+		"AbCdEfGhIjKlMnOpQr/StUvWxYz0123456789abcdef",
+		"abcdefghijklmnopqrstuvwxyz0123456789ABCDEF",
+	} {
+		if got := cleanRejection("bad token "+secret+" here", "", ""); strings.Contains(got, secret) {
+			t.Fatalf("%q survived: %q", secret, got)
+		}
+	}
+	for _, host := range []string{"localhost:8000", "dgx1:8000", "vllm-0:8000", "a.b.c:443"} {
+		if got := cleanRejection("refused by "+host, "", ""); strings.Contains(got, host) {
+			t.Fatalf("%q survived: %q", host, got)
+		}
+	}
+	if got := cleanRejection("at fd00::12 and 2001:db8::1", "", ""); strings.Contains(got, "fd00") || strings.Contains(got, "2001") {
+		t.Fatalf("IPv6 survived: %q", got)
+	}
+}
