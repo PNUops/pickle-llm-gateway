@@ -178,7 +178,7 @@ func (h *upstreamHealth) recordSuccess(ref string) {
 // The returned count is how many upstream attempts were made, including the
 // one that succeeded: 1 is the ordinary path and anything above it means the
 // request cost more than it looks like it did.
-func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *snapshot.Key,
+func (s *Server) callUpstream(ctx context.Context, p *protocol, model *snapshot.Model, key *snapshot.Key,
 	params map[string]json.RawMessage, outputCap int, clientHeaders http.Header) (*http.Response, config.Upstream, int, *attemptError) {
 	attempts := 0
 
@@ -236,14 +236,18 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 			}
 		}
 		lastUp = up
-		body, err := s.bodyFor(params, up, outputCap)
+		capField := p.capWriteField
+		if capField == "" {
+			capField = up.CapField
+		}
+		body, err := bodyFor(params, capField, outputCap)
 		if err != nil {
 			return nil, up, attempts, &attemptError{err: err}
 		}
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
 			s.health.recordAttempt(ref)
-			resp, ae := s.do(ctx, up, chatAttempt(s.client, body, cred, model, clientHeaders))
+			resp, ae := s.do(ctx, up, attemptFor(p, s.client, body, cred, model, clientHeaders))
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
@@ -305,7 +309,7 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 
 // bodyFor renders the request for one upstream, injecting the output cap on
 // the field that upstream honors.
-func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, outputCap int) ([]byte, error) {
+func bodyFor(params map[string]json.RawMessage, capField string, outputCap int) ([]byte, error) {
 	if outputCap <= 0 {
 		return json.Marshal(params)
 	}
@@ -313,7 +317,7 @@ func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, 
 	for k, v := range params {
 		out[k] = v
 	}
-	out[up.CapField] = json.RawMessage(strconv.Itoa(outputCap))
+	out[capField] = json.RawMessage(strconv.Itoa(outputCap))
 	return json.Marshal(out)
 }
 
@@ -348,20 +352,22 @@ type attemptSpec struct {
 	publicModel   string
 }
 
-// chatAttempt is the shape of one chat-completions call for a model. Client
+// attemptFor is the shape of one call on a surface for a model. Client
 // headers go only to a money-axis model: those are the vendor's features on
 // the student's own vendor key, while a self-hosted server has no use for
 // them and they would describe the student to the platform's own upstream.
-func chatAttempt(client *http.Client, body []byte, cred string, model *snapshot.Model, clientHeaders http.Header) attemptSpec {
+// The surface picks which headers; the axis decides whether any go at all,
+// and that decision stays here so no surface can forget it.
+func attemptFor(p *protocol, client *http.Client, body []byte, cred string, model *snapshot.Model, clientHeaders http.Header) attemptSpec {
 	var headers http.Header
 	if model.CreditAxis() {
-		headers = chatForwardedHeaders(clientHeaders)
+		headers = p.requestHeaders(clientHeaders)
 	}
 	return attemptSpec{
 		headers:       headers,
 		client:        client,
 		method:        http.MethodPost,
-		path:          "/chat/completions",
+		path:          p.upstreamPath,
 		body:          body,
 		cred:          cred,
 		creditAxis:    model.CreditAxis(),

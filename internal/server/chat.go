@@ -1,92 +1,20 @@
-// The chat-completions path: authenticate, admit against limits, translate
-// the public model name, forward, and meter. The gateway parses request and
-// response JSON only to validate parameters, swap model names and read token
-// usage; content is never inspected beyond size and never stored.
+// The chat-completions surface: what chat changes about the shared pipeline
+// (see pipeline.go). The model, its fallback list and the messages are read
+// here; every check and the metering run in the pipeline.
 package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
-	"errors"
-	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
-	"unicode/utf8"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
-	"github.com/pnuops/pickle-llm-gateway/internal/limits"
+	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 	"github.com/pnuops/pickle-llm-gateway/internal/spool"
 )
-
-// maxPassthroughNameBytes bounds a passthrough model name. Catalog names are
-// short by construction; an uncatalogued name is client input headed for logs,
-// the usage spool and an upstream URL-less request body, so junk is cut off
-// here rather than carried through all three.
-const maxPassthroughNameBytes = 256
-
-// passthroughModel synthesizes a model entry for a public name the catalog
-// does not list, when the current document names a passthrough upstream. The
-// synthesized model is always on the CREDIT axis: the commercial provider
-// prices it, so the per-key credential (and the money limit behind it) is the
-// only budget that can govern it. Names under the self-serve prefix never
-// pass through — a typo in a curated name must stay a 404 rather than become
-// a billable request to the commercial provider.
-func passthroughModel(doc *snapshot.Document, publicName string) *snapshot.Model {
-	// The prefix guard is case-insensitive even though catalog lookup is not:
-	// "PICKLE-general" must fail like "pickle-generall" does, not slip past
-	// the guard into a billable request. Retired prefixes stay guarded too.
-	if doc.PassthroughRef == "" ||
-		snapshot.IsReservedModelName(publicName) ||
-		// A preset stands in for the model and its fallbacks, so a name
-		// carrying one is not a name this fence can judge. Guarded here rather
-		// than at the call sites because this is the one door every
-		// uncatalogued name goes through.
-		snapshot.IsPresetModelName(publicName) ||
-		len(publicName) > maxPassthroughNameBytes {
-		return nil
-	}
-	return &snapshot.Model{
-		PublicName:  publicName,
-		UpstreamRef: doc.PassthroughRef,
-		// The two names are deliberately the same string, and something now
-		// depends on it: the passthrough surface has no upstream name in scope
-		// where it records a served model, so it passes the public one. That is
-		// correct only while this identity holds. Mapping a name here without
-		// threading the upstream one down there turns that comparison into the
-		// public-versus-upstream one that was wrong everywhere else.
-		UpstreamModel: publicName,
-		BudgetAxis:    snapshot.AxisCredit,
-	}
-}
-
-// `route` is deliberately not fenced, and this is inference rather than a
-// verified fact. The vendor's current fallback and routing documents do not
-// mention the field at all — not in the examples, not in the settings tables —
-// so it reads as a retired one. The reasoning for leaving it open is that it
-// selects AMONG candidates and `models` is the only candidate list, so fencing
-// every entry of that list bounds whatever `route` can reach, and `route` with
-// no `models` has nothing to select from.
-//
-// Recorded as inference on purpose. A note that claimed this was checked would
-// be read as settled by the next person, and an unverified vendor behaviour
-// treated as settled is exactly what defeated this fence once already.
-//
-// candidateModelsField is the request field that names models the vendor may
-// serve INSTEAD of the one in `model`. The vendor's own documentation is
-// explicit that any error can trigger a fallback to the next entry and that
-// "requests are priced using the model that was ultimately used", so an entry
-// here is a model this key can be billed for.
-//
-// That makes it the money fence's business rather than the parameter surface's.
-// The fence is built on model identity — AllowsCreditModel judges one public
-// name — so a field that changes which model answers walks around it while
-// every record, the spool included, still shows the name that was judged.
-const candidateModelsField = "models"
 
 // firstCandidateModel reads the first entry of the fallback list for a request
 // that has no `model`. present is false when there is no usable list at all
@@ -121,387 +49,6 @@ func renameFirstCandidate(params map[string]json.RawMessage, upstream string) {
 	if out, err := json.Marshal(names); err == nil {
 		params[candidateModelsField] = out
 	}
-}
-
-// fenceCandidateModels applies the money fence to every entry of that list,
-// returning the first entry that fails.
-//
-// Judging beats refusing here. Refusing the field would take back a capability
-// the vendor offers and this gateway has no reason to withhold; judging it
-// leaves fallback working between models the key may already use, which is
-// what the field is for. The body is parsed whole for `model` already, so the
-// extra cost is walking a short array.
-//
-// An unreadable list fails closed. A list this build cannot parse is one it
-// cannot fence, and forwarding it would hand the vendor candidates nobody
-// judged.
-func fenceCandidateModels(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
-	key *snapshot.Key, params map[string]json.RawMessage) (string, bool) {
-	raw, present := params[candidateModelsField]
-	if !present || string(bytes.TrimSpace(raw)) == "null" {
-		return "", true
-	}
-	var names []string
-	if json.Unmarshal(raw, &names) != nil {
-		return "", false
-	}
-	for _, name := range names {
-		if !allowsCandidateModel(doc, modelLookup, key, name) {
-			return name, false
-		}
-	}
-	return "", true
-}
-
-// allowsCandidateModel resolves one candidate exactly the way the request's own
-// `model` is resolved and applies the same two fences. Resolving it the same
-// way is the point: it is what keeps a reserved self-serve prefix out of the
-// list, so a typo in a curated name cannot leave for the vendor as a fallback
-// after being refused as a primary.
-func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
-	key *snapshot.Key, name string) bool {
-	// An empty candidate is refused rather than ignored. The primary `model`
-	// already refuses an empty string, and a list that quietly tolerates one is
-	// the asymmetry a fail-closed claim cannot afford — `[null]` decodes to
-	// exactly this.
-	if name == "" {
-		return false
-	}
-	// A preset in a candidate is the same refusal as a preset in `model`.
-	if snapshot.IsPresetModelName(name) {
-		return false
-	}
-	// A reserved self-serve name is never a candidate, catalogued or not. The
-	// list goes to the vendor, so such a name there is either a typo or our own
-	// naming leaving the platform; the catalogue lookup below would otherwise
-	// accept a TOKEN-axis row and hand it over, which is exactly the leak the
-	// primary path's prefix guard exists to stop.
-	if snapshot.IsReservedModelName(name) {
-		return false
-	}
-	m := modelLookup(name)
-	if m == nil {
-		m = passthroughModel(doc, name)
-	}
-	if m == nil {
-		return false
-	}
-	// The axis has to be checked, not inferred. AllowsCreditModel answers true
-	// for anything off the money axis — that is what makes it a money fence —
-	// so a candidate that resolves to a TOKEN-axis catalogue row would sail
-	// through every check here. Requiring the money axis closes that
-	// structurally rather than by naming the shapes that could reach it, and
-	// costs nothing: a self-hosted model is not something the vendor can serve,
-	// so it is meaningless as a fallback anyway.
-	if !m.CreditAxis() {
-		return false
-	}
-	return key.AllowsModel(m) && key.AllowsCreditModel(m)
-}
-
-// The vendor's server tools are the sixth channel, and they arrive inside
-// `tools` rather than beside it. A tool runs on the vendor's side during the
-// completion, and of the twelve it offers, four take a model of their own:
-// advisor consults a stronger model mid-generation, subagent delegates to a
-// smaller worker, fusion runs a panel plus an analyst, and image_generation
-// produces an image. The advisor's documentation says its model may be any
-// model on the platform and gives a tilde floating alias as the first example —
-// the shape closed everywhere else this round.
-//
-// image_generation is the one that matters most, because it runs on the chat
-// path and so reaches past the capability fence that governs the image routes.
-// Note that the vendor's overview table lists its second model as "None" while
-// its own detail page documents parameters.model with a default; the detail
-// page is the specific one and is what this follows. Somebody reading only the
-// overview will think this tool takes no model.
-//
-// These are judged rather than blocked, and judged by the same function the
-// fallback candidates go through — a tool that names a model this key may
-// already use is not a problem, and this way there is one rule with one more
-// place that applies it rather than a second rule to keep in step. A tool that
-// names no model passes untouched.
-//
-// WHAT THIS DELIBERATELY DOES NOT CATCH, so that it does not read as an
-// oversight: a tool of the vendor's that this build does not know, naming its
-// model through a parameter this build does not know, is forwarded unjudged.
-// Refusing unknown tools was considered and declined (operator, 2026-09-06).
-// The money is still bounded either way — the key's own credit limit is what
-// caps it, so nobody can spend past what was approved — and what leaks is only
-// which model that approved amount is spent on. While the deny list is a cost
-// control, that is the caller's own balance draining faster, and a caller who
-// gets this far is doing it on purpose.
-//
-// THE CONDITION THAT REVERSES IT: the moment a deny list carries policy rather
-// than cost — a vendor nobody may use, a model excluded for a reason that is
-// not price — the "their own balance" argument stops holding, because the harm
-// is then no longer the caller's to absorb. Revisit this the first time a deny
-// list is used that way.
-const toolsField = "tools"
-
-// serverToolPrefix marks the vendor's own tools. A caller's function tool
-// carries its schema under `function`, so its own "parameters" is a different
-// thing entirely and is deliberately not read here.
-const serverToolPrefix = "openrouter:"
-
-// imageGenerationTool produces an image from the chat path. It answers to the
-// image capability as well: a grant that is required to call the image route
-// and not required to reach the same work through a tool is not a grant.
-const imageGenerationTool = "openrouter:image_generation"
-
-// toolModelParams are the parameters through which a server tool names the
-// model it will call. A tool naming one some other way is forwarded unjudged —
-// see the decision recorded above; that is a choice, not a gap nobody noticed.
-var toolModelParams = []string{"model", "analysis_models"}
-
-// toolModelsRequiredOnFencedKey are the parameters a server tool must name on a
-// key that carries a model fence, because leaving them out does not mean "no
-// model" — it means the vendor picks one this fence never sees. The advisor's
-// documented order is the tool definition's model, then whatever the executing
-// model passes in its own tool call, then the outer model; the middle step is
-// decided mid-generation and never appears in the request. Fusion defaults its
-// panel to the vendor's quality preset (floating aliases), and its two
-// documents disagree on the analyst's default. The subagent is absent because
-// its documented fallback is the outer model, which is already judged.
-var toolModelsRequiredOnFencedKey = map[string][]string{
-	"openrouter:advisor": {"model"},
-	"openrouter:fusion":  {"model", "analysis_models"},
-}
-
-// nestedToolsParam carries server tools for a tool's own inner calls: the
-// subagent's worker and the fusion panel each take one. Every entry there runs
-// on the same key, so it is fenced exactly like a top-level tool.
-const nestedToolsParam = "tools"
-
-// maxNestedToolDepth bounds the recursion through nestedToolsParam. The vendor
-// documents one level (the subagent refuses to nest itself); a few more are
-// tolerated so a shape the vendor adds later is fenced rather than refused, and
-// anything deeper fails closed rather than being forwarded unread.
-const maxNestedToolDepth = 3
-
-// fenceServerTools judges every model a server tool names, and applies the
-// image capability to the tool that generates images. It returns the refusal to
-// send, or nil.
-func (s *Server) fenceServerTools(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
-	key *snapshot.Key, params map[string]json.RawMessage) *apiError {
-	raw, present := params[toolsField]
-	if !present || string(bytes.TrimSpace(raw)) == "null" {
-		return nil
-	}
-	return fenceToolList(doc, modelLookup, key, raw, 0)
-}
-
-func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
-	key *snapshot.Key, raw json.RawMessage, depth int) *apiError {
-	var tools []json.RawMessage
-	if json.Unmarshal(raw, &tools) != nil {
-		// Unreadable is unfenceable, and this field can carry a model.
-		e := errInvalidParamValue(toolsField)
-		return &e
-	}
-	for _, rawTool := range tools {
-		// Decoded into maps, not a tagged struct. Go matches struct tags
-		// case-insensitively with the last duplicate winning, so a tool carrying
-		// both "type" and "Type" would be judged by one key while the vendor,
-		// which receives these bytes verbatim, reads the other. A map reads the
-		// exact key, as the vendor does.
-		var tool map[string]json.RawMessage
-		if json.Unmarshal(rawTool, &tool) != nil {
-			e := errInvalidParamValue(toolsField)
-			return &e
-		}
-		var rawType string
-		if v, ok := tool["type"]; ok && json.Unmarshal(v, &rawType) != nil {
-			e := errInvalidParamValue(toolsField)
-			return &e
-		}
-		var parameters map[string]json.RawMessage
-		if v, ok := tool["parameters"]; ok && json.Unmarshal(v, &parameters) != nil {
-			e := errInvalidParamValue(toolsField)
-			return &e
-		}
-		toolType := strings.ToLower(strings.TrimSpace(rawType))
-		if !strings.HasPrefix(toolType, serverToolPrefix) {
-			continue
-		}
-		if toolType == imageGenerationTool &&
-			!key.AllowsEndpoint(snapshot.EndpointImages) {
-			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
-			return &e
-		}
-		for _, name := range toolModelParams {
-			v, ok := parameters[name]
-			if !ok {
-				continue
-			}
-			bad, refused, unreadable := judgeModelValue(doc, modelLookup, key, v)
-			if unreadable {
-				e := errInvalidParamValue(toolsField)
-				return &e
-			}
-			if refused {
-				e := errToolModelNotAllowed(bad)
-				return &e
-			}
-		}
-		if key.HasCreditFence() {
-			for _, name := range toolModelsRequiredOnFencedKey[toolType] {
-				// An empty value is as good as none: the vendor falls back to
-				// its default either way, and an empty list judged nothing.
-				if v, ok := parameters[name]; !ok || emptyModelValue(v) {
-					e := errToolModelRequired(toolType, name)
-					return &e
-				}
-			}
-		}
-		if nested, ok := parameters[nestedToolsParam]; ok && string(bytes.TrimSpace(nested)) != "null" {
-			if depth >= maxNestedToolDepth {
-				e := errInvalidParamValue(toolsField)
-				return &e
-			}
-			if e := fenceToolList(doc, modelLookup, key, nested, depth+1); e != nil {
-				return e
-			}
-		}
-	}
-	return nil
-}
-
-// judgeModelValue applies the candidate fence to a field the vendor spells both
-// ways, one model or a list. It reports the first refused name, or that the
-// value could not be read at all — which the caller refuses too, since a value
-// this build cannot read is one it cannot fence.
-func judgeModelValue(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
-	key *snapshot.Key, v json.RawMessage) (bad string, refused, unreadable bool) {
-	// null is the field left out, not a model named "". Whether leaving it out
-	// is acceptable is the caller's question (see toolModelsRequiredOnFencedKey),
-	// and answering it here would refuse a key that carries no list at all.
-	if string(bytes.TrimSpace(v)) == "null" {
-		return "", false, false
-	}
-	var one string
-	if json.Unmarshal(v, &one) == nil {
-		if !allowsCandidateModel(doc, modelLookup, key, one) {
-			return one, true, false
-		}
-		return "", false, false
-	}
-	var many []string
-	if json.Unmarshal(v, &many) != nil {
-		return "", false, true
-	}
-	for _, candidate := range many {
-		if !allowsCandidateModel(doc, modelLookup, key, candidate) {
-			return candidate, true, false
-		}
-	}
-	return "", false, false
-}
-
-// The `plugins` field is the seventh channel. Its entries configure work the
-// vendor does around the completion, and two kinds choose models:
-//
-//   - The routers (snapshot.RouterPluginID) steer which model a router picks.
-//     They are refused on a fenced key, judged by nothing: their candidates are
-//     wildcard patterns or a score, which the fence cannot judge, and the
-//     vendor documents each as read only by its own router model, which a
-//     fenced key cannot call anyway. Refusing costs such a key nothing.
-//   - fusion names its analyst and its panel outright, and configures a fusion
-//     run however that run was started — including by the server tool, which a
-//     fenced key can call. Its names are judged like a tool's. Its `preset`
-//     expands into a panel on the vendor's side, so on a fenced key it is
-//     refused; it is not the account preset refused for every key elsewhere.
-//
-// context-compression is deliberately not fenced. Its documentation says it
-// may move a request to a model with a longer context but not from which set,
-// and it switches itself on for small-context endpoints without the field, so
-// refusing the entry would not close it. It waits on a live call.
-//
-// A plugin this build does not know is forwarded, for the same reason and on
-// the same reversal condition as an unknown server tool (see above).
-const pluginsField = "plugins"
-
-const fusionPluginID = "fusion"
-
-// emptyModelValue reports a model field that names nothing: null, "", or [].
-func emptyModelValue(v json.RawMessage) bool {
-	var one string
-	if json.Unmarshal(v, &one) == nil {
-		return one == ""
-	}
-	var many []json.RawMessage
-	return json.Unmarshal(v, &many) == nil && len(many) == 0
-}
-
-// fusionPluginPreset is the fusion plugin's own panel selector.
-const fusionPluginPreset = "preset"
-
-// fencePlugins judges the models plugin entries name and refuses router
-// configuration on a fenced key. It returns the refusal to send, or nil.
-func (s *Server) fencePlugins(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
-	key *snapshot.Key, params map[string]json.RawMessage) *apiError {
-	raw, present := params[pluginsField]
-	if !present || string(bytes.TrimSpace(raw)) == "null" {
-		return nil
-	}
-	var plugins []map[string]json.RawMessage
-	if json.Unmarshal(raw, &plugins) != nil {
-		e := errInvalidParamValue(pluginsField)
-		return &e
-	}
-	for _, plugin := range plugins {
-		var id string
-		if json.Unmarshal(plugin["id"], &id) != nil {
-			// A missing id decodes from nil and fails here too: an entry the
-			// vendor will dispatch somewhere is one this has to be able to name.
-			// A null id decodes to "" without error and is forwarded like any
-			// unknown plugin; it names nothing the vendor can dispatch.
-			e := errInvalidParamValue(pluginsField)
-			return &e
-		}
-		if router := snapshot.RouterPluginID(id); router != "" {
-			if key.HasCreditFence() {
-				e := errRouterPluginNotAllowed(router)
-				return &e
-			}
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(id), fusionPluginID) {
-			continue
-		}
-		for _, name := range toolModelParams {
-			v, ok := plugin[name]
-			if !ok {
-				continue
-			}
-			bad, refused, unreadable := judgeModelValue(doc, modelLookup, key, v)
-			if unreadable {
-				e := errInvalidParamValue(pluginsField)
-				return &e
-			}
-			if refused {
-				e := errPluginModelNotAllowed(bad)
-				return &e
-			}
-		}
-		if key.HasCreditFence() {
-			// The preset expands on the vendor's side, and an empty panel may
-			// fall back to the vendor's default one; neither is judged.
-			if v, ok := plugin[fusionPluginPreset]; ok && string(bytes.TrimSpace(v)) != "null" {
-				e := errFusionPluginNeedsModels
-				return &e
-			}
-			if v, ok := plugin["analysis_models"]; ok && string(bytes.TrimSpace(v)) != "null" && emptyModelValue(v) {
-				e := errFusionPluginNeedsModels
-				return &e
-			}
-		}
-		if nested, ok := plugin[nestedToolsParam]; ok && string(bytes.TrimSpace(nested)) != "null" {
-			if e := fenceToolList(doc, modelLookup, key, nested, 1); e != nil {
-				return e
-			}
-		}
-	}
-	return nil
 }
 
 // tokenAxisParams are the top-level request fields the gateway forwards for a
@@ -570,472 +117,108 @@ var creditOnlyParams = map[string]bool{
 	"verbosity":        true,
 }
 
-type usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	// Cost is what the vendor charged for this request. It reaches the client
-	// verbatim either way; reading it here is what puts a dollar figure in the
-	// accounting, which until now had only the vendor's own cumulative meters.
-	// json.Number so the vendor's precision survives — it reports down to
-	// about 1e-7 and a float64 round trip is not something to spend on a
-	// number that is added up across a month.
-	Cost json.Number `json:"cost"`
-	// The two details are subsets of the counts above, not additions.
-	PromptTokensDetails struct {
-		CachedTokens int `json:"cached_tokens"`
-	} `json:"prompt_tokens_details"`
-	CompletionTokensDetails struct {
-		ReasoningTokens int `json:"reasoning_tokens"`
-	} `json:"completion_tokens_details"`
+// protoChat is the chat-completions surface.
+var protoChat = &protocol{
+	endpoint:     spool.EndpointChat,
+	capability:   capabilityChat,
+	upstreamPath: "/chat/completions",
+	logLine:      "chat request",
+	limits: func(c *config.Config) bodyLimits {
+		return bodyLimits{
+			request:       c.RequestBodyMaxBytes,
+			largeRequest:  c.ChatLargeBodyMaxBytes,
+			largeResponse: c.ChatLargeResponseMaxBytes,
+		}
+	},
+	parse:          parseChat,
+	tokenAxisParam: chatTokenAxisParam,
+	fences: []fence{
+		fencePresetField,
+		fenceCandidates,
+		fenceServerToolsStep,
+		fencePluginsStep,
+	},
+	requestHeaders: chatForwardedHeaders,
+	// Chat has two output fields, and which one an upstream honours is a fact
+	// about the upstream (a legacy server reads max_tokens only), so the cap
+	// goes on the upstream's configured field.
+	capReadFields: []string{"max_completion_tokens", "max_tokens"},
+	capWriteField: "",
+	shape:         shapeChat,
+	capture:       capRequest,
+	readResponse:  readChatResponse,
+	newStream: func(s *Server, a streamArgs, ev *spool.Event) streamExtractor {
+		return &chatStream{s: s, a: a, ev: ev}
+	},
+	writeError: func(w http.ResponseWriter, e apiError, _ string) { writeAPIError(w, e) },
 }
 
+// capabilityChat is the grant every completion surface will require. Nothing
+// enforces it yet.
+const capabilityChat = "chat"
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAPIError(w, errMethod)
-		return
-	}
-	start := s.now()
-	// Set before every fence, so a refused request still says which route it
-	// came in on. The one shape that never reaches the spool at all is an
-	// unauthenticated attempt, which belongs to nobody.
-	ev := spool.Event{
-		EventUUID:   spool.NewEventUUID(),
-		RequestedAt: start,
-		Endpoint:    spool.EndpointChat,
-	}
-	// The request id is the usage event's id, echoed on every response so a
-	// student can quote it in a support request (requirements §13) and so it
-	// ties their report to the metered event. OpenAI SDKs surface this header.
-	w.Header().Set("X-Request-Id", ev.EventUUID)
-	record := func() {
-		ev.LatencyMs = time.Since(start).Milliseconds()
-		s.metrics.observe(ev)
-		// A request that never resolved to a key has nobody to account to, and
-		// the spool is a small disk with a long retention that anyone on the
-		// internet can reach. Writing a line per unauthenticated attempt makes
-		// filling it a matter of a loop; the counters still see them, and a
-		// rejection for a key that *did* resolve (suspended, revoked, expired)
-		// is still spooled, because that one belongs to someone.
-		if ev.KeyID == "" && ev.Status == spool.StatusAuthRejected {
-			return
-		}
-		if err := s.spool.Write(ev); err != nil {
-			// The spool is the durable accounting record. A failure here is
-			// counted as well as logged: otherwise usage simply comes out low
-			// and nothing on any surface says why.
-			s.metrics.spoolWriteFailures.Add(1)
-			s.log.Error("usage spool write failed", "error", err)
-		}
-		s.log.Info("chat request", "keyId", ev.KeyID, "model", ev.PublicModelName,
-			"status", ev.Status, "errorType", ev.ErrorType,
-			"inputTokens", ev.InputTokens, "outputTokens", ev.OutputTokens,
-			"latencyMs", ev.LatencyMs, "ttftMs", ev.TtftMs)
-	}
-	refuse := func(e apiError, status string) {
-		writeAPIError(w, e)
-		ev.Status = status
-		ev.ErrorType = e.code
-		record()
-	}
-	// Same refusal to the caller, a different name in the usage record. Used
-	// where two distinct causes deliberately share one public error code and
-	// the accounting still has to tell them apart.
-	refuseAs := func(e apiError, status, errorType string) {
-		writeAPIError(w, e)
-		ev.Status = status
-		ev.ErrorType = errorType
-		record()
-	}
+	s.serveProtocol(protoChat, w, r)
+}
 
-	// One snapshot view per request: every check below reads this state, so a
-	// concurrent reload can never mix generations within a request.
-	doc, keyLookup, modelLookup := s.store.Current()
-	ev.Generation = doc.Generation
-	if !doc.ServiceEnabled {
-		refuse(errServiceDisabled, spool.StatusAuthRejected)
-		return
-	}
-	key, authErr := s.authenticate(r, keyLookup)
-	// Attribute before refusing: a key that resolved has an owner, and that is
-	// the fact worth recording about a rejection.
-	if key != nil {
-		ev.KeyID = key.KeyID
-	}
-	if authErr != nil {
-		refuse(*authErr, spool.StatusAuthRejected)
-		return
-	}
-
-	// The daily token quota is checked after the model resolves — it governs
-	// only TOKEN-axis models, and which axis applies is a fact about the model
-	// the request names. But a key that is BOTH quota-exhausted and without
-	// any upstream credential cannot pass either axis, so it is refused here,
-	// before it spends an in-flight slot and a body parse per attempt.
-	if key.QuotaExhausted && len(key.UpstreamCredentials) == 0 {
-		refuse(errQuotaExhausted, spool.StatusRateLimited)
-		return
-	}
-	// The gateway-wide cap is checked before any per-key charge: a refusal
-	// the student cannot influence must not spend their request budget.
-	select {
-	case s.inFlight <- struct{}{}:
-		defer func() { <-s.inFlight }()
-	default:
-		refuse(errServerBusy, spool.StatusRateLimited)
-		return
-	}
-	// The per-key limits are applied further down, once the model has told us
-	// the budget axis. They all protect self-hosted serving capacity, which a
-	// commercial call never touches — see the TOKEN branch below.
-	//
-	// A body above the ordinary bound needs a large-body slot, judged on the
-	// declared length before anything is read: refusing after reading would
-	// already have spent the memory the slot exists to bound. A request that
-	// declares no length, or a small one, is read through the small cap, so a
-	// false declaration cannot reach the large one (see config).
-	bodyLimit := s.cfg.RequestBodyMaxBytes
-	releaseLarge := func() {}
-	if r.ContentLength > bodyLimit {
-		if s.chatLarge == nil || r.ContentLength > s.cfg.ChatLargeBodyMaxBytes {
-			refuse(errRequestTooLarge, spool.StatusBadRequest)
-			return
-		}
-		release, ok := s.chatLarge.acquire(key.KeyID)
-		if !ok {
-			refuse(errLargeRequestBusy, spool.StatusRateLimited)
-			return
-		}
-		releaseLarge = release
-		defer release()
-		bodyLimit = s.cfg.ChatLargeBodyMaxBytes
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
-	// Sized from the declared length when there is one, so a 25 MiB body is
-	// one allocation rather than a doubling series that peaks near twice it.
-	var buf bytes.Buffer
-	if r.ContentLength > 0 && r.ContentLength <= bodyLimit {
-		buf.Grow(int(r.ContentLength) + bytes.MinRead)
-	}
-	_, err := buf.ReadFrom(r.Body)
-	rawBody := buf.Bytes()
-	// The buffer still points at the same bytes; only rawBody may, so that
-	// dropping it below actually lets them go.
-	buf = bytes.Buffer{}
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			refuse(errRequestTooLarge, spool.StatusBadRequest)
-			return
-		}
-		// Not a malformed body: the upload itself stopped (the connection
-		// closed or the read deadline passed). Recording it as invalid_json
-		// blamed the caller's JSON for a transport fault, and there is nobody
-		// left to answer.
-		// The answer is written anyway: when the peer is still there (a
-		// malformed chunked body, a read deadline) it would otherwise get an
-		// empty 200, and when it is gone the write is harmless.
-		writeAPIError(w, errRequestBodyUnreadable)
-		ev.Status = spool.StatusCanceled
-		ev.ErrorType = "request_body_read_failed"
-		record()
-		return
-	}
-	var params map[string]json.RawMessage
-	if err := json.Unmarshal(rawBody, &params); err != nil {
-		refuse(errBadJSON, spool.StatusBadRequest)
-		return
-	}
-	// Stamped here rather than where the stream is set up, because every fence
-	// between the two refuses requests that did ask for one. Reading it off a
-	// refusal as false would understate streaming by exactly the traffic that
-	// never got through, which is the traffic a limit question is about.
-	if raw, ok := params["stream"]; ok {
-		var streamed bool
-		_ = json.Unmarshal(raw, &streamed)
-		ev.Streamed = streamed
-	}
-	var publicModel string
+// parseChat reads the model name and the messages.
+func parseChat(params map[string]json.RawMessage) (parsedRequest, *refusal) {
+	var req parsedRequest
 	// fromCandidates marks a request that named its models only through the
 	// fallback list. The vendor documents that shape (`model` is optional when
 	// `models` is given, and the first entry is then the primary), so it is
 	// served rather than refused: the first entry stands in for `model` in
-	// every check below, the axis and the naming rules included, and the
-	// candidate fence still judges every entry, that first one too.
-	fromCandidates := false
-	if raw, ok := params["model"]; ok && json.Unmarshal(raw, &publicModel) != nil {
-		refuse(errMissingParam("model"), spool.StatusBadRequest)
-		return
+	// every check, the axis and the naming rules included, and the candidate
+	// fence still judges every entry, that first one too.
+	if raw, ok := params["model"]; ok && json.Unmarshal(raw, &req.publicModel) != nil {
+		return req, &refusal{e: errMissingParam("model")}
 	}
-	if publicModel == "" {
+	if req.publicModel == "" {
 		first, present, valid := firstCandidateModel(params)
 		switch {
 		case !present:
-			refuse(errMissingParam("model"), spool.StatusBadRequest)
-			return
+			return req, &refusal{e: errMissingParam("model")}
 		case !valid:
-			refuse(errInvalidParamValue(candidateModelsField), spool.StatusBadRequest)
-			return
+			return req, &refusal{e: errInvalidParamValue(candidateModelsField)}
 		}
-		publicModel, fromCandidates = first, true
+		req.publicModel, req.fromCandidates = first, true
 	}
-	messagesRaw, ok := params["messages"]
+	messages, ok := params["messages"]
 	if !ok {
-		refuse(errMissingParam("messages"), spool.StatusBadRequest)
-		return
+		return req, &refusal{e: errMissingParam("messages")}
 	}
-	// Checked before the model resolves, because a preset name resolves to
-	// nothing and would otherwise answer "no such model, see GET /v1/models" —
-	// advice that sends the caller to a list which cannot contain the answer.
-	if snapshot.IsPresetModelName(publicModel) {
-		refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
-		return
-	}
-	model := modelLookup(publicModel)
-	if model == nil {
-		model = passthroughModel(&doc, publicModel)
-	}
-	if model == nil {
-		refuse(errModelNotFound, spool.StatusBadRequest)
-		return
-	}
-	ev.PublicModelName = publicModel
-	// Copy the effective axis out of the request's snapshot. A catalog row
-	// written before budgetAxis existed has always meant TOKEN, while a
-	// synthesized passthrough model is explicitly CREDIT. Recording the
-	// normalized value here keeps later catalog changes from reclassifying the
-	// event and leaves requests with no valid route unclassified.
-	switch model.BudgetAxis {
-	case "", snapshot.AxisToken:
-		ev.BudgetAxis = snapshot.AxisToken
-	case snapshot.AxisCredit:
-		ev.BudgetAxis = snapshot.AxisCredit
-	}
-	// The parameter allowlist governs the TOKEN axis and nothing else.
-	//
-	// One machine used to run on both axes, and running on both hid the fact
-	// that it was doing two different jobs. On the self-hosted side it is the
-	// enforcement point for a service decision — thinking is off by default,
-	// with no per-request opt-in (see tokenAxisParams) — and the serving
-	// capacity it rations is the platform's own. On the money axis it was our
-	// convenience and nothing more: it refused fields the provider defines,
-	// on requests the student's own budget pays for, so every field it turned
-	// away was one the vendor would have served. Where the vendor accepts a
-	// request this gateway has no reason to be what refuses it.
-	//
-	// It still runs before the permission fences, so a malformed request
-	// answers 400 rather than 403, and it runs after the model is read because
-	// the axis is a fact about the model the body names.
-	if !model.CreditAxis() {
-		for name := range params {
-			if tokenAxisParams[name] {
-				continue
-			}
-			if creditOnlyParams[name] {
-				// Known field, wrong axis. Same public code as any other
-				// rejected field — one more code is one more thing every SDK
-				// has to learn for a fact it already handles — but different
-				// advice, and its own spool type so the two stay countable
-				// apart.
-				refuseAs(errParamNeedsCreditModel(name), spool.StatusBadRequest,
-					"credit_only_parameter")
-				return
-			}
-			refuse(errUnsupportedParam(name), spool.StatusBadRequest)
-			return
-		}
-	}
-	if !key.AllowsModel(model) {
-		refuse(errModelNotAllowed, spool.StatusBadRequest)
-		return
-	}
-	// Budget-axis enforcement, now that the model (and so the axis) is known.
-	//
-	// charge meters this request against the key's tpm bucket. It is a no-op
-	// on the CREDIT axis and stays that way for the rest of the handler, so
-	// commercial traffic can neither be refused by that bucket nor push it
-	// into debt — either one would let a commercial call spend self-hosted
-	// serving capacity it never used. Assigning (not declaring) it inside the
-	// branch below is deliberate: a `:=` there would shadow this one and leave
-	// every TOKEN request unmetered, which is the exact defect this ordering
-	// was written to fix.
-	charge := func(int) {}
-	if model.CreditAxis() {
-		// The model lists are checked before the credential, and the order is
-		// the answer the caller gets. A key restricted to some models still
-		// holds a funded credential, so testing the credential first would
-		// answer "no money budget" to somebody who has one — sending them to
-		// apply for what they already have. What they actually need is a
-		// different model, or an administrator who widens the fence.
-		//
-		// One call covers both the allow list and the deny list; AllowsCreditModel
-		// is the whole fence, so nothing here has to know which half refused.
-		// The caller is not told either, deliberately: naming the list would
-		// disclose its contents to somebody who is not the approver, and the
-		// two refusals ask the same thing of them anyway.
-		if !key.AllowsCreditModel(model) {
-			// Same public code as the catalogue fence, different advice (see
-			// errors.go). The spool gets its own error type so the two stay
-			// countable apart — otherwise nobody can tell how many callers hit
-			// this one.
-			//
-			// Re-reading the two predicates here decides only which message to
-			// send; the refusal itself was already decided above, and this
-			// branch cannot admit anything the fence turned away.
-			if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
-				refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
-					"router_model_not_allowed")
-				return
-			}
-			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
-				"credit_model_not_allowed")
-			return
-		}
-		// A preset carries its own model and fallback list, so it reaches past
-		// every check here from outside the fields they read. Refused rather
-		// than judged: presets live on the platform's vendor account, which
-		// every student key is issued under, so one created there is reachable
-		// by all of them.
-		if _, present := params[snapshot.PresetField]; present {
-			refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
-			return
-		}
-		// The same fence over the fallback candidates. Without this the field
-		// is a way around everything above it: the vendor may serve and bill
-		// any entry, while the fence, the spool and the student's own screen
-		// all keep showing the name that was judged.
-		if bad, ok := fenceCandidateModels(&doc, modelLookup, key, params); !ok {
-			refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
-				"credit_model_not_allowed")
-			return
-		}
-		// And over the models the vendor's own server tools name, which reach
-		// past everything above from inside `tools`.
-		if e := s.fenceServerTools(&doc, modelLookup, key, params); e != nil {
-			refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
-			return
-		}
-		// And over the models `plugins` entries name or steer.
-		if e := s.fencePlugins(&doc, modelLookup, key, params); e != nil {
-			refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
-			return
-		}
-		// Past the fence, the credential is the whole of the money axis: its
-		// issuer holds the limit, so a key granted no money budget simply
-		// carries none. No per-key limit of ours applies on this side.
-		if key.CredentialFor(model.UpstreamRef) == "" {
-			// Same missing credential, two different answers. A budget that
-			// was granted and is still being applied ends by itself, so the
-			// caller is told to wait and the status says so; anything else
-			// needs a person to act, and saying "wait" there would be a
-			// promise nothing keeps.
-			if key.CreditPending {
-				refuse(errCreditPending, spool.StatusAuthRejected)
-				return
-			}
-			refuse(errCreditUnavailable, spool.StatusAuthRejected)
-			return
-		}
-	} else {
-		// Every per-key limit below guards self-hosted serving capacity, so
-		// all of them wait until the axis is known. Admission comes before the
-		// daily quota, as it always has: a key that exhausted its allowance is
-		// the one most likely to be sitting in a retry loop, and leaving it
-		// unmetered by rpm would remove the only brake on that loop.
-		rpm, tpm, conc := s.keyLimits(key)
-		adm := s.limiter.Acquire(key.KeyID, rpm, tpm, conc)
-		if adm.Reason != limits.OK {
-			// Tell the client when to come back rather than leaving it to
-			// guess; SDK retry helpers read this header.
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(adm.RetryAfter.Seconds()))))
-			switch adm.Reason {
-			case limits.Rpm:
-				refuse(errRateRequests, spool.StatusRateLimited)
-			case limits.Tpm:
-				refuse(errRateTokens, spool.StatusRateLimited)
-			default:
-				refuse(errRateConcurrency, spool.StatusRateLimited)
-			}
-			return
-		}
-		defer adm.Release()
-		w.Header().Set("X-RateLimit-Limit-Requests", strconv.Itoa(rpm))
-		w.Header().Set("X-RateLimit-Remaining-Requests", strconv.Itoa(adm.RemainingRequests))
-		if key.QuotaExhausted {
-			refuse(errQuotaExhausted, spool.StatusRateLimited)
-			return
-		}
-		keyID := key.KeyID
-		charge = func(tokens int) { s.limiter.ChargeTokens(keyID, tpm, tokens) }
-	}
-	// Output length. A JSON null is what SDKs send for "unset" and is treated
-	// as absent; an explicit value above the model cap is refused. Whatever the
-	// student sent (on either OpenAI field) is normalized onto the upstream's
-	// configured cap field and capped at the model maximum, so the limit lands
-	// on the field the upstream actually honors — forwarding the student's
-	// field verbatim would let a legacy `max_tokens`-only server ignore a
-	// `max_completion_tokens` request and blow past the cap.
-	// The normalization runs whether or not the model declares a maximum. A
-	// model with none is a valid document (the field is optional, and the
-	// control plane may simply not set it), and leaving the student's field
-	// untouched in that case puts it back exactly where it does not work: a
-	// legacy `max_tokens`-only upstream ignores `max_completion_tokens`, and
-	// the request the student thought they had bounded generates without a
-	// limit, billed.
-	outputCap := 0
-	asked := 0
-	for _, f := range []string{"max_completion_tokens", "max_tokens"} {
-		raw, ok := params[f]
-		if !ok {
-			continue
-		}
-		delete(params, f) // re-added below on up.CapField
-		if string(bytes.TrimSpace(raw)) == "null" {
-			continue
-		}
-		var n int
-		if json.Unmarshal(raw, &n) != nil || n <= 0 {
-			refuse(errInvalidParamValue(f), spool.StatusBadRequest)
-			return
-		}
-		if model.MaxOutputTokens > 0 && n > model.MaxOutputTokens {
-			refuse(errOutputTooLong, spool.StatusBadRequest)
-			return
-		}
-		if asked == 0 || n < asked {
-			asked = n
-		}
-	}
-	switch {
-	case asked > 0:
-		outputCap = asked
-	case model.MaxOutputTokens > 0:
-		outputCap = model.MaxOutputTokens
-	}
-	// Input length: token counting needs the model's tokenizer, which the
-	// gateway does not have. This guard only refuses what cannot possibly
-	// fit (bytes far beyond the token budget); exact enforcement is the
-	// upstream's context-window error.
-	inputBytes := len(messagesRaw)
-	if model.MaxInputTokens > 0 && len(messagesRaw) > model.MaxInputTokens*6 {
-		refuse(errInputTooLong, spool.StatusBadRequest)
-		return
-	}
-
-	// Already on the event, stamped before the fences above.
-	streaming := ev.Streamed
+	req.input = messages
 	// Usage must always come back from the upstream for metering, but the
 	// usage chunk is only forwarded when the student asked for it — clients
 	// that never opted in would break on a chunk with an empty choices array.
-	studentWantsUsage := false
 	if raw, ok := params["stream_options"]; ok {
 		var opts struct {
 			IncludeUsage bool `json:"include_usage"`
 		}
 		_ = json.Unmarshal(raw, &opts)
-		studentWantsUsage = opts.IncludeUsage
+		req.wantsUsage = opts.IncludeUsage
 	}
-	if fromCandidates {
+	return req, nil
+}
+
+func chatTokenAxisParam(name string) *refusal {
+	if tokenAxisParams[name] {
+		return nil
+	}
+	if creditOnlyParams[name] {
+		// Known field, wrong axis. Same public code as any other rejected
+		// field — one more code is one more thing every SDK has to learn for a
+		// fact it already handles — but different advice, and its own spool
+		// type so the two stay countable apart.
+		return &refusal{e: errParamNeedsCreditModel(name), errorType: "credit_only_parameter"}
+	}
+	return &refusal{e: errUnsupportedParam(name)}
+}
+
+// shapeChat puts the upstream name in place of the public one and asks a
+// stream for its usage.
+func shapeChat(params map[string]json.RawMessage, req parsedRequest, model *snapshot.Model, streaming bool) {
+	if req.fromCandidates {
 		// Forwarded in the shape the caller sent, the one the vendor documents:
 		// no `model`, and the list with its first entry in the upstream name.
 		// Moving that entry into `model` instead would depend on how the vendor
@@ -1048,99 +231,30 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if streaming {
 		params["stream_options"] = withIncludeUsage(params["stream_options"])
 	}
+}
 
-	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
-	defer cancel()
-
-	// Try the model's upstream, then its fallback if it has one. Nothing has
-	// been written to the client yet, so switching upstreams here is invisible
-	// to the student; once the response starts, it is not.
-	resp, up, attempts, attemptErr := s.callUpstream(upCtx, model, key, params, outputCap, r.Header)
-	ev.TtftMs = time.Since(start).Milliseconds()
-	// Which upstream was reached, and how many tries it took. The response's
-	// own model field is rewritten to the public name before the student sees
-	// it, so without this the accounting cannot tell a free local model from a
-	// paid fallback — and the two are billed to different people. Recorded
-	// before the failure switch below, because a request that died on the way
-	// still spent whatever the upstream had already done for it; both fields
-	// stay empty only when nothing was contacted at all.
-	ev.UpstreamRef = up.Ref
-	ev.Attempts = attempts
-	if attemptErr != nil {
-		switch {
-		case r.Context().Err() != nil:
-			// The student went away; nothing can be written back.
-			ev.Status = spool.StatusCanceled
-			ev.ErrorType = "client_disconnected"
-			record()
-		case upCtx.Err() != nil || attemptErr.timeout:
-			refuse(errUpstreamTimeout, spool.StatusTimeout)
-		case attemptErr.refusal != nil:
-			// A budget refusal is accounting, not a fault: it belongs with the
-			// other limit refusals so "how often did this key hit a wall"
-			// counts it and "is the upstream broken" does not.
-			status := spool.StatusUpstreamErr
-			if attemptErr.refusal.code == errCreditExhausted.code {
-				status = spool.StatusRateLimited
+// readChatResponse reads a non-streamed chat completion.
+func readChatResponse(m map[string]any, publicName string) responseResult {
+	var res responseResult
+	if raw, has := m["model"]; has {
+		res.servedModel, _ = raw.(string)
+		m["model"] = publicName
+	}
+	if uraw, has := m["usage"]; has && uraw != nil {
+		if b, err := json.Marshal(uraw); err == nil && json.Unmarshal(b, &res.usage) == nil {
+			res.haveUsage = true
+		}
+	}
+	// The assistant text is needed for the no-usage size estimate, and again
+	// for capture when the key opted in.
+	if choices, _ := m["choices"].([]any); len(choices) > 0 {
+		if first, _ := choices[0].(map[string]any); first != nil {
+			if msg, _ := first["message"].(map[string]any); msg != nil {
+				res.answer, _ = msg["content"].(string)
 			}
-			refuse(*attemptErr.refusal, status)
-		case attemptErr.throttled:
-			// Every upstream is throttling us: the service really is busy.
-			relayRetryAfter(w, model, attemptErr)
-			refuse(errServerBusy, spool.StatusUpstreamErr)
-		default:
-			s.log.Error("upstream request failed", "keyId", key.KeyID,
-				"model", publicModel, "error", attemptErr.err)
-			relayRetryAfter(w, model, attemptErr)
-			refuse(errUpstream, spool.StatusUpstreamErr)
 		}
-		return
 	}
-	defer resp.Body.Close()
-
-	// Body capture: only for a key that opted in, and only when the delivery
-	// channel exists — captured text is never written to this host's disk, so
-	// with no channel there is nothing to capture into.
-	var capture *bodies.Record
-	if s.bodies.Enabled() && key.RecordBodies {
-		capture = &bodies.Record{
-			EventUUID:   ev.EventUUID,
-			KeyID:       key.KeyID,
-			RequestedAt: start,
-		}
-		capture.Request, capture.RequestTruncated = capRequest(messagesRaw)
-	}
-
-	// The upstream is answering, so the request body has done its job. Every
-	// copy of it is let go here rather than when the handler returns: the
-	// read bytes, the decoded members, and the re-serialised body the
-	// transport would otherwise keep reachable for the whole response. That
-	// is what lets the large-body slot go now, so a long stream does not
-	// hold one.
-	releaseUpstreamBody(resp)
-	rawBody, params, messagesRaw = nil, nil, nil
-	releaseLarge()
-
-	if !streaming {
-		s.finishNonStream(w, resp, model.PublicName, model.UpstreamModel, model.CreditAxis(), charge, &ev, record, inputBytes, capture)
-		return
-	}
-	// A stream commits its 200 before the body is read, so the id goes out
-	// with it; whatever happens later is reported inside the stream.
-	if model.CreditAxis() {
-		relayGenerationID(w, resp.Header)
-	}
-	s.finishStream(w, resp, streamArgs{
-		capture:      capture,
-		publicName:   model.PublicName,
-		sentModel:    model.UpstreamModel,
-		keyID:        key.KeyID,
-		charge:       charge,
-		inputBytes:   inputBytes,
-		forwardUsage: studentWantsUsage,
-		clientCtx:    r.Context(),
-		upCtx:        upCtx,
-	}, &ev, record)
+	return res
 }
 
 // withIncludeUsage forces stream_options.include_usage on so streamed
@@ -1156,220 +270,6 @@ func withIncludeUsage(raw json.RawMessage) json.RawMessage {
 		return json.RawMessage(`{"include_usage":true}`)
 	}
 	return out
-}
-
-// upstreamResponseCapBytes bounds what one upstream response may cost this
-// process without a large-body slot: a whole non-streamed response, or one
-// event of a stream (a stream holds one event at a time, so its total length
-// is left to the duration cap). The non-stream path holds the raw bytes, the
-// decoded map and the re-marshalled output at once, so the real cost is a
-// multiple of this, times the in-flight cap. A non-streamed response past it
-// is read further only with a slot, up to ChatLargeResponseMaxBytes.
-const upstreamResponseCapBytes = 8 << 20
-
-// servedModelMismatch records that the vendor answered with a model other than
-// the one requested. The vendor falls back on its own and prices the request
-// using whatever it ultimately used, so this is a real event; the response's
-// model field is rewritten to the public name a line later, which makes this
-// the only place the fact exists at all.
-//
-// It is recorded only when the answer differs from what was asked for, and
-// that is a correction of the reasoning this function first shipped with.
-//
-// The argument for recording it always was that an absent value otherwise
-// means both "the vendor reported nothing" and "the same model we asked for".
-// True, and it cost more than it was worth: the two names it compares live in
-// different namespaces. What goes on the wire is the upstream model id, while
-// the event's public model name is the name this service issues, and for every
-// catalogue model those differ by design -- hiding the upstream name is what a
-// public name is for. Anything downstream comparing the two therefore reported
-// a fallback on every ordinary self-hosted request.
-//
-// Comparing here is the only place the right pair is in hand. The distinction
-// that was lost is one nobody had a use for; the count that was wrong is read
-// by an aggregate.
-//
-// The name comes from an upstream response body, so it is bounded here rather
-// than left to the control plane's own limit: an oversized one would otherwise
-// reach the spool on a small disk with a 90-day retention.
-func (s *Server) noteServedModel(ev *spool.Event, requested, served string) {
-	if served == "" || requested == "" || strings.EqualFold(requested, served) {
-		return
-	}
-	ev.ServedModelName = boundServedModel(served)
-	s.log.Warn("upstream served a different model than requested",
-		"keyId", ev.KeyID, "publicModel", ev.PublicModelName,
-		"requested", requested, "served", served, "eventUuid", ev.EventUUID)
-}
-
-// servedModelMax is shorter than the control plane's own text bound on
-// purpose. Nothing legitimate approaches it, and the cost of a long one is
-// paid on this side first.
-const servedModelMax = 128
-
-func boundServedModel(served string) string {
-	if len(served) > servedModelMax {
-		return served[:servedModelMax]
-	}
-	return served
-}
-
-func (s *Server) finishNonStream(w http.ResponseWriter, resp *http.Response, publicName, sentModel string, creditAxis bool, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
-	// releaseLargeResponse frees a large-body slot taken below. It runs once
-	// the output is marshalled, before the write: the slot bounds what parsing
-	// costs, and a client that reads slowly must not hold it while it reads
-	// (the edge does not buffer responses).
-	releaseLargeResponse := func() {}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes+1))
-	if err == nil && len(body) > upstreamResponseCapBytes {
-		// Past the ordinary bound. The rest is read only with a large-body
-		// slot, because a response is the same size-times-count problem as a
-		// request. The vendor has already billed it either way, which is why
-		// the refusal points at streaming rather than at a retry.
-		release, ok := s.chatLarge.acquire(ev.KeyID)
-		if !ok || s.cfg.ChatLargeResponseMaxBytes <= upstreamResponseCapBytes {
-			release()
-			s.refuseResponseTooLarge(w, ev, charge, record, inputBytes)
-			return
-		}
-		defer release()
-		releaseLargeResponse = release
-		limit := s.cfg.ChatLargeResponseMaxBytes - int64(len(body))
-		buf := bytes.NewBuffer(body)
-		_, err = buf.ReadFrom(io.LimitReader(resp.Body, limit+1))
-		body = buf.Bytes()
-		if err == nil && int64(len(body)) > s.cfg.ChatLargeResponseMaxBytes {
-			s.refuseResponseTooLarge(w, ev, charge, record, inputBytes)
-			return
-		}
-	}
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			writeAPIError(w, errUpstreamTimeout)
-			ev.Status = spool.StatusTimeout
-			ev.ErrorType = errUpstreamTimeout.code
-		} else {
-			writeAPIError(w, errUpstream)
-			ev.Status = spool.StatusUpstreamErr
-			ev.ErrorType = "upstream_read_failed"
-		}
-		// The upstream may have generated tokens before the read failed; charge
-		// an input-side estimate so a client looping large failing requests is
-		// still rate-limited rather than metered as free.
-		s.settleUsage(ev, usage{}, false, inputBytes, 0)
-		charge(ev.InputTokens + ev.OutputTokens)
-		record()
-		return
-	}
-	// A response that does not parse as JSON is not something the gateway can
-	// vouch for, and forwarding it verbatim would expose the upstream's model
-	// identifiers — answer an upstream error instead.
-	var m map[string]any
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-	if dec.Decode(&m) != nil {
-		writeAPIError(w, errUpstream)
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = "upstream_invalid_response"
-		// Charge the minute bucket but leave the event's token counts at zero.
-		// The bucket is in-memory and minute-scale, so charging it is only
-		// rate limiting: without it a client looping against an upstream that
-		// answers garbage pays nothing and can repeat without bound. The event
-		// is the accounting record, and the api's daily-allowance query counts
-		// tokens without looking at status — writing an estimate there would
-		// spend a student's daily quota on an upstream fault they cannot
-		// influence, which is the same principle that puts the gateway-wide
-		// cap ahead of every per-key charge.
-		in, _ := estimateTokens(inputBytes, 0)
-		charge(in)
-		record()
-		return
-	}
-	if raw, has := m["model"]; has {
-		served, _ := raw.(string)
-		s.noteServedModel(ev, sentModel, served)
-		m["model"] = publicName
-	}
-	var u usage
-	haveUsage := false
-	if uraw, has := m["usage"]; has && uraw != nil {
-		if b, err := json.Marshal(uraw); err == nil && json.Unmarshal(b, &u) == nil {
-			haveUsage = true
-		}
-	}
-	// The assistant text is needed for the no-usage size estimate, and again
-	// for capture when the key opted in.
-	answer := ""
-	if choices, _ := m["choices"].([]any); len(choices) > 0 {
-		if first, _ := choices[0].(map[string]any); first != nil {
-			if msg, _ := first["message"].(map[string]any); msg != nil {
-				answer, _ = msg["content"].(string)
-			}
-		}
-	}
-	contentChars := 0
-	if !haveUsage {
-		contentChars = len(answer)
-	}
-	if capture != nil {
-		capture.Response, capture.ResponseTruncated = capString(answer)
-	}
-	out, err := json.Marshal(m)
-	if err != nil {
-		writeAPIError(w, errUpstream)
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = "upstream_invalid_response"
-		// Defensive only, and no test covers it: everything a UseNumber decode
-		// produces marshals again, so nothing a valid decode above can yield
-		// reaches here. Kept for the same reason as the decode failure, and
-		// charged the same way — bucket yes, accounting record no.
-		if haveUsage {
-			charge(u.PromptTokens + u.CompletionTokens)
-		} else {
-			in, outTok := estimateTokens(inputBytes, contentChars)
-			charge(in + outTok)
-		}
-		record()
-		return
-	}
-	body, m = nil, nil
-	releaseLargeResponse()
-	// Only on the answer actually relayed: a refusal above is the gateway's
-	// own error, not the vendor's generation.
-	if creditAxis {
-		relayGenerationID(w, resp.Header)
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if _, err := w.Write(out); err != nil {
-		ev.Status = spool.StatusCanceled
-		ev.ErrorType = "client_disconnected"
-	} else {
-		ev.Status = spool.StatusOK
-	}
-	s.settleUsage(ev, u, haveUsage, inputBytes, contentChars)
-	charge(ev.InputTokens + ev.OutputTokens)
-	s.bodies.Offer(capture)
-	if capture != nil {
-		s.metrics.bodiesCaptured.Add(1)
-	}
-	record()
-}
-
-// refuseResponseTooLarge answers a non-streamed response this service will
-// not relay. Its usage cannot be read, so the input side is estimated the way
-// a failed read is: a client looping on oversized answers is still metered.
-func (s *Server) refuseResponseTooLarge(w http.ResponseWriter, ev *spool.Event, charge func(int), record func(), inputBytes int) {
-	writeAPIError(w, errChatResponseTooLarge)
-	ev.Status = spool.StatusUpstreamErr
-	ev.ErrorType = errChatResponseTooLarge.code
-	s.settleUsage(ev, usage{}, false, inputBytes, 0)
-	charge(ev.InputTokens + ev.OutputTokens)
-	record()
-}
-
-// finishStream relays a chat-completions stream.
-func (s *Server) finishStream(w http.ResponseWriter, resp *http.Response, a streamArgs, ev *spool.Event, record func()) {
-	s.relayStream(w, resp, &chatStream{s: s, a: a, ev: ev}, a, ev, record)
 }
 
 // chatStream reads a chat-completions stream: data lines only, ended by
@@ -1450,24 +350,6 @@ func (c *chatStream) errorEvent(code, msg string) []byte {
 }
 
 func (c *chatStream) terminator() []byte { return []byte("data: [DONE]\n\n") }
-
-// capString bounds one captured answer. A cut record says so rather than
-// looking like a short answer.
-func capString(s string) (string, bool) {
-	return capAt(s, bodies.ResponseCapBytes)
-}
-
-func capAt(s string, limit int) (string, bool) {
-	if len(s) <= limit {
-		return s, false
-	}
-	// Cut on a rune boundary so the stored text stays valid UTF-8.
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut], true
-}
 
 // capRequest bounds the captured prompt. Under the cap it stays the messages
 // array the student sent. Over it, the array cannot be cut and still parse, so
@@ -1554,47 +436,4 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	}
 	c.out = b
 	return c, true
-}
-
-// settleUsage fills the event's token counts: exact when the upstream
-// reported usage, a byte-based estimate flagged as such otherwise.
-func (s *Server) settleUsage(ev *spool.Event, u usage, haveUsage bool, inputBytes, contentChars int) {
-	if haveUsage {
-		ev.InputTokens = u.PromptTokens
-		ev.OutputTokens = u.CompletionTokens
-		ev.CostUsd = spool.CostLiteral(u.Cost)
-		ev.CachedInputTokens = nonNegative(u.PromptTokensDetails.CachedTokens)
-		ev.ReasoningTokens = nonNegative(u.CompletionTokensDetails.ReasoningTokens)
-		return
-	}
-	// The estimate path writes no price and no breakdown. An estimate has
-	// neither, and leaving a value from somewhere else would be a number
-	// claiming to be exact next to a flag saying the tokens are not. Every
-	// caller reaches this function, which is why the rule lives here rather
-	// than at each of the four call sites.
-	ev.InputTokens, ev.OutputTokens = estimateTokens(inputBytes, contentChars)
-	ev.Estimated = true
-}
-
-func nonNegative(v int) int {
-	if v < 0 {
-		return 0
-	}
-	return v
-}
-
-// estimateTokens is the byte-based fallback when no upstream usage arrived.
-// It is separate from settleUsage because the rate limiter sometimes needs the
-// estimate without it reaching the accounting record — see the response paths
-// that charge the bucket but leave the event's token counts at zero.
-func estimateTokens(inputBytes, contentChars int) (in, out int) {
-	return inputBytes / 4, contentChars / 3
-}
-
-func isTimeout(err error) bool {
-	var ne interface{ Timeout() bool }
-	if errors.As(err, &ne) {
-		return ne.Timeout()
-	}
-	return errors.Is(err, context.DeadlineExceeded)
 }
