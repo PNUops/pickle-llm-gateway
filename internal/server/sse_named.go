@@ -36,7 +36,7 @@ type namedStream struct {
 }
 
 func (n *namedStream) event(e sseEvent) []byte {
-	if e.fieldTooLong {
+	if e.badField {
 		// A name this relay could not keep is a name it cannot dispatch on,
 		// so the event is not forwarded under some other name.
 		n.res.dropped++
@@ -56,7 +56,10 @@ func (n *namedStream) event(e sseEvent) []byte {
 	return sseFrame(e.name, data)
 }
 
-func (n *namedStream) done() bool { return n.ended }
+// done is true after an end event or the upstream's own error event. Nothing
+// the upstream sends after its error is part of an answer, and reading on
+// would hold the request open for an upstream that keeps the connection.
+func (n *namedStream) done() bool { return n.ended || n.res.upstreamError }
 
 func (n *namedStream) result() streamResult { return n.res }
 
@@ -64,7 +67,7 @@ func (n *namedStream) errorEvent(code, msg string) []byte {
 	return sseFrame(n.errorName, n.errorData(code, msg))
 }
 
-// terminator is nil: an upstream's error event already closes a named stream,
+// terminator is nil: an upstream's error event ends a named stream (see done),
 // and there is no separate end marker to add after it.
 func (n *namedStream) terminator() []byte { return nil }
 
@@ -103,6 +106,11 @@ func sseFrame(name string, data []byte) []byte {
 // gateway's own types are OpenAI's, four of which Anthropic shares; the rest
 // are chosen by status, because that is what an Anthropic client retries on.
 func anthropicErrorType(e apiError) string {
+	// The vendor has a type of its own for an oversized request; this gateway
+	// answers it with 400 rather than 413, so it is picked by code.
+	if e.code == errRequestTooLarge.code {
+		return "request_too_large"
+	}
 	switch e.typ {
 	case "authentication_error", "permission_error", "rate_limit_error":
 		return e.typ

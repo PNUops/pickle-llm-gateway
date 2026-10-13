@@ -110,11 +110,13 @@ func TestNamedStreamEndSet(t *testing.T) {
 }
 
 // An upstream's own error event is forwarded under its name and is the end of
-// the stream: the gateway adds neither a second error nor a terminator.
+// the stream: the gateway adds neither a second error nor a terminator, and
+// nothing the upstream sends after it is relayed or read.
 func TestNamedStreamUpstreamError(t *testing.T) {
 	errData := `{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`
 	out, ev, _ := relayNamed(t, testNamedStream(),
-		"event: message_start\ndata: "+msgStart+"\n\nevent: error\ndata: "+errData+"\n\n")
+		"event: message_start\ndata: "+msgStart+"\n\nevent: error\ndata: "+errData+"\n\n"+
+			"event: content_block_delta\ndata: "+msgDelta+"\n\n"+strings.Repeat("x", upstreamResponseCapBytes+10))
 	want := "event: message_start\ndata: " + msgStart + "\n\nevent: error\ndata: " + errData + "\n\n"
 	if out != want {
 		t.Fatalf("relayed bytes:\n got %q\nwant %q", out, want)
@@ -172,7 +174,7 @@ func TestAnthropicErrorEnvelope(t *testing.T) {
 
 	anthropicTypes := map[string]bool{
 		"invalid_request_error": true, "authentication_error": true, "permission_error": true,
-		"not_found_error": true, "rate_limit_error": true, "api_error": true,
+		"not_found_error": true, "rate_limit_error": true, "api_error": true, "request_too_large": true,
 		"overloaded_error": true, "timeout_error": true,
 	}
 	for name, e := range allAPIErrors() {
@@ -181,12 +183,47 @@ func TestAnthropicErrorEnvelope(t *testing.T) {
 			t.Fatalf("%s: %q is not an Anthropic error type", name, got)
 		}
 		switch {
+		case e.code == errRequestTooLarge.code:
+			if got != "request_too_large" {
+				t.Fatalf("%s: %q", name, got)
+			}
 		case e.status == http.StatusNotFound && got != "not_found_error",
+			e.status == http.StatusBadRequest && got != "invalid_request_error",
+			e.status == http.StatusForbidden && got != "permission_error",
 			e.status == http.StatusGatewayTimeout && got != "timeout_error",
 			e.status == http.StatusServiceUnavailable && got != "overloaded_error",
 			e.status == http.StatusUnauthorized && got != "authentication_error",
 			e.status == http.StatusTooManyRequests && got != "rate_limit_error":
 			t.Fatalf("%s (%d): %q", name, e.status, got)
+		}
+	}
+}
+
+// A name carrying a bare CR would be one line here and two at the client, a
+// way to put an event in front of it that read never saw. Such an event is
+// dropped.
+func TestNamedStreamDropsANameWithACarriageReturn(t *testing.T) {
+	out, _, _ := relayNamed(t, testNamedStream(),
+		"event: ping\rdata: {\"injected\":true}\r\revent: message_stop\ndata: {\"type\":\"ping\"}\n\n"+
+			"event: message_stop\ndata: "+msgStop+"\n\n")
+	if out != "event: message_stop\ndata: "+msgStop+"\n\n" {
+		t.Fatalf("relayed bytes: %q", out)
+	}
+}
+
+// The gateway's own terminal error on the request deadline is a timeout in
+// the Anthropic vocabulary, and anything else it ends a stream for is api_error.
+func TestNamedStreamGatewayErrorTypes(t *testing.T) {
+	n := testNamedStream()
+	for code, want := range map[string]string{
+		"request_deadline_exceeded":   "timeout_error",
+		"upstream_stream_interrupted": "api_error",
+		"upstream_response_too_large": "api_error",
+	} {
+		got := string(n.errorEvent(code, "m"))
+		if !strings.HasPrefix(got, "event: error\ndata: ") || !strings.Contains(got, `"type":"`+want+`"`) ||
+			!strings.Contains(got, `"code":"`+code+`"`) || !strings.Contains(got, `"request_id":"req-1"`) {
+			t.Fatalf("%s: %q", code, got)
 		}
 	}
 }
