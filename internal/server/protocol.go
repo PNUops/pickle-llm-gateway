@@ -18,9 +18,8 @@ import (
 // time, so a test that swaps s.client still reaches every surface.
 type protocol struct {
 	endpoint string // usage event route name
-	// capability is the key grant this surface needs, on both axes. The
-	// pipeline does not check it yet: the grant has to reach every existing
-	// key first, or enforcing it shuts them all out.
+	// capability is the key grant this surface needs, on both axes, checked
+	// right after authentication.
 	capability   string
 	upstreamPath string // appended to the upstream base URL
 	logLine      string // the request log's message

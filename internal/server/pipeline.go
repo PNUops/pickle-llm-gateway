@@ -116,6 +116,14 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		refuse(*authErr, spool.StatusAuthRejected)
 		return
 	}
+	// The surface's own grant. It applies on both axes and does not depend on
+	// the model, so it is judged before any limit or the body: a key that was
+	// never granted this surface should hear that, not a complaint about a
+	// budget or a field.
+	if !key.AllowsEndpoint(p.capability) {
+		refuse(errEndpointNotAllowed(endpointLabel(p.capability)), spool.StatusAuthRejected)
+		return
+	}
 
 	// The daily token quota is checked after the model resolves — it governs
 	// only TOKEN-axis models, and which axis applies is a fact about the model
