@@ -201,6 +201,11 @@ const serverToolPrefix = "openrouter:"
 // and not required to reach the same work through a tool is not a grant.
 const imageGenerationTool = "openrouter:image_generation"
 
+// webSearchTool searches the web during the completion, billed per search. It
+// answers to the web search capability wherever it appears, nested tool lists
+// included, for the same reason the image tool answers to images.
+const webSearchTool = "openrouter:web_search"
+
 // toolModelParams are the parameters through which a server tool names the
 // model it will call. A tool naming one some other way is forwarded unjudged —
 // see the decision recorded above; that is a choice, not a gap nobody noticed.
@@ -281,6 +286,11 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
 			return &e
 		}
+		if toolType == webSearchTool &&
+			!key.AllowsEndpoint(snapshot.EndpointWebSearch) {
+			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
+			return &e
+		}
 		for _, name := range toolModelParams {
 			v, ok := parameters[name]
 			if !ok {
@@ -294,6 +304,9 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 			if refused {
 				e := errToolModelNotAllowed(bad)
 				return &e
+			}
+			if e := onlineNeedsWebSearch(key, v); e != nil {
+				return e
 			}
 		}
 		if key.HasCreditFence() {
@@ -435,6 +448,9 @@ func (s *Server) fencePlugins(doc *snapshot.Document, modelLookup func(string) *
 				e := errPluginModelNotAllowed(bad)
 				return &e
 			}
+			if e := onlineNeedsWebSearch(key, v); e != nil {
+				return e
+			}
 		}
 		if key.HasCreditFence() {
 			// The preset expands on the vendor's side, and an empty panel may
@@ -502,4 +518,154 @@ func fencePluginsStep(s *Server, doc *snapshot.Document, lookup func(string) *sn
 		return &refusal{e: *e, errorType: toolRefusalType(*e)}
 	}
 	return nil
+}
+
+// The capabilities a chat body reaches without a route of its own. Each is
+// judged by the fields that ask for that feature and nothing else, so a
+// request that merely could have used it is never refused for it; and a
+// refusal is a refusal, never a quiet rewrite of the request into one the key
+// may send. The server tools among them are judged in fenceToolList, where
+// nesting is already followed.
+//
+// What is deliberately not judged, so it does not read as a gap: the
+// OpenAI-style web_search_options field (whether the vendor acts on it is
+// unconfirmed), a model that searches on its own without being asked, and a
+// PDF sent with no engine to a model that cannot read PDFs, which the vendor
+// answers with its paid engine. The last needs to know which models read PDFs
+// themselves, and this document does not carry that yet.
+
+// onlineSuffix asks the vendor to add web results to a model's answer.
+const onlineSuffix = ":online"
+
+// webPluginID is the vendor's web search plugin.
+const webPluginID = "web"
+
+// fileParserPluginID configures how files in the messages are read, and
+// paidPdfEngine is the engine that is billed per page.
+const (
+	fileParserPluginID = "file-parser"
+	paidPdfEngine      = "mistral-ocr"
+)
+
+// modalitiesField names the kinds of output asked for; "image" there makes a
+// chat completion an image generation.
+const modalitiesField = "modalities"
+
+func fenceChatCapabilities(_ *Server, _ *snapshot.Document, _ func(string) *snapshot.Model,
+	key *snapshot.Key, model *snapshot.Model, params map[string]json.RawMessage) *refusal {
+	needs := func(capability string) *refusal {
+		if key.AllowsEndpoint(capability) {
+			return nil
+		}
+		return &refusal{e: errEndpointNotAllowed(endpointLabel(capability)), errorType: "endpoint_not_allowed"}
+	}
+	// :online on the model or on any fallback candidate: either may be the
+	// model that answers, and the search is billed whichever does.
+	online := isOnlineName(model.PublicName)
+	if raw, ok := params[candidateModelsField]; ok && string(bytes.TrimSpace(raw)) != "null" {
+		var names []string
+		// Already parsed whole by the candidate fence, so this cannot fail.
+		_ = json.Unmarshal(raw, &names)
+		for _, name := range names {
+			online = online || isOnlineName(name)
+		}
+	}
+	if online {
+		if rf := needs(snapshot.EndpointWebSearch); rf != nil {
+			return rf
+		}
+	}
+	if raw, ok := params[pluginsField]; ok && string(bytes.TrimSpace(raw)) != "null" {
+		var plugins []map[string]json.RawMessage
+		// Already parsed by the plugins fence, which refuses what it cannot read.
+		_ = json.Unmarshal(raw, &plugins)
+		for _, plugin := range plugins {
+			var id string
+			_ = json.Unmarshal(plugin["id"], &id)
+			id = strings.ToLower(strings.TrimSpace(id))
+			switch id {
+			case webPluginID:
+				if rf := needs(snapshot.EndpointWebSearch); rf != nil {
+					return rf
+				}
+			case fileParserPluginID:
+				paid, readable := asksPaidPdfEngine(plugin)
+				if !readable {
+					return &refusal{e: errInvalidParamValue(pluginsField)}
+				}
+				if paid {
+					if rf := needs(snapshot.EndpointPdfOcr); rf != nil {
+						return rf
+					}
+				}
+			}
+		}
+	}
+	if raw, ok := params[modalitiesField]; ok && string(bytes.TrimSpace(raw)) != "null" {
+		var kinds []string
+		if json.Unmarshal(raw, &kinds) != nil {
+			// A list this build cannot read is one it cannot judge.
+			return &refusal{e: errInvalidParamValue(modalitiesField)}
+		}
+		for _, kind := range kinds {
+			if strings.EqualFold(strings.TrimSpace(kind), "image") {
+				if rf := needs(snapshot.EndpointImages); rf != nil {
+					return rf
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// onlineNeedsWebSearch applies the web search grant to a model a tool or a
+// plugin names. A model that answers inside a tool searches the web on this
+// key's money just as the request's own model would. The value was already
+// read by judgeModelValue, so a shape it accepted decodes here.
+func onlineNeedsWebSearch(key *snapshot.Key, v json.RawMessage) *apiError {
+	if key.AllowsEndpoint(snapshot.EndpointWebSearch) {
+		return nil
+	}
+	var names []string
+	var one string
+	if json.Unmarshal(v, &one) == nil {
+		names = []string{one}
+	} else {
+		_ = json.Unmarshal(v, &names)
+	}
+	for _, name := range names {
+		if isOnlineName(name) {
+			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
+			return &e
+		}
+	}
+	return nil
+}
+
+func isOnlineName(name string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(name)), onlineSuffix)
+}
+
+// asksPaidPdfEngine reports whether a file-parser plugin entry names the paid
+// PDF engine. readable is false when the pdf settings are there but cannot be
+// read, which the caller refuses: an engine it cannot read is one it cannot
+// judge.
+func asksPaidPdfEngine(plugin map[string]json.RawMessage) (paid, readable bool) {
+	raw, ok := plugin["pdf"]
+	if !ok || string(bytes.TrimSpace(raw)) == "null" {
+		return false, true
+	}
+	var pdf map[string]json.RawMessage
+	if json.Unmarshal(raw, &pdf) != nil {
+		return false, false
+	}
+	engineRaw, ok := pdf["engine"]
+	if !ok || string(bytes.TrimSpace(engineRaw)) == "null" {
+		return false, true
+	}
+	var engine string
+	if json.Unmarshal(engineRaw, &engine) != nil {
+		return false, false
+	}
+	return strings.EqualFold(strings.TrimSpace(engine), paidPdfEngine), true
 }

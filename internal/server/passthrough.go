@@ -122,6 +122,9 @@ var (
 // covers (editing and the catalogue read travel with it), and matching the
 // screen still wins over being more precise here than the screen is.
 var endpointNames = map[string]string{
+	snapshot.EndpointChat:       "Chat",
+	snapshot.EndpointWebSearch:  "웹 검색",
+	snapshot.EndpointPdfOcr:     "PDF OCR",
 	snapshot.EndpointImages:     "이미지 생성",
 	snapshot.EndpointEmbeddings: "임베딩",
 }
@@ -138,10 +141,9 @@ func endpointLabel(capability string) string {
 }
 
 // handlePassthrough builds the handler for one route. The fence order it runs
-// is the order the caller needs the answers in, and it is not the same as
-// chat's: the endpoint fence comes first because a key that was never granted
-// the capability should hear that, not a complaint about a money budget it may
-// well have.
+// is the order the caller needs the answers in, and like chat's it starts with
+// the endpoint fence: a key that was never granted the capability should hear
+// that, not a complaint about a money budget it may well have.
 func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != route.method {

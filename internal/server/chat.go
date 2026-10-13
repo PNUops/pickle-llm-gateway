@@ -120,7 +120,7 @@ var creditOnlyParams = map[string]bool{
 // protoChat is the chat-completions surface.
 var protoChat = &protocol{
 	endpoint:     spool.EndpointChat,
-	capability:   capabilityChat,
+	capability:   snapshot.EndpointChat,
 	upstreamPath: "/chat/completions",
 	logLine:      "chat request",
 	limits: func(c *config.Config) bodyLimits {
@@ -137,6 +137,7 @@ var protoChat = &protocol{
 		fenceCandidates,
 		fenceServerToolsStep,
 		fencePluginsStep,
+		fenceChatCapabilities,
 	},
 	requestHeaders: chatForwardedHeaders,
 	// Chat has two output fields, and which one an upstream honours is a fact
@@ -152,10 +153,6 @@ var protoChat = &protocol{
 	},
 	writeError: func(w http.ResponseWriter, e apiError, _ string) { writeAPIError(w, e) },
 }
-
-// capabilityChat is the grant every completion surface will require. Nothing
-// enforces it yet.
-const capabilityChat = "chat"
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.serveProtocol(protoChat, w, r)

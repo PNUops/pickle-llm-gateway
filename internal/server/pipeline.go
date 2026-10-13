@@ -30,9 +30,11 @@ import (
 // surface changes is in its protocol value.
 //
 // Every surface forwards the parsed body re-serialised, never the bytes it
-// received. Forwarding the original would let a duplicate or case-variant key
-// mean one thing to the fences, which read the decoded map, and another to the
-// vendor, which reads the bytes.
+// received. Forwarding the original would let a duplicate or case-variant
+// top-level key mean one thing to the fences, which read the decoded map, and
+// another to the vendor, which reads the bytes. Nested values go out as they
+// arrived; the fences that read them decode the same way a JSON parser on the
+// vendor's side does, the last of a repeated key winning.
 func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		p.writeError(w, errMethod, "")
@@ -114,6 +116,14 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	}
 	if authErr != nil {
 		refuse(*authErr, spool.StatusAuthRejected)
+		return
+	}
+	// The surface's own grant. It applies on both axes and does not depend on
+	// the model, so it is judged before any limit or the body: a key that was
+	// never granted this surface should hear that, not a complaint about a
+	// budget or a field.
+	if !key.AllowsEndpoint(p.capability) {
+		refuse(errEndpointNotAllowed(endpointLabel(p.capability)), spool.StatusAuthRejected)
 		return
 	}
 

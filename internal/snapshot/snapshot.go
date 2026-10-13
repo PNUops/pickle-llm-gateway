@@ -87,6 +87,13 @@ const (
 const (
 	EndpointImages     = "images"
 	EndpointEmbeddings = "embeddings"
+	// EndpointChat governs every completion surface, on both axes.
+	EndpointChat = "chat"
+	// The two below are parts of chat that cost money per use. They are
+	// judged from the chat body, on the money axis only, and a grant of either
+	// is meaningful only beside EndpointChat (the control plane enforces that).
+	EndpointWebSearch = "web_search"
+	EndpointPdfOcr    = "pdf_ocr"
 )
 
 // reservedModelPrefixes are the prefixes reserved for curated self-serve
@@ -356,9 +363,12 @@ type Key struct {
 	// send the member at all, since a gateway too old to read it does not
 	// serve these routes either.
 	//
-	// Nothing here governs chat completions or the model catalogue: those keep
-	// the fences they already have, so this list can never take away something
-	// a key has today.
+	// It governs chat completions too (EndpointChat), on both axes. An empty
+	// list is therefore a key that can do nothing but read the model
+	// catalogue, which stays open to every key because it costs nothing. The
+	// control plane granted chat to every key that existed before this was
+	// enforced, so a document from a control plane too old to know the word
+	// shuts every key out of chat: roll back the gateway first.
 	PassthroughEndpoints []string `json:"passthroughEndpoints,omitempty"`
 	Limits               Limits   `json:"limits"`
 	QuotaExhausted       bool     `json:"quotaExhausted,omitempty"`
