@@ -25,10 +25,11 @@ import (
 type sseEvent struct {
 	name, id, retry string
 	data            []byte
-	// fieldTooLong marks an event that carried an event:, id: or retry:
-	// value past sseFieldMax. The value was not kept, so a surface that reads
-	// the field must treat the event as malformed rather than as unnamed.
-	fieldTooLong bool
+	// badField marks an event that carried an event:, id: or retry: value
+	// this relay would not keep: one past sseFieldMax, or one holding a
+	// control byte. The value was dropped, so a surface that reads the field
+	// must treat the event as malformed rather than as unnamed.
+	badField bool
 }
 
 // sseFieldMax bounds the event:, id: and retry: values one event keeps. Those
@@ -37,16 +38,21 @@ type sseEvent struct {
 // without it one event could keep three more lines of the full line bound.
 const sseFieldMax = 1024
 
-// field reads one field value, or marks the event when the value is too long
-// to keep.
+// field reads one field value, or marks the event when the value cannot be
+// kept. A control byte is refused because this relay splits lines on LF
+// alone while a client also ends one at a bare CR: a name carrying a CR would
+// be one name here and, once written back out, a second line there, which is
+// a way to put an event in front of the client that no extractor ever read.
 func (e *sseEvent) field(after []byte) string {
 	v := bytes.TrimSpace(after)
-	if len(v) > sseFieldMax {
-		e.fieldTooLong = true
+	if len(v) > sseFieldMax || bytes.ContainsFunc(v, isControlByte) {
+		e.badField = true
 		return ""
 	}
 	return string(v)
 }
+
+func isControlByte(r rune) bool { return r < 0x20 || r == 0x7f }
 
 // streamExtractor is one surface's reading of its upstream's stream.
 type streamExtractor interface {
