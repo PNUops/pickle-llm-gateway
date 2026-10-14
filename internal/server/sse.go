@@ -85,7 +85,8 @@ type streamArgs struct {
 	// sentModel is the upstream model name this request asked for, so a
 	// vendor-side fallback can be noticed before the name is rewritten.
 	sentModel string
-	// keyID is for logging only; metering goes through charge, which already
+	// keyID is for logging and for the key's share of the large-body pool an
+	// oversized event takes; metering goes through charge, which already
 	// knows the key and whether this request's axis is metered at all.
 	keyID        string
 	charge       func(int)
@@ -129,16 +130,49 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 	// eventBytes is what the event being assembled holds so far. One event is
 	// what this loop keeps in memory, so it is what the bound applies to.
 	eventBytes := 0
+	// eventCap is the bound on the event being assembled. An event that
+	// outgrows the ordinary bound may go on to the large response bound only
+	// by taking a large-body slot, the same rule a non-streamed answer
+	// follows: an image generation streams its picture as one event, so a
+	// stream needs the same room a non-streamed answer gets, and the pool is
+	// what keeps that room a small multiplication.
+	eventCap := upstreamResponseCapBytes
+	releaseEvent := func() {}
+	defer func() { releaseEvent() }()
+	resetEventCap := func() {
+		releaseEvent()
+		releaseEvent, eventCap = func() {}, upstreamResponseCapBytes
+	}
+	overCap := func(n int) bool {
+		if n <= eventCap {
+			return false
+		}
+		largeMax := s.cfg.ChatLargeResponseMaxBytes
+		if eventCap == upstreamResponseCapBytes && largeMax > upstreamResponseCapBytes {
+			if release, ok := s.chatLarge.acquire(a.keyID); ok {
+				releaseEvent, eventCap = release, int(largeMax)
+				return n > eventCap
+			}
+		}
+		return true
+	}
 	flushEvent := func() {
 		// An event with no data is not dispatched, as SSE itself specifies.
 		if len(dataLines) == 0 {
 			cur = sseEvent{}
+			resetEventCap()
 			return
 		}
 		cur.data = bytes.Join(dataLines, []byte("\n"))
 		e := cur
 		cur, dataLines, eventBytes = sseEvent{}, nil, 0
-		writeRaw(x.event(e))
+		out := x.event(e)
+		// The slot bounds what assembling and converting the event costs and
+		// is given back before the write, as the non-stream path does, so a
+		// client that reads slowly does not hold it.
+		e.data = nil
+		resetEventCap()
+		writeRaw(out)
 	}
 
 	// Bounded per event, not in total. The memory a stream costs is the one
@@ -147,7 +181,8 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 	// sixteen 60 MiB streams of ordinary chunks peaked at 116 MiB, while one
 	// event the size of a non-streamed response costs what that response
 	// does. So one event, and one line within it, gets the non-stream bound,
-	// and the total length is left to the request's duration cap.
+	// or the large response bound with a slot (eventCap above), and the total
+	// length is left to the request's duration cap.
 	//
 	// The bound fails loudly rather than reading as a finished stream, which
 	// is what a plain io.LimitReader at a total cap used to do.
@@ -156,7 +191,7 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		var line []byte
 		for {
 			frag, err := br.ReadSlice('\n')
-			if len(line)+len(frag)+eventBytes > upstreamResponseCapBytes {
+			if overCap(len(line) + len(frag) + eventBytes) {
 				return nil, errResponseOverCap
 			}
 			line = append(line, frag...)
