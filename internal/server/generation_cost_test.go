@@ -270,3 +270,27 @@ func TestGenerationLookupsDoNotBlockAndAreBounded(t *testing.T) {
 		t.Fatalf("generation record read %d times", g.readCount())
 	}
 }
+
+// A record that keeps answering 404 is given up at the deadline, not at the
+// end of the schedule: a failed request's id answers 404 for good.
+func TestGenerationLookupStopsAtTheDeadline(t *testing.T) {
+	h, g := generationHarness(t, []time.Duration{time.Millisecond, time.Hour},
+		generationAnswer{404, `{"error":{"code":404}}`})
+	h.srv.costs.deadline = 200 * time.Millisecond
+	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	done := make(chan struct{})
+	go func() { h.srv.DrainCostLookups(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lookup outlived its deadline")
+	}
+	if ev := lastEvent(t, h); ev.CostUsd != "" || ev.InputTokens != 7 {
+		t.Fatalf("record: %+v", ev)
+	}
+	if g.readCount() != 1 {
+		t.Fatalf("reads %d", g.readCount())
+	}
+}

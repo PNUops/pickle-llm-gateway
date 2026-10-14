@@ -23,19 +23,34 @@ import (
 // The lookup runs after the handler has returned. A streamed response is only
 // complete for the client when its handler returns, so waiting here would hold
 // every client's stream open for as long as the vendor takes to publish the
-// record, which is not immediate: the first read after a stream ends is
-// normally a 404.
+// record, which is not immediate: measured on 2026-10-14, the record answers
+// 404 for about 11 to 12 seconds after a stream ends (5 to 6 for an image or a
+// cache hit), then 200. A stream that ends cleanly carries its cost in its
+// last usage on every route, so the lookup is for the streams that did not
+// get that far: a client that went away, an event past the relay bound, an
+// upstream that broke off. A request the vendor failed keeps answering 404
+// for good, which looks the same as not yet published, so the lookup gives up
+// at a deadline rather than on any answer.
 
-// generationCostDelays is the wait before each read of the generation record.
-// The record has been seen to appear within a couple of seconds of the end of
-// a stream; the tail covers a slow one, and past it the event is written
-// without a cost rather than held further. With each read bounded at five
-// seconds, a lookup holds its slot for at most about 35 seconds (15 of waiting,
-// 20 of reads against an upstream that answers nothing).
-var generationCostDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+// generationCostDelays is the wait before each read of the generation record:
+// the first just past the measured publishing delay, the rest backing off,
+// at 12, 18, 28, 43 and 58 seconds after the stream ended.
+var generationCostDelays = []time.Duration{12 * time.Second, 6 * time.Second, 10 * time.Second,
+	15 * time.Second, 15 * time.Second}
+
+// generationCostDeadline is how long after the stream a lookup may run,
+// reads included; past it the event is written without a cost. It is also
+// the most a lookup holds its slot.
+const generationCostDeadline = 60 * time.Second
+
+// generationCostReadTimeout bounds one read of the record.
+const generationCostReadTimeout = 5 * time.Second
 
 // generationCostPending bounds the lookups waiting at once. Each holds one
 // usage event in memory; past the bound an event is written without a cost.
+// With a lookup lasting up to the deadline, this is room for about eight
+// cost-less stream endings a second, sustained; ordinary streams carry their
+// cost and never take a slot.
 const generationCostPending = 512
 
 // generationCostReadLimit bounds one generation record. A real one is about
@@ -53,15 +68,17 @@ type generationCosts struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	delays   []time.Duration
+	deadline time.Duration
 }
 
 func newGenerationCosts() *generationCosts {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &generationCosts{
-		slots:  make(chan struct{}, generationCostPending),
-		ctx:    ctx,
-		cancel: cancel,
-		delays: generationCostDelays,
+		slots:    make(chan struct{}, generationCostPending),
+		ctx:      ctx,
+		cancel:   cancel,
+		delays:   generationCostDelays,
+		deadline: generationCostDeadline,
 	}
 }
 
@@ -150,15 +167,17 @@ func (c *generationCosts) admit() bool {
 // when no cost was found.
 func (s *Server) lookupGenerationCost(up config.Upstream, cred, id string) json.Number {
 	c := s.costs
+	ctx, cancel := context.WithTimeout(c.ctx, c.deadline)
+	defer cancel()
 	for _, wait := range c.delays {
 		t := time.NewTimer(wait)
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			t.Stop()
 			return ""
 		case <-t.C:
 		}
-		cost, retry := s.readGenerationCost(up, cred, id)
+		cost, retry := s.readGenerationCost(ctx, up, cred, id)
 		if cost != "" || !retry {
 			return cost
 		}
@@ -169,8 +188,8 @@ func (s *Server) lookupGenerationCost(up config.Upstream, cred, id string) json.
 // readGenerationCost makes one read. retry says whether a later read could
 // still succeed: a record not yet published, a throttle or a server fault can;
 // a refused credential or a record without a readable cost cannot.
-func (s *Server) readGenerationCost(up config.Upstream, cred, id string) (cost json.Number, retry bool) {
-	ctx, cancel := context.WithTimeout(s.costs.ctx, 5*time.Second)
+func (s *Server) readGenerationCost(lookup context.Context, up config.Upstream, cred, id string) (cost json.Number, retry bool) {
+	ctx, cancel := context.WithTimeout(lookup, generationCostReadTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		up.BaseURL+"/generation?id="+url.QueryEscape(id), http.NoBody)
@@ -180,7 +199,7 @@ func (s *Server) readGenerationCost(up config.Upstream, cred, id string) (cost j
 	req.Header.Set("Authorization", "Bearer "+cred)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", s.costs.ctx.Err() == nil
+		return "", lookup.Err() == nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -197,6 +216,10 @@ func (s *Server) readGenerationCost(up config.Upstream, cred, id string) (cost j
 	}
 	var rec struct {
 		Data struct {
+			// total_cost is what the vendor charged. upstream_inference_cost
+			// comes as 0 and is not read, and neither are the record's token
+			// counts: a cache hit's record carries the original request's
+			// tokens at a cost of 0, so the answer's own usage stays.
 			TotalCost json.Number `json:"total_cost"`
 		} `json:"data"`
 	}
