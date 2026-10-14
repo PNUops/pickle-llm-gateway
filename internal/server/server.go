@@ -218,19 +218,48 @@ func entryFor(m *snapshot.Model) modelEntry {
 	return modelEntry{ID: m.PublicName, Object: "model", Created: modelsCreatedEpoch, OwnedBy: "pnu-cloud"}
 }
 
+// anthropicModelEntry is one model in the shape Anthropic's models API uses,
+// which its SDKs and agent clients read when they send anthropic-version.
+type anthropicModelEntry struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// modelsCreatedAt is modelsCreatedEpoch in the RFC 3339 form that shape uses.
+var modelsCreatedAt = time.Unix(modelsCreatedEpoch, 0).UTC().Format(time.RFC3339)
+
+func anthropicEntryFor(m *snapshot.Model) anthropicModelEntry {
+	return anthropicModelEntry{Type: "model", ID: m.PublicName, DisplayName: m.PublicName, CreatedAt: modelsCreatedAt}
+}
+
+// The models route answers two client families from one path, and the
+// anthropic-version header is what tells them apart: an Anthropic client
+// sends it on every request and an OpenAI one never does. The list and the
+// refusals both follow it, so neither family is handed a shape it cannot read.
+// What the list contains is the same either way.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	anthropic := r.Header.Get("Anthropic-Version") != ""
+	fail := func(e apiError) {
+		if anthropic {
+			writeAnthropicError(w, e, "")
+			return
+		}
+		writeAPIError(w, e)
+	}
 	if r.Method != http.MethodGet {
-		writeAPIError(w, errMethod)
+		fail(errMethod)
 		return
 	}
 	doc, keyLookup, modelLookup := s.store.Current()
 	if !doc.ServiceEnabled {
-		writeAPIError(w, errServiceDisabled)
+		fail(errServiceDisabled)
 		return
 	}
 	key, authErr := s.authenticate(r, keyLookup)
 	if authErr != nil {
-		writeAPIError(w, *authErr)
+		fail(*authErr)
 		return
 	}
 
@@ -254,26 +283,52 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		// it will not serve exists, and a restricted key learning which names
 		// are real would undo that.
 		if m == nil || !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
-			writeAPIError(w, errModelNotFound)
+			fail(errModelNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if anthropic {
+			writeJSON(w, anthropicEntryFor(m))
+			return
+		}
 		writeJSON(w, entryFor(m))
 		return
 	}
 
-	list := struct {
-		Object string       `json:"object"`
-		Data   []modelEntry `json:"data"`
-	}{Object: "list", Data: []modelEntry{}}
+	var models []*snapshot.Model
 	for i := range doc.Models {
 		m := &doc.Models[i]
 		if !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
 			continue
 		}
-		list.Data = append(list.Data, entryFor(m))
+		models = append(models, m)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if anthropic {
+		// One page holds the whole list, so there is never a next one; the
+		// two ids are the page's ends, null on an empty page.
+		page := struct {
+			Data    []anthropicModelEntry `json:"data"`
+			HasMore bool                  `json:"has_more"`
+			FirstID *string               `json:"first_id"`
+			LastID  *string               `json:"last_id"`
+		}{Data: []anthropicModelEntry{}}
+		for _, m := range models {
+			page.Data = append(page.Data, anthropicEntryFor(m))
+		}
+		if n := len(page.Data); n > 0 {
+			page.FirstID, page.LastID = &page.Data[0].ID, &page.Data[n-1].ID
+		}
+		writeJSON(w, page)
+		return
+	}
+	list := struct {
+		Object string       `json:"object"`
+		Data   []modelEntry `json:"data"`
+	}{Object: "list", Data: []modelEntry{}}
+	for _, m := range models {
+		list.Data = append(list.Data, entryFor(m))
+	}
 	writeJSON(w, list)
 }
 
