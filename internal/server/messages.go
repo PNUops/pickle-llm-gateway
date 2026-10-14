@@ -209,10 +209,22 @@ type messagesUsage struct {
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
 	// Cost is read raw and kept only when it is a number: a malformed one
 	// must not take the token counts down with it.
-	Cost                json.RawMessage `json:"cost"`
+	Cost json.RawMessage `json:"cost"`
+	// The vendor reports thinking as thinking_tokens on this surface; the
+	// chat surface's reasoning_tokens is read too, in case a provider sends
+	// that name, and thinking_tokens wins when both are present.
 	OutputTokensDetails struct {
-		ReasoningTokens int `json:"reasoning_tokens"`
+		ThinkingTokens  *int `json:"thinking_tokens"`
+		ReasoningTokens *int `json:"reasoning_tokens"`
 	} `json:"output_tokens_details"`
+}
+
+// thinkingTokens is the output spent thinking, under either name.
+func (m messagesUsage) thinkingTokens() int {
+	if d := m.OutputTokensDetails; d.ThinkingTokens != nil {
+		return nonNegative(*d.ThinkingTokens)
+	}
+	return nonNegative(intOf(m.OutputTokensDetails.ReasoningTokens))
 }
 
 // cost is the vendor's price when it reported one as a number, else "".
@@ -262,7 +274,7 @@ func (m messagesUsage) normalized() (usage, bool) {
 	u.TotalTokens = u.PromptTokens + u.CompletionTokens
 	u.Cost = m.cost()
 	u.PromptTokensDetails.CachedTokens = read
-	u.CompletionTokensDetails.ReasoningTokens = m.OutputTokensDetails.ReasoningTokens
+	u.CompletionTokensDetails.ReasoningTokens = m.thinkingTokens()
 	return u, true
 }
 
@@ -362,7 +374,7 @@ func (m *messagesStream) read(e sseEvent, res *streamResult) ([]byte, bool) {
 				m.cacheCreation = nonNegative(*mu.CacheCreationInputTokens)
 			}
 			res.usage.CompletionTokens = nonNegative(*mu.OutputTokens)
-			res.usage.CompletionTokensDetails.ReasoningTokens = mu.OutputTokensDetails.ReasoningTokens
+			res.usage.CompletionTokensDetails.ReasoningTokens = mu.thinkingTokens()
 			if c := mu.cost(); c != "" {
 				res.usage.Cost = c
 			}
