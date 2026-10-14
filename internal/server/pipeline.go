@@ -845,11 +845,13 @@ func (s *Server) settleUsage(ev *spool.Event, u usage, haveUsage bool, inputByte
 		ev.ReasoningTokens = nonNegative(u.CompletionTokensDetails.ReasoningTokens)
 		return
 	}
-	// The estimate path writes no price and no breakdown. An estimate has
-	// neither, and leaving a value from somewhere else would be a number
-	// claiming to be exact next to a flag saying the tokens are not. Every
-	// caller reaches this function, which is why the rule lives here rather
-	// than at each of the four call sites.
+	// The estimate path writes no price and no breakdown: an estimate has
+	// neither, so none is derived from it. The one price an estimated record
+	// may still get is the vendor's own billed figure, read from its
+	// generation record after a money-axis stream (generation_cost.go); that
+	// is exact, and Estimated describes the token counts only. Every caller
+	// reaches this function, which is why the rule lives here rather than at
+	// each of the four call sites.
 	ev.InputTokens, ev.OutputTokens = estimateTokens(inputBytes, contentChars)
 	ev.Estimated = true
 }

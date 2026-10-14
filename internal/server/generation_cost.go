@@ -29,7 +29,9 @@ import (
 // generationCostDelays is the wait before each read of the generation record.
 // The record has been seen to appear within a couple of seconds of the end of
 // a stream; the tail covers a slow one, and past it the event is written
-// without a cost rather than held further.
+// without a cost rather than held further. With each read bounded at five
+// seconds, a lookup holds its slot for at most about 35 seconds (15 of waiting,
+// 20 of reads against an upstream that answers nothing).
 var generationCostDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
 
 // generationCostPending bounds the lookups waiting at once. Each holds one
@@ -181,6 +183,10 @@ func (s *Server) readGenerationCost(up config.Upstream, cred, id string) (cost j
 		return "", s.costs.ctx.Err() == nil
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// Read out so the connection can be reused for the next read.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, generationCostReadLimit))
+	}
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusTooManyRequests,
