@@ -45,8 +45,10 @@ var protoMessages = &protocol{
 	// that is ever lifted without writing this surface's own list, every
 	// field is refused rather than forwarded unread.
 	tokenAxisParam: func(name string) *refusal { return &refusal{e: errUnsupportedParam(name)} },
+	// Model names follow the chat rules: a name the catalogue does not list is
+	// forwarded to the vendor under the key's allow and deny lists, whether or
+	// not it carries a provider prefix.
 	fences: []fence{
-		fenceQualifiedModelName,
 		fencePresetField,
 		fenceCandidates,
 		fenceFallbacks,
@@ -139,21 +141,6 @@ func messagesForwardedHeaders(h http.Header) http.Header {
 		out.Set(name, v)
 	}
 	return out
-}
-
-// fenceQualifiedModelName refuses a model name the catalogue does not list and
-// that carries no provider prefix. Every paid model the vendor serves is named
-// provider/model, so a bare name is never one of them; on this surface it is
-// almost always an agent client's own default, sent because its model setting
-// was left empty. Forwarding it would hand the caller the vendor's error in
-// place of the one thing they need to hear, which setting to fill in. A name
-// the catalogue lists is ours and is judged by the catalogue as on any route.
-func fenceQualifiedModelName(_ *Server, _ *snapshot.Document, lookup func(string) *snapshot.Model,
-	_ *snapshot.Key, model *snapshot.Model, _ map[string]json.RawMessage) *refusal {
-	if lookup(model.PublicName) != nil || strings.Contains(model.PublicName, "/") {
-		return nil
-	}
-	return &refusal{e: errUnqualifiedModelName(model.PublicName), errorType: "model_name_unqualified"}
 }
 
 // fallbacksField is the Messages surface's own fallback list: up to a few

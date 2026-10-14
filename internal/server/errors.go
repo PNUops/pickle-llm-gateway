@@ -277,17 +277,6 @@ func errFallbackModelNotAllowed(name string) apiError {
 			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
 }
 
-// A model name with no provider prefix on the Messages surface: almost always
-// an agent client's built-in default, sent because its model setting is
-// empty. Same public code as any unusable value; the advice names the
-// setting. The name was already bounded when it resolved.
-func errUnqualifiedModelName(name string) apiError {
-	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
-		"유료 모델 이름은 공급자/모델 형식이어야 합니다: " + name + ". " +
-			"Pickle 이용 안내의 유료 모델 이름을 지정해주세요. " +
-			"Claude Code는 ANTHROPIC_MODEL 환경 변수로 모델을 지정합니다."}
-}
-
 func errUnsupportedParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
 		"지원하지 않는 파라미터입니다: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해주세요."}

@@ -276,25 +276,41 @@ func TestMessagesRefusesSelfHostedModel(t *testing.T) {
 	}
 }
 
-func TestMessagesRefusesUnqualifiedModelName(t *testing.T) {
+// Model names follow the chat rules: an uncatalogued name is forwarded as
+// written whether or not it carries a provider prefix, and only the key's own
+// lists decide whether it may go.
+func TestMessagesModelNamesFollowChatRules(t *testing.T) {
 	h, v := messagesHarness(t, nil)
-	status, body, _ := sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
-	e := expectAnthropicRefusal(t, status, body, 400, "invalid_request_error", "invalid_parameter_value")
-	if !strings.Contains(e.Error.Message, "ANTHROPIC_MODEL") || !strings.Contains(e.Error.Message, "claude-opus-5-5") {
-		t.Fatalf("message: %s", e.Error.Message)
-	}
-	if v.callCount() != 0 {
-		t.Fatal("unqualified name reached the vendor")
-	}
-	if ev := lastEvent(t, h); ev.ErrorType != "model_name_unqualified" {
-		t.Fatalf("record: %+v", ev)
-	}
-	// A vendor name and a floating alias both carry a provider; a catalogue
-	// name without one is ours and is served.
-	for _, model := range []string{"anthropic/claude-sonnet-4.5", "~anthropic/claude-opus-latest", "vendor-model"} {
+	for _, model := range []string{"claude-opus-5-5", "anthropic/claude-sonnet-4.5", "~anthropic/claude-opus-latest", "vendor-model"} {
 		if status, body, _ := sendMessages(t, h, nil, messagesFor(model)); status != 200 {
 			t.Fatalf("%s: %d %s", model, status, body)
 		}
+	}
+	// The bare name went out as the caller wrote it.
+	h, v = messagesHarness(t, nil)
+	if status, body, _ := sendMessages(t, h, nil, messagesFor("claude-opus-5-5")); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	var sent string
+	_ = json.Unmarshal(v.body["model"], &sent)
+	if sent != "claude-opus-5-5" {
+		t.Fatalf("forwarded model %q", sent)
+	}
+
+	// A key whose lists do not admit the name refuses it as on chat.
+	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditAllowedModels = []string{"anthropic/*"} })
+	status, body, _ := sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
+	expectAnthropicRefusal(t, status, body, 403, "permission_error", "model_not_allowed")
+	if v.callCount() != 0 {
+		t.Fatal("a name outside the allow list reached the vendor")
+	}
+	// A pattern with a vendor segment never reaches a bare name; an exact entry
+	// does.
+	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditDeniedModels = []string{"claude-opus-5-5"} })
+	status, body, _ = sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
+	expectAnthropicRefusal(t, status, body, 403, "permission_error", "model_not_allowed")
+	if v.callCount() != 0 {
+		t.Fatal("a denied name reached the vendor")
 	}
 }
 
@@ -619,7 +635,6 @@ func TestMessagesErrorsAreWellFormed(t *testing.T) {
 		"errMissingKeyMessages":         errMissingKeyMessages,
 		"errModelNotOnMessages":         errModelNotOnMessages,
 		"errFallbackModelNotAllowed(x)": errFallbackModelNotAllowed("x"),
-		"errUnqualifiedModelName(x)":    errUnqualifiedModelName("x"),
 	}
 	okTypes := map[string]bool{
 		"invalid_request_error": true, "authentication_error": true,
