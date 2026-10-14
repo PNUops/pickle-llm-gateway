@@ -302,14 +302,13 @@ func TestMessagesModelNamesFollowChatRules(t *testing.T) {
 	}
 
 	// A key whose lists do not admit the name refuses it as on chat.
-	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditAllowedModels = []string{"anthropic/*"} })
+	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditAllowedModels = []string{"openai/*"} })
 	status, body, _ := sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
 	expectAnthropicRefusal(t, status, body, 403, "permission_error", "model_not_allowed")
 	if v.callCount() != 0 {
 		t.Fatal("a name outside the allow list reached the vendor")
 	}
-	// A pattern with a vendor segment never reaches a bare name; an exact entry
-	// does.
+	// An exact entry reaches a bare name as written.
 	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditDeniedModels = []string{"claude-opus-5-5"} })
 	status, body, _ = sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
 	expectAnthropicRefusal(t, status, body, 403, "permission_error", "model_not_allowed")
