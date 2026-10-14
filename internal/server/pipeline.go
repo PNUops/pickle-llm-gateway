@@ -547,13 +547,17 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	if p.usageRequired {
 		// The stream has already been relayed by the time this runs, so the
 		// answer cannot be refused; what can still be refused is a record
-		// that reads as a clean success with made-up counts. Only the clean
-		// ending is reclassified: every other ending already says it failed.
+		// with made-up counts. Every ending without usage drops the estimate,
+		// and a clean one is also reclassified as failed: every other ending
+		// already says it failed.
 		recordStream = func() {
-			if ev.Status == spool.StatusOK && !x.result().haveUsage {
-				ev.Status = spool.StatusUpstreamErr
-				ev.ErrorType = errUsageMissing
+			if !x.result().haveUsage {
+				if ev.Status == spool.StatusOK {
+					ev.Status = spool.StatusUpstreamErr
+					ev.ErrorType = errUsageMissing
+				}
 				ev.InputTokens, ev.OutputTokens, ev.Estimated = 0, 0, false
+				ev.CachedInputTokens, ev.ReasoningTokens, ev.CostUsd = 0, 0, ""
 			}
 			record()
 		}

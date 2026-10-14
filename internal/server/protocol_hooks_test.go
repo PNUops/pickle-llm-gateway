@@ -187,10 +187,12 @@ func TestUsageRequiredStreamWithoutUsageIsRecordedFailed(t *testing.T) {
 		t.Fatalf("record: %+v", ev)
 	}
 
-	// A stream that failed for another reason keeps that reason.
+	// A stream that failed for another reason keeps that reason, and no
+	// estimate either.
 	h.mock.set(func(o *mockOpts) { o.abortMid = true })
 	_ = serveVariant(t, h, p, nil, streamRequest)
-	if ev := lastEvent(t, h); ev.ErrorType != "upstream_stream_interrupted" {
+	if ev := lastEvent(t, h); ev.ErrorType != "upstream_stream_interrupted" ||
+		ev.InputTokens != 0 || ev.OutputTokens != 0 || ev.Estimated {
 		t.Fatalf("interrupted stream: %+v", ev)
 	}
 }

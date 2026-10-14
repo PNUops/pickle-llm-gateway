@@ -66,9 +66,10 @@ type protocol struct {
 	capture func(input json.RawMessage) (json.RawMessage, bool)
 	// usageRequired refuses to settle an answer without the upstream's usage.
 	// A non-streamed answer that carries none is refused rather than metered
-	// by estimate, and a stream that ends cleanly without one is recorded as
-	// failed with no token counts. An estimate here would be a wrong number
-	// that nothing marks as wrong once it is summed.
+	// by estimate. A stream that ends without one keeps no token counts,
+	// however it ended, and one that ended cleanly is recorded as failed. An
+	// estimate here would be a wrong number that nothing marks as wrong once
+	// it is summed.
 	usageRequired bool
 
 	// readResponse reads a decoded non-streamed answer: it puts the public
