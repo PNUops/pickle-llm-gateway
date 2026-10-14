@@ -41,11 +41,16 @@ const generationCostPending = 512
 const generationCostReadLimit = 64 << 10
 
 type generationCosts struct {
-	wg     sync.WaitGroup
-	slots  chan struct{}
-	ctx    context.Context
-	cancel context.CancelFunc
-	delays []time.Duration
+	wg sync.WaitGroup
+	// mu orders admitting a lookup against the start of a drain: a
+	// WaitGroup must not gain work while something waits on it, so once
+	// draining is set no lookup is admitted.
+	mu       sync.Mutex
+	draining bool
+	slots    chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
+	delays   []time.Duration
 }
 
 func newGenerationCosts() *generationCosts {
@@ -62,7 +67,13 @@ func newGenerationCosts() *generationCosts {
 // written before the spool closes. Once ctx is done the ones still waiting give
 // up and write their events without a cost; it returns when every event is
 // written either way.
+//
+// It is called once the listeners have stopped, so no stream normally ends
+// after it begins; one that does is written at once without a cost.
 func (s *Server) DrainCostLookups(ctx context.Context) {
+	s.costs.mu.Lock()
+	s.costs.draining = true
+	s.costs.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		s.costs.wg.Wait()
@@ -93,15 +104,12 @@ func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cr
 			return
 		}
 		stopClock()
-		select {
-		case s.costs.slots <- struct{}{}:
-		default:
+		if !s.costs.admit() {
 			s.metrics.streamCostMissing.Add(1)
-			s.log.Warn("generation cost lookup skipped, too many pending", "keyId", ev.KeyID)
+			s.log.Warn("generation cost lookup skipped", "keyId", ev.KeyID)
 			record()
 			return
 		}
-		s.costs.wg.Add(1)
 		go func() {
 			defer s.costs.wg.Done()
 			defer func() { <-s.costs.slots }()
@@ -115,6 +123,24 @@ func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cr
 			record()
 		}()
 	}
+}
+
+// admit takes a pending slot and registers the lookup with the WaitGroup, or
+// reports that the event has to be written now: the pending bound is reached,
+// or the gateway is draining.
+func (c *generationCosts) admit() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.draining {
+		return false
+	}
+	select {
+	case c.slots <- struct{}{}:
+	default:
+		return false
+	}
+	c.wg.Add(1)
+	return true
 }
 
 // lookupGenerationCost reads the generation record until it has a usable

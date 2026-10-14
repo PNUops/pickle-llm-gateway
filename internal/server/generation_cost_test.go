@@ -224,3 +224,49 @@ func TestGenerationCostSurvivesDroppedEstimate(t *testing.T) {
 		t.Fatalf("record: %+v", ev)
 	}
 }
+
+// A pending lookup never holds the client's stream, and past the pending
+// bound an event is written at once without a cost. After a drain has begun
+// nothing more is admitted.
+func TestGenerationLookupsDoNotBlockAndAreBounded(t *testing.T) {
+	h, g := generationHarness(t, []time.Duration{time.Hour}, generationAnswer{200, generationRecordOK})
+	h.srv.costs.slots = make(chan struct{}, 1)
+
+	start := time.Now()
+	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the stream waited %s for its lookup", took)
+	}
+	if evs := h.spoolEvents(t); len(evs) != 0 {
+		t.Fatalf("pending lookup already wrote: %+v", evs)
+	}
+	// The one slot is taken, so this stream is written now, without a cost.
+	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	if evs := h.spoolEvents(t); len(evs) != 1 || evs[0].CostUsd != "" {
+		t.Fatalf("overflow event: %+v", evs)
+	}
+	if n := h.srv.metrics.streamCostMissing.Load(); n != 1 {
+		t.Fatalf("streamCostMissing %d", n)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.srv.DrainCostLookups(ctx)
+	if evs := h.spoolEvents(t); len(evs) != 2 {
+		t.Fatalf("after drain: %d events", len(evs))
+	}
+	// Admission is closed once draining: written at once, nothing read.
+	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	if evs := h.spoolEvents(t); len(evs) != 3 || evs[2].CostUsd != "" {
+		t.Fatalf("event after drain: %+v", evs)
+	}
+	if g.readCount() != 0 {
+		t.Fatalf("generation record read %d times", g.readCount())
+	}
+}
