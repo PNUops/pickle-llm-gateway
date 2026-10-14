@@ -64,13 +64,15 @@ type protocol struct {
 	// whatever the key opted into, so a surface whose record format nobody
 	// has designed yet sends nothing rather than an empty record.
 	capture func(input json.RawMessage) (json.RawMessage, bool)
-	// usageRequired refuses to settle an answer without the upstream's usage.
-	// A non-streamed answer that carries none is refused rather than metered
-	// by estimate. A stream that ends without one keeps no token counts,
-	// however it ended, and one that ended cleanly is recorded as failed. An
-	// estimate here would be a wrong number that nothing marks as wrong once
-	// it is summed.
-	usageRequired bool
+	// noUsageEstimate keeps byte-based estimates out of this surface's usage
+	// records. An answer without the upstream's usage, streamed or not, is
+	// relayed as it came and recorded without token counts; one that would
+	// otherwise be recorded as a success is recorded as failed, with
+	// upstream_usage_missing, so the gap is visible rather than summed as a
+	// zero. An estimate here would be a wrong number that nothing marks as
+	// wrong once it is summed. The rate-limit bucket is still charged by
+	// estimate: that is a throttle, not accounting.
+	noUsageEstimate bool
 
 	// readResponse reads a decoded non-streamed answer: it puts the public
 	// name in place of the served one and pulls out what metering needs.
