@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -301,14 +302,13 @@ func TestMessagesModelNamesFollowChatRules(t *testing.T) {
 	}
 
 	// A key whose lists do not admit the name refuses it as on chat.
-	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditAllowedModels = []string{"anthropic/*"} })
+	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditAllowedModels = []string{"openai/*"} })
 	status, body, _ := sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
 	expectAnthropicRefusal(t, status, body, 403, "permission_error", "model_not_allowed")
 	if v.callCount() != 0 {
 		t.Fatal("a name outside the allow list reached the vendor")
 	}
-	// A pattern with a vendor segment never reaches a bare name; an exact entry
-	// does.
+	// An exact entry reaches a bare name as written.
 	h, v = messagesHarness(t, func(d *snapshot.Document) { d.Keys[0].CreditDeniedModels = []string{"claude-opus-5-5"} })
 	status, body, _ = sendMessages(t, h, nil, messagesFor("claude-opus-5-5"))
 	expectAnthropicRefusal(t, status, body, 403, "permission_error", "model_not_allowed")
@@ -687,5 +687,29 @@ func TestMessagesErrorsAreWellFormed(t *testing.T) {
 		if codes[e.code] && !shared[e.code] {
 			t.Errorf("%s reuses code %q", name, e.code)
 		}
+	}
+}
+
+// A key whose credit is still being provisioned gets a 503 the Anthropic
+// clients do not retry by themselves: not overloaded_error, which Claude Code
+// retries whatever the headers say, and x-should-retry: false, which it and
+// the SDK obey. Other 503s keep the retryable type and no such header.
+func TestMessagesCreditPendingIsNotRetried(t *testing.T) {
+	h, _ := messagesHarness(t, func(d *snapshot.Document) {
+		d.Keys[0].UpstreamCredentials = nil
+		d.Keys[0].CreditPending = true
+	})
+	status, body, hdr := sendMessages(t, h, nil, messagesFor("anthropic/claude-sonnet-4.5"))
+	e := expectAnthropicRefusal(t, status, body, 503, "api_error", "credit_pending")
+	if strings.Contains(string(body), "overloaded_error") || hdr.Get("X-Should-Retry") != "false" {
+		t.Fatalf("retryable credit_pending: %v %s", hdr, body)
+	}
+	if e.Error.Message != errCreditPending.message || hdr.Get("Retry-After") == "" {
+		t.Fatalf("message or Retry-After changed: %v %s", hdr, body)
+	}
+	rec := httptest.NewRecorder()
+	writeAnthropicError(rec, errServerBusy, "r")
+	if rec.Header().Get("X-Should-Retry") != "" || !strings.Contains(rec.Body.String(), "overloaded_error") {
+		t.Fatalf("server_busy: %v %s", rec.Header(), rec.Body)
 	}
 }

@@ -144,13 +144,23 @@ response_format  tools  tool_choice  parallel_tool_calls
 대개 무료 미리보기이고, 거절은 모델 제한이 걸린 Key에서만 일어납니다.
 
 `tools`가 부르는 모델도 같은 펜스를 지납니다. 공급자의 서버 도구 일부가 본문 안에서 다른 모델을
-부르는데(`parameters.model`), 그 이름도 후보 목록과 같은 규칙으로 판정합니다. **이미지 생성
+부르는데(`parameters.model`, Messages 경로에서는 도구 최상위의 `model`), 두 자리 모두 후보
+목록과 같은 규칙으로 판정합니다. **이미지 생성
 도구는 `images` 기능 권한도 함께 요구합니다** — 전용 경로로 부를 때는 필요하고 채팅으로 부를
 때는 필요 없다면 그것은 권한이 아니기 때문입니다. 웹 검색 도구(`openrouter:web_search`)도 같은
 이유로 `web_search` 기능 권한을 요구합니다. 중첩된 도구 목록 안에 있어도 같습니다.
 
-모델 제한이 걸린 Key에서는 **모델을 비워 둔 서버 도구도 거절합니다.** `openrouter:advisor`는
-`parameters.model`이 없으면 답을 만드는 모델이 생성 도중에 자문 모델을 고르고,
+**공급자는 서버 도구 하나를 여러 `type` 철자로 받습니다.** `openrouter:web_search` 말고도
+`web_search`, `web_search_preview`, `web_search_preview_2025_03_11`, `web_search_2025_08_26`가
+Chat에서 같은 유료 검색을 실행하고, Messages에서는 `web_search_20250305` 같은 Anthropic 철자와
+`advisor_20260301`, `image_generation`이 그렇습니다. 그래서 `type`에서 `openrouter:` 접두와 날짜
+접미사(`_20250305`, `_2025_03_11`)를 뗀 기본 이름으로 어떤 도구인지 정한 뒤 판정합니다. 기본
+이름이 `web_search`, `image_generation`, `advisor` 등으로 시작하면 그 도구로 봅니다.
+`web_fetch`는 권한 없이 통과하고, `code_execution_*`는 공급자가 400으로 거절하므로 그대로
+보냅니다.
+
+모델 제한이 걸린 Key에서는 **모델을 비워 둔 서버 도구도 거절합니다.** `openrouter:advisor`(와
+`advisor_20260301`)는 `model`이 도구 최상위에도 `parameters`에도 없으면 답을 만드는 모델이 생성 도중에 자문 모델을 고르고,
 `openrouter:fusion`은 `model`과 `analysis_models`가 없으면 공급자 기본값을 씁니다. 어느 쪽도
 요청에 이름이 드러나지 않아 판정할 수 없습니다. `openrouter:subagent`는 모델이 없으면 요청의
 `model`을 쓰므로 그대로 통과합니다. 도구가 안쪽 호출용으로 다시 받는 `parameters.tools`도 같은
@@ -174,6 +184,13 @@ response_format  tools  tool_choice  parallel_tool_calls
 `~anthropic/claude-sonnet-latest`도 차단됩니다. 허용 목록에서 공급자를 직접 지정할 때는
 `anthropic/*`와 `~anthropic/*`를 구분합니다. 공급자 자리 전체를 `*`로 지정하면 두 이름을
 모두 포함합니다.
+
+**공급자 접두 없는 `claude-` 이름은 `anthropic/`을 붙인 이름으로도 판정합니다.** 공급자가
+Messages 경로에서 `claude-opus-5-5`(없는 날짜를 붙인 이름까지)를 `anthropic/claude-opus-5.5`로
+해석해 그 모델 값으로 청구하기 때문입니다. 요청의 이름은 바꾸지 않고 판정만 두 이름으로 합니다.
+허용 목록은 둘 중 하나라도 맞으면 허용, 차단 목록은 둘 중 하나라도 맞으면 차단이고 차단이
+우선합니다. 그래서 `anthropic/*` 차단은 `claude-opus-5-5`도 막고, `anthropic/claude-opus*` 허용은
+그 이름을 엽니다. 다른 접두 없는 이름은 적힌 그대로만 판정합니다.
 
 **`models`는 예외입니다.** 목록에 적힌 이름은 외부 공급자가 `model` 대신 서빙하고 **그
 이름으로 청구**할 수 있습니다(공급자 문서: 어떤 오류든 폴백을 촉발할 수 있고, 요청 가격은
@@ -230,7 +247,10 @@ response_format  tools  tool_choice  parallel_tool_calls
 `credit_unavailable`(403)이고, 한도는 부여됐는데 그 Key의 업스트림 자격증명이 아직
 만들어지지 않았으면 `credit_pending`(503)입니다. 뒤쪽은 관리 API가 문서에
 `creditPending`으로 표시해 주는 상태이고 저절로 끝나므로, 응답에 `Retry-After`가
-실립니다. 앞쪽은 사람이 한도를 신청해야 풀리므로 헤더가 없습니다. 문서에
+실립니다. 단 `/v1/messages`에서는 오류 종류를 `overloaded_error`가 아닌 `api_error`로 하고
+`x-should-retry: false`를 붙입니다. Anthropic SDK와 Claude Code는 이 헤더를 보면 스스로
+재시도하지 않지만, Claude Code는 `overloaded_error`면 헤더와 상관없이 재시도합니다. 그대로 두면
+상태가 몇 분 이어지는 동안 학생 화면이 멈춥니다. 앞쪽은 사람이 한도를 신청해야 풀리므로 헤더가 없습니다. 문서에
 `creditPending`이 없는 관리 API를 쓰면 두 경우 모두 `credit_unavailable`이 됩니다.
 
 문서 최상위의 `passthroughRef`가 설정돼 있으면, 카탈로그에 없는 모델명은 그 업스트림으로
@@ -295,9 +315,9 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | 기능 | 여는 것 |
 |---|---|
 | `chat` | `POST /v1/chat/completions`. 자체 서빙과 유료 모델 모두 |
-| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구 |
+| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등) |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
-| `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구) |
+| `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은

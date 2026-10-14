@@ -163,12 +163,13 @@ func TestAnthropicErrorEnvelope(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeAnthropicError(rec, errCreditPending, "req-9")
 	want := `{"error":{"code":"credit_pending","message":` + mustJSON(t, errCreditPending.message) +
-		`,"type":"overloaded_error"},"request_id":"req-9","type":"error"}`
+		`,"type":"api_error"},"request_id":"req-9","type":"error"}`
 	if rec.Code != errCreditPending.status || rec.Body.String() != want {
 		t.Fatalf("envelope %d %s\nwant %s", rec.Code, rec.Body.String(), want)
 	}
 	if rec.Header().Get("Content-Type") != "application/json; charset=utf-8" ||
-		rec.Header().Get("Retry-After") != strconv.Itoa(retryAfterSeconds["credit_pending"]) {
+		rec.Header().Get("Retry-After") != strconv.Itoa(retryAfterSeconds["credit_pending"]) ||
+		rec.Header().Get("X-Should-Retry") != "false" {
 		t.Fatalf("headers %v", rec.Header())
 	}
 
@@ -186,6 +187,10 @@ func TestAnthropicErrorEnvelope(t *testing.T) {
 		case e.code == errRequestTooLarge.code:
 			if got != "request_too_large" {
 				t.Fatalf("%s: %q", name, got)
+			}
+		case anthropicNoRetry[e.code]:
+			if got == "overloaded_error" {
+				t.Fatalf("%s: a no-retry refusal typed %q", name, got)
 			}
 		case e.status == http.StatusNotFound && got != "not_found_error",
 			e.status == http.StatusBadRequest && got != "invalid_request_error",
