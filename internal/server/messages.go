@@ -52,6 +52,7 @@ var protoMessages = &protocol{
 		fenceFallbacks,
 		fenceServerToolsStep,
 		fenceDeferredTools,
+		fenceNativeWebSearch,
 		fencePluginsStep,
 		fenceChatCapabilities,
 	},
@@ -71,12 +72,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.serveProtocol(protoMessages, w, r)
 }
 
-// handleCountTokens answers the token-counting route with a fast 404 in the
-// Anthropic envelope. The vendor has no such route to forward to, and a client
+// handleMessagesUnknown answers the token-counting route, and anything else
+// under the Messages path, with a fast 404 in the Anthropic envelope. The vendor has no such route to forward to, and a client
 // that gets a 404 here falls back to its own estimate without retrying. It is
 // answered before authentication, like any other route this service does not
 // serve, and it records nothing: nothing was served.
-func (s *Server) handleCountTokens(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleMessagesUnknown(w http.ResponseWriter, _ *http.Request) {
 	writeAnthropicError(w, errNotFound, "")
 }
 
@@ -190,6 +191,40 @@ func fenceFallbacks(_ *Server, doc *snapshot.Document, lookup func(string) *snap
 	return nil
 }
 
+// nativeWebSearchPrefix is the type prefix of Anthropic's own web search
+// server tool (web_search_20250305 and its successors). On this surface a
+// client can ask for a search in that shape as well as the vendor's own, and
+// a search is a search whichever spelling asked for it, so it answers to the
+// same grant. Whether the vendor runs or bills it is not what decides: a key
+// without the grant has not been given searches, and asking is refused.
+const nativeWebSearchPrefix = "web_search_"
+
+func fenceNativeWebSearch(_ *Server, _ *snapshot.Document, _ func(string) *snapshot.Model,
+	key *snapshot.Key, _ *snapshot.Model, params map[string]json.RawMessage) *refusal {
+	if key.AllowsEndpoint(snapshot.EndpointWebSearch) {
+		return nil
+	}
+	for _, field := range []string{toolsField, deferredToolsField} {
+		raw, present := params[field]
+		if !present || string(bytes.TrimSpace(raw)) == "null" {
+			continue
+		}
+		// Both lists were already read whole by the fences before this one,
+		// which refuse what they cannot read.
+		var tools []map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &tools)
+		for _, tool := range tools {
+			var typ string
+			_ = json.Unmarshal(tool["type"], &typ)
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(typ)), nativeWebSearchPrefix) {
+				return &refusal{e: errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch)),
+					errorType: "endpoint_not_allowed"}
+			}
+		}
+	}
+	return nil
+}
+
 // deferredToolsField carries tool definitions the model loads on demand. A
 // server tool there runs on this key exactly as one in `tools` does, so it is
 // fenced the same way, and an unreadable list fails closed.
@@ -214,14 +249,29 @@ func fenceDeferredTools(_ *Server, doc *snapshot.Document, lookup func(string) *
 // excludes the cached part, read and written, so the three are added to get
 // what chat calls prompt tokens.
 type messagesUsage struct {
-	InputTokens              *int        `json:"input_tokens"`
-	OutputTokens             *int        `json:"output_tokens"`
-	CacheReadInputTokens     *int        `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens *int        `json:"cache_creation_input_tokens"`
-	Cost                     json.Number `json:"cost"`
-	OutputTokensDetails      struct {
+	InputTokens              *int `json:"input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	// Cost is read raw and kept only when it is a number: a malformed one
+	// must not take the token counts down with it.
+	Cost                json.RawMessage `json:"cost"`
+	OutputTokensDetails struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"output_tokens_details"`
+}
+
+// cost is the vendor's price when it reported one as a number, else "".
+func (m messagesUsage) cost() json.Number {
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(m.Cost))
+	dec.UseNumber()
+	var v any
+	if len(m.Cost) == 0 || dec.Decode(&v) != nil {
+		return ""
+	}
+	n, _ = v.(json.Number)
+	return n
 }
 
 func intOf(p *int) int {
@@ -256,7 +306,7 @@ func (m messagesUsage) normalized() (usage, bool) {
 	u.PromptTokens = nonNegative(*m.InputTokens) + read + nonNegative(intOf(m.CacheCreationInputTokens))
 	u.CompletionTokens = nonNegative(*m.OutputTokens)
 	u.TotalTokens = u.PromptTokens + u.CompletionTokens
-	u.Cost = m.Cost
+	u.Cost = m.cost()
 	u.PromptTokensDetails.CachedTokens = read
 	u.CompletionTokensDetails.ReasoningTokens = m.OutputTokensDetails.ReasoningTokens
 	return u, true
@@ -359,8 +409,8 @@ func (m *messagesStream) read(e sseEvent, res *streamResult) ([]byte, bool) {
 			}
 			res.usage.CompletionTokens = nonNegative(*mu.OutputTokens)
 			res.usage.CompletionTokensDetails.ReasoningTokens = mu.OutputTokensDetails.ReasoningTokens
-			if mu.Cost != "" {
-				res.usage.Cost = mu.Cost
+			if c := mu.cost(); c != "" {
+				res.usage.Cost = c
 			}
 			m.settle(res)
 		}

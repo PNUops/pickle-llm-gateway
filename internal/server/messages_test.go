@@ -370,6 +370,10 @@ func TestMessagesWebSearchNeedsGrant(t *testing.T) {
 		"online in models": messagesWith(model, "models", `["anthropic/claude-haiku-4.5:online"]`),
 		"web plugin":       messagesWith(model, "plugins", `[{"id":"web"}]`),
 		"web search tool":  messagesWith(model, "tools", `[{"type":"openrouter:web_search"}]`),
+		"native web search tool": messagesWith(model, "tools",
+			`[{"type":"web_search_20250305","name":"web_search","max_uses":5}]`),
+		"deferred native web search tool": messagesWith(model, "deferred_tools",
+			`[{"type":"web_search_20260209","name":"web_search"}]`),
 	}
 	h, v := messagesHarness(t, nil)
 	for name, body := range asks {
@@ -444,10 +448,27 @@ func TestMessagesRefusalsUseAnthropicEnvelope(t *testing.T) {
 	expectAnthropicRefusal(t, status, body, 502, "api_error", "upstream_error")
 }
 
+func TestMessagesUnreadableCostKeepsCounts(t *testing.T) {
+	h, v := messagesHarness(t, nil)
+	v.answer = strings.Replace(vendorMessageAnswer, `"cost":0.0012`, `"cost":"n/a"`, 1)
+	if status, body, _ := sendMessages(t, h, nil, messagesFor("vendor-model")); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	if ev := lastEvent(t, h); ev.Status != spool.StatusOK || ev.InputTokens != 35 || ev.OutputTokens != 4 || ev.CostUsd != "" {
+		t.Fatalf("record: %+v", ev)
+	}
+}
+
 func TestMessagesCountTokensIsUnknown(t *testing.T) {
 	h, v := messagesHarness(t, nil)
-	for _, token := range []string{testToken, ""} {
-		req, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/messages/count_tokens?beta=true",
+	for _, c := range []struct{ path, token string }{
+		{"/v1/messages/count_tokens?beta=true", testToken},
+		{"/v1/messages/count_tokens", ""},
+		{"/v1/messages/batches", testToken},
+		{"/v1/messages/", testToken},
+	} {
+		token := c.token
+		req, _ := http.NewRequest(http.MethodPost, h.gw.URL+c.path,
 			strings.NewReader(messagesFor("anthropic/claude-sonnet-4.5")))
 		if token != "" {
 			req.Header.Set("X-Api-Key", token)
