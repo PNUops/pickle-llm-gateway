@@ -181,7 +181,7 @@ func errToolModelNotAllowed(name string) apiError {
 func errToolModelRequired(toolType, param string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 tools의 " + toolType +
-			"에 parameters." + param + "을(를) 직접 지정해야 합니다. " +
+			"에 " + param + "을(를) 직접 지정해야 합니다. " +
 			"지정하지 않으면 요청 밖에서 모델이 정해져 허용 여부를 판단할 수 없기 때문입니다."}
 }
 
