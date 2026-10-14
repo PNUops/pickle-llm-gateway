@@ -423,7 +423,7 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if model.MaxOutputTokens > 0 && n > model.MaxOutputTokens {
-			refuse(errOutputTooLong, spool.StatusBadRequest)
+			refuse(errOutputTooLong(f, model.MaxOutputTokens), spool.StatusBadRequest)
 			return
 		}
 		if asked == 0 || n < asked {

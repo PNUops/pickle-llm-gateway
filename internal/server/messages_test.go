@@ -211,7 +211,10 @@ func TestMessagesOutputCapOverModelMaximum(t *testing.T) {
 		}
 	})
 	status, body, _ := sendMessages(t, h, nil, messagesFor("vendor-model"))
-	expectAnthropicRefusal(t, status, body, 400, "invalid_request_error", "output_limit_exceeded")
+	e := expectAnthropicRefusal(t, status, body, 400, "invalid_request_error", "output_limit_exceeded")
+	if !strings.Contains(e.Error.Message, "max_tokens 값을 50 이하로") {
+		t.Fatalf("message without the cap: %s", e.Error.Message)
+	}
 	if v.callCount() != 0 {
 		t.Fatal("refused request reached the vendor")
 	}

@@ -685,6 +685,10 @@ func TestOutputCapRefusal(t *testing.T) {
 	if status != 400 || errCode(t, body) != "output_limit_exceeded" {
 		t.Fatalf("got %d %s", status, body)
 	}
+	// The refusal says which field and how far down.
+	if !strings.Contains(string(body), "max_tokens 값을 4096 이하로") {
+		t.Fatalf("message without the cap: %s", body)
+	}
 }
 
 func TestRpmLimit(t *testing.T) {
@@ -2001,7 +2005,7 @@ func allAPIErrors() map[string]apiError {
 		"errRateRequests":      errRateRequests, "errRateTokens": errRateTokens,
 		"errRateConcurrency": errRateConcurrency, "errServiceDisabled": errServiceDisabled,
 		"errModelNotFound": errModelNotFound, "errModelNotAllowed": errModelNotAllowed,
-		"errOutputTooLong": errOutputTooLong, "errInputTooLong": errInputTooLong,
+		"errOutputTooLong(x, 1)": errOutputTooLong("x", 1), "errInputTooLong": errInputTooLong,
 		"errRequestTooLarge": errRequestTooLarge, "errBadJSON": errBadJSON,
 		"errUpstream": errUpstream, "errUpstreamTimeout": errUpstreamTimeout,
 		"errUpstreamRejected": errUpstreamRejected,

@@ -92,8 +92,6 @@ var (
 		"요청 본문이 허용 크기를 초과했습니다."}
 	errInputTooLong = apiError{http.StatusBadRequest, "invalid_request_error", "input_too_long",
 		"입력이 모델의 최대 입력 길이를 초과했습니다."}
-	errOutputTooLong = apiError{http.StatusBadRequest, "invalid_request_error", "output_limit_exceeded",
-		"요청한 최대 출력 길이가 모델의 허용치를 초과했습니다."}
 	// The upload stopped before the declared body arrived. Distinct from a
 	// malformed body: nothing the caller sent was wrong, it was cut off.
 	errRequestBodyUnreadable = apiError{http.StatusBadRequest, "invalid_request_error", "request_body_incomplete",
@@ -275,6 +273,15 @@ func errFallbackModelNotAllowed(name string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 		"이 API Key로는 대체 모델 목록(fallbacks)의 " + name + "을(를) 사용할 수 없습니다. " +
 			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
+// errOutputTooLong names the field and the model's cap, which is the only
+// thing a caller needs to fix the request: an agent client that sends its own
+// default output length gets this on every request until the value is lowered.
+func errOutputTooLong(field string, max int) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "output_limit_exceeded",
+		"요청한 최대 출력 길이가 모델의 허용치를 초과했습니다. " + field + " 값을 " +
+			strconv.Itoa(max) + " 이하로 지정해주세요."}
 }
 
 func errUnsupportedParam(name string) apiError {
