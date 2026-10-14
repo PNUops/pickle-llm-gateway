@@ -88,3 +88,17 @@ func TestLargeStreamEventRefused(t *testing.T) {
 		})
 	}
 }
+
+// Only a data line may take a slot: an oversized field line is refused at the
+// ordinary bound even with the pool free.
+func TestLargeNonDataLineTakesNoSlot(t *testing.T) {
+	stream := "event: " + strings.Repeat("e", 9<<20) + "\n" + largeEventStream(16)
+	h := streamingHarness(t, largeCfg(2), stream)
+	_, body := h.chat(t, testToken, largeEventRequest)
+	if !strings.Contains(string(body), "upstream_response_too_large") {
+		t.Fatalf("an oversized field line was relayed: %s", body[max(0, len(body)-300):])
+	}
+	if n := h.srv.chatLarge.inUse(); n != 0 {
+		t.Fatalf("slots in use: %d", n)
+	}
+}

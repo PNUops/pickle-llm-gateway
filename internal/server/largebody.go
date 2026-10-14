@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // largeBodySlots admits chat bodies, and non-streamed chat responses, above
@@ -51,6 +52,35 @@ func (l *largeBodySlots) acquire(_ string) (release func(), ok bool) {
 			l.used--
 		})
 	}, true
+}
+
+// A large answer holds its slot until it has been written to the client, so
+// the pool bounds every copy of it, the one waiting on a slow reader included
+// (the edge does not buffer responses). What stops a slow reader from holding
+// a slot indefinitely is a write deadline sized to the answer: a fixed floor
+// plus one second per MiB, so 128 MiB has a little under three minutes. A
+// client that cannot read at that rate is cut off and recorded as gone.
+const (
+	largeWriteFloor   = 30 * time.Second
+	largeWriteMinRate = 1 << 20 // bytes a second
+)
+
+// largeWriteBudget is how long an answer of n bytes may take to write.
+func largeWriteBudget(n int) time.Duration {
+	return largeWriteFloor + time.Duration(n/largeWriteMinRate)*time.Second
+}
+
+// writeUnderDeadline runs write with the deadline for an n-byte answer and
+// clears it afterwards, so the rest of a stream is not held to it. A writer
+// that cannot take a deadline writes without one.
+func writeUnderDeadline(w http.ResponseWriter, n int, write func()) {
+	rc := http.NewResponseController(w)
+	if rc.SetWriteDeadline(time.Now().Add(largeWriteBudget(n))) != nil {
+		write()
+		return
+	}
+	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	write()
 }
 
 // inUse is a gauge for /metrics.

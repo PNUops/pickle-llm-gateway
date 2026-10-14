@@ -143,12 +143,15 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		releaseEvent()
 		releaseEvent, eventCap = func() {}, upstreamResponseCapBytes
 	}
-	overCap := func(n int) bool {
+	// Only a data line can take a slot. The other fields are cut to
+	// sseFieldMax once read, so nothing legitimate needs a large one, and a
+	// slot taken by one would be held until the next blank line.
+	overCap := func(n int, data bool) bool {
 		if n <= eventCap {
 			return false
 		}
 		largeMax := s.cfg.ChatLargeResponseMaxBytes
-		if eventCap == upstreamResponseCapBytes && largeMax > upstreamResponseCapBytes {
+		if data && eventCap == upstreamResponseCapBytes && largeMax > upstreamResponseCapBytes {
 			if release, ok := s.chatLarge.acquire(a.keyID); ok {
 				releaseEvent, eventCap = release, int(largeMax)
 				return n > eventCap
@@ -167,12 +170,16 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		e := cur
 		cur, dataLines, eventBytes = sseEvent{}, nil, 0
 		out := x.event(e)
-		// The slot bounds what assembling and converting the event costs and
-		// is given back before the write, as the non-stream path does, so a
-		// client that reads slowly does not hold it.
 		e.data = nil
+		if eventCap > upstreamResponseCapBytes {
+			// The slot covers the write too, under a deadline sized to the
+			// event (writeUnderDeadline), so the copy waiting on a slow
+			// reader is inside the pool's arithmetic.
+			writeUnderDeadline(w, len(out), func() { writeRaw(out) })
+		} else {
+			writeRaw(out)
+		}
 		resetEventCap()
-		writeRaw(out)
 	}
 
 	// Bounded per event, not in total. The memory a stream costs is the one
@@ -191,7 +198,11 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		var line []byte
 		for {
 			frag, err := br.ReadSlice('\n')
-			if overCap(len(line) + len(frag) + eventBytes) {
+			start := line
+			if start == nil {
+				start = frag
+			}
+			if overCap(len(line)+len(frag)+eventBytes, bytes.HasPrefix(start, []byte("data:"))) {
 				return nil, errResponseOverCap
 			}
 			line = append(line, frag...)
