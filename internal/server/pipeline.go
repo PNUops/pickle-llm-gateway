@@ -544,20 +544,12 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	}
 	x := p.newStream(s, a, &ev)
 	recordStream := record
-	if p.usageRequired {
-		// The stream has already been relayed by the time this runs, so the
-		// answer cannot be refused; what can still be refused is a record
-		// with made-up counts. Every ending without usage drops the estimate,
-		// and a clean one is also reclassified as failed: every other ending
-		// already says it failed.
+	if p.noUsageEstimate {
+		// Every ending without usage drops the estimate from the record; the
+		// answer itself has already been relayed as it came.
 		recordStream = func() {
 			if !x.result().haveUsage {
-				if ev.Status == spool.StatusOK {
-					ev.Status = spool.StatusUpstreamErr
-					ev.ErrorType = errUsageMissing
-				}
-				ev.InputTokens, ev.OutputTokens, ev.Estimated = 0, 0, false
-				ev.CachedInputTokens, ev.ReasoningTokens, ev.CostUsd = 0, 0, ""
+				dropUsageEstimate(&ev)
 			}
 			record()
 		}
@@ -566,10 +558,23 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 }
 
 // errUsageMissing is the usage record's name for an answer whose upstream
-// reported no usage on a surface that does not estimate. It never reaches a
-// client as a code: a refused non-streamed answer says upstream_error, the
-// fault being the upstream's.
+// reported no usage on a surface that does not estimate. It is a record value
+// only: the answer reaches the client as the upstream sent it.
 const errUsageMissing = "upstream_usage_missing"
+
+// dropUsageEstimate clears the counts from the record of an answer that came
+// without the upstream's usage, on a surface that does not estimate. An ending
+// that would be recorded as a success is reclassified as failed with
+// errUsageMissing, so the gap stays visible; every other ending already says
+// it failed and keeps its own reason.
+func dropUsageEstimate(ev *spool.Event) {
+	if ev.Status == spool.StatusOK {
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errUsageMissing
+	}
+	ev.InputTokens, ev.OutputTokens, ev.Estimated = 0, 0, false
+	ev.CachedInputTokens, ev.ReasoningTokens, ev.CostUsd = 0, 0, ""
+}
 
 // upstreamResponseCapBytes bounds what one upstream response may cost this
 // process without a large-body slot: a whole non-streamed response, or one
@@ -654,19 +659,6 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	}
 	res := p.readResponse(m, publicName)
 	s.noteServedModel(ev, sentModel, res.servedModel)
-	if p.usageRequired && !res.haveUsage && !res.upstreamError {
-		// An answer this surface cannot meter is not relayed. The bucket is
-		// charged by estimate, as for an answer that did not parse, and the
-		// record keeps no counts: the estimate is a rate-limit device, not
-		// accounting.
-		p.writeError(w, errUpstream, ev.EventUUID)
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = errUsageMissing
-		in, out := estimateTokens(inputBytes, len(res.answer))
-		charge(in + out)
-		record()
-		return
-	}
 	contentChars := 0
 	if !res.haveUsage {
 		contentChars = len(res.answer)
@@ -710,11 +702,12 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	default:
 		ev.Status = spool.StatusOK
 	}
-	if p.usageRequired && !res.haveUsage {
-		// Only a vendor error answer reaches here without usage (see above);
-		// it is relayed as it came and recorded failed, without counts.
+	if p.noUsageEstimate && !res.haveUsage {
+		// Relayed as it came, as on every other surface. The bucket is charged
+		// by estimate, which is a throttle; the record keeps no counts.
 		in, out := estimateTokens(inputBytes, contentChars)
 		charge(in + out)
+		dropUsageEstimate(ev)
 	} else {
 		s.settleUsage(ev, res.usage, res.haveUsage, inputBytes, contentChars)
 		charge(ev.InputTokens + ev.OutputTokens)

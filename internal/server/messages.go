@@ -63,11 +63,11 @@ var protoMessages = &protocol{
 	capWriteField:  "max_tokens",
 	shape:          shapeMessages,
 	// No body capture: its record format is not designed for this surface.
-	capture:       nil,
-	usageRequired: true,
-	readResponse:  readMessagesResponse,
-	newStream:     newMessagesStream,
-	writeError:    writeAnthropicError,
+	capture:         nil,
+	noUsageEstimate: true,
+	readResponse:    readMessagesResponse,
+	newStream:       newMessagesStream,
+	writeError:      writeAnthropicError,
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {

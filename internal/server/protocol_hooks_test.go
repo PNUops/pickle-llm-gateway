@@ -142,17 +142,14 @@ func TestNilCaptureMakesNoBodyRecord(t *testing.T) {
 	}
 }
 
-func TestUsageRequiredRefusesUnmeteredAnswer(t *testing.T) {
+func TestNoUsageEstimateRelaysUnmeteredAnswerWithoutCounts(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(o *mockOpts) { o.noUsage = true })
-	p := chatVariant(func(p *protocol) { p.usageRequired = true })
+	p := chatVariant(func(p *protocol) { p.noUsageEstimate = true })
 
 	rec := serveVariant(t, h, p, nil, chatBody)
-	if rec.Code != 502 || errCode(t, rec.Body.Bytes()) != "upstream_error" {
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "안녕하세요") {
 		t.Fatalf("answer without usage: %d %s", rec.Code, rec.Body)
-	}
-	if strings.Contains(rec.Body.String(), "안녕하세요") {
-		t.Fatal("the unmetered answer was relayed")
 	}
 	ev := lastEvent(t, h)
 	if ev.Status != spool.StatusUpstreamErr || ev.ErrorType != "upstream_usage_missing" ||
@@ -172,10 +169,10 @@ func TestUsageRequiredRefusesUnmeteredAnswer(t *testing.T) {
 	}
 }
 
-func TestUsageRequiredStreamWithoutUsageIsRecordedFailed(t *testing.T) {
+func TestNoUsageEstimateStreamWithoutUsageIsRecordedFailed(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.mock.set(func(o *mockOpts) { o.noUsage = true })
-	p := chatVariant(func(p *protocol) { p.usageRequired = true })
+	p := chatVariant(func(p *protocol) { p.noUsageEstimate = true })
 
 	rec := serveVariant(t, h, p, nil, streamRequest)
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "data: [DONE]") {

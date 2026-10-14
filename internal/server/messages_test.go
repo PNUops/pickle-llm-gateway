@@ -450,11 +450,15 @@ func TestMessagesRefusalsUseAnthropicEnvelope(t *testing.T) {
 	status, body, _ = sendMessages(t, h, nil, messagesFor("anthropic/claude-sonnet-4.5"))
 	expectAnthropicRefusal(t, status, body, 429, "rate_limit_error", "credit_exhausted")
 
-	// A 200 the vendor did not meter is not relayed.
+	// A 200 the vendor did not meter is relayed as Chat relays one, and
+	// recorded failed without counts.
 	v.status, v.answer = 0, `{"type":"message","model":"x","content":[{"type":"text","text":"hi"}]}`
 	status, body, _ = sendMessages(t, h, nil, messagesFor("anthropic/claude-sonnet-4.5"))
-	expectAnthropicRefusal(t, status, body, 502, "api_error", "upstream_error")
-	if ev := lastEvent(t, h); ev.ErrorType != "upstream_usage_missing" || ev.InputTokens != 0 || ev.Estimated {
+	if status != 200 || !strings.Contains(string(body), `"hi"`) {
+		t.Fatalf("unmetered answer: %d %s", status, body)
+	}
+	if ev := lastEvent(t, h); ev.Status != spool.StatusUpstreamErr || ev.ErrorType != "upstream_usage_missing" ||
+		ev.InputTokens != 0 || ev.OutputTokens != 0 || ev.Estimated {
 		t.Fatalf("record: %+v", ev)
 	}
 
