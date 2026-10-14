@@ -35,7 +35,7 @@ const largeEventRequest = `{"model":"pickle-general","stream":true,"messages":[{
 // An event past the ordinary bound is relayed whole when a large-body slot is
 // free, and the slot is given back once the event has gone out.
 func TestLargeStreamEventTakesASlot(t *testing.T) {
-	h := streamingHarness(t, largeCfg(2, 2), largeEventStream(9<<20))
+	h := streamingHarness(t, largeCfg(2), largeEventStream(9<<20))
 	status, body := h.chat(t, testToken, largeEventRequest)
 	if status != 200 {
 		t.Fatalf("status %d", status)
@@ -55,7 +55,7 @@ func TestLargeStreamEventTakesASlot(t *testing.T) {
 	}
 }
 
-// Without the pool, or with the key's share taken, or past the large bound,
+// Without the pool, or with the pool full, or past the large bound,
 // the stream ends with the named error.
 func TestLargeStreamEventRefused(t *testing.T) {
 	cases := []struct {
@@ -64,9 +64,9 @@ func TestLargeStreamEventRefused(t *testing.T) {
 		size   int
 		hold   int
 	}{
-		{"pool off", largeCfg(0, 0), 9 << 20, 0},
-		{"key share taken", largeCfg(4, 1), 9 << 20, 1},
-		{"past the large bound", largeCfg(2, 2), 17 << 20, 0},
+		{"pool off", largeCfg(0), 9 << 20, 0},
+		{"pool full", largeCfg(2), 9 << 20, 2},
+		{"past the large bound", largeCfg(2), 17 << 20, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,7 +74,7 @@ func TestLargeStreamEventRefused(t *testing.T) {
 			for i := 0; i < tc.hold; i++ {
 				release, ok := h.srv.chatLarge.acquire("k-test")
 				if !ok {
-					t.Fatal("could not take the key's slot")
+					t.Fatal("could not take a slot")
 				}
 				defer release()
 			}

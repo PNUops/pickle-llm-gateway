@@ -85,9 +85,9 @@ type streamArgs struct {
 	// sentModel is the upstream model name this request asked for, so a
 	// vendor-side fallback can be noticed before the name is rewritten.
 	sentModel string
-	// keyID is for logging and for the key's share of the large-body pool an
-	// oversized event takes; metering goes through charge, which already
-	// knows the key and whether this request's axis is metered at all.
+	// keyID is for logging and names the key when an oversized event takes a
+	// large-body slot; metering goes through charge, which already knows the
+	// key and whether this request's axis is metered at all.
 	keyID        string
 	charge       func(int)
 	inputBytes   int

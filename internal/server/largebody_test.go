@@ -18,12 +18,11 @@ import (
 
 // largeCfg opens the large-body pool in the harness: the ordinary bound is
 // the harness's 1 MiB, the large one 4 MiB.
-func largeCfg(slots, perKey int) func(*config.Config) {
+func largeCfg(slots int) func(*config.Config) {
 	return func(c *config.Config) {
 		c.ChatLargeBodyMaxBytes = 4 << 20
 		c.ChatLargeResponseMaxBytes = 16 << 20
 		c.ChatLargeBodySlots = slots
-		c.ChatLargeBodySlotsPerKey = perKey
 	}
 }
 
@@ -32,15 +31,15 @@ func chatOfSize(n int) string {
 	return head + strings.Repeat("x", n-len(head)-len(tail)) + tail
 }
 
-func TestLargeBodySlotsCountTotalAndPerKey(t *testing.T) {
-	l := newLargeBodySlots(3, 2)
+// The pool counts in total only: one key may take every slot.
+func TestLargeBodySlotsCountTotalOnly(t *testing.T) {
+	l := newLargeBodySlots(3)
 	a1, ok1 := l.acquire("a")
 	_, ok2 := l.acquire("a")
 	_, ok3 := l.acquire("a")
 	_, ok4 := l.acquire("b")
-	_, ok5 := l.acquire("c")
-	if !ok1 || !ok2 || ok3 || !ok4 || ok5 {
-		t.Fatalf("admission: %v %v %v %v %v", ok1, ok2, ok3, ok4, ok5)
+	if !ok1 || !ok2 || !ok3 || ok4 {
+		t.Fatalf("admission: %v %v %v %v", ok1, ok2, ok3, ok4)
 	}
 	a1()
 	a1() // a second release must not free a slot it does not hold
@@ -50,7 +49,7 @@ func TestLargeBodySlotsCountTotalAndPerKey(t *testing.T) {
 	if _, ok := l.acquire("c"); !ok {
 		t.Fatal("a freed slot was not reusable")
 	}
-	if newLargeBodySlots(0, 2) != nil {
+	if newLargeBodySlots(0) != nil {
 		t.Fatal("a zero-size pool should be off")
 	}
 	var off *largeBodySlots
@@ -60,7 +59,7 @@ func TestLargeBodySlotsCountTotalAndPerKey(t *testing.T) {
 }
 
 func TestLargeChatBodyIsAdmittedThroughThePool(t *testing.T) {
-	h := newHarness(t, nil, largeCfg(2, 1))
+	h := newHarness(t, nil, largeCfg(2))
 
 	body := chatOfSize(3 << 20)
 	if status, resp := h.chat(t, testToken, body); status != 200 {
@@ -85,7 +84,7 @@ func TestLargeChatBodyIsAdmittedThroughThePool(t *testing.T) {
 // With the pool off, a body above the ordinary bound is refused exactly as
 // it always was.
 func TestLargeChatBodyWithPoolOff(t *testing.T) {
-	h := newHarness(t, nil, largeCfg(0, 0))
+	h := newHarness(t, nil, largeCfg(0))
 	if status, resp := h.chat(t, testToken, chatOfSize(2<<20)); status != 400 || errCode(t, resp) != "request_too_large" {
 		t.Fatalf("got %d %s", status, resp)
 	}
@@ -94,7 +93,7 @@ func TestLargeChatBodyWithPoolOff(t *testing.T) {
 // A body that declares no length is read through the ordinary bound, so
 // leaving the header off cannot reach the large one.
 func TestUndeclaredLengthUsesTheOrdinaryBound(t *testing.T) {
-	h := newHarness(t, nil, largeCfg(2, 2))
+	h := newHarness(t, nil, largeCfg(2))
 	body := chatOfSize(2 << 20)
 	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/chat/completions",
 		io.MultiReader(strings.NewReader(body)))
@@ -113,10 +112,10 @@ func TestUndeclaredLengthUsesTheOrdinaryBound(t *testing.T) {
 	}
 }
 
-// The slot is held while the upstream has not answered, and a key past its
-// share is refused before its body is read.
+// The slot is held while the upstream has not answered, and a request that
+// finds the pool full is refused before its body is read.
 func TestLargeBodySlotIsHeldUntilHeaders(t *testing.T) {
-	h := newHarness(t, nil, largeCfg(4, 1))
+	h := newHarness(t, nil, largeCfg(1))
 	parked := make(chan struct{})
 	unpark := make(chan struct{})
 	var once sync.Once
@@ -137,7 +136,7 @@ func TestLargeBodySlotIsHeldUntilHeaders(t *testing.T) {
 	}
 	status, resp, hdr := h.chatHeaders(t, testToken, chatOfSize(2<<20))
 	if status != 429 || errCode(t, resp) != "large_request_busy" || hdr.Get("Retry-After") != "5" {
-		t.Fatalf("second large body from the same key: %d %s %q", status, resp, hdr.Get("Retry-After"))
+		t.Fatalf("large body with the pool full: %d %s %q", status, resp, hdr.Get("Retry-After"))
 	}
 	close(unpark)
 	if status := <-done; status != 200 {
@@ -158,7 +157,7 @@ func TestLargeBodySlotIsHeldUntilHeaders(t *testing.T) {
 // Once the upstream has answered, the slot is free and the request body is
 // unreachable, while the stream is still running.
 func TestLargeBodyIsReleasedWhileStreaming(t *testing.T) {
-	h := newHarness(t, nil, largeCfg(2, 2))
+	h := newHarness(t, nil, largeCfg(2))
 	pr, pw := io.Pipe()
 	var sent *http.Request
 	h.srv.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -238,7 +237,7 @@ func TestLargeNonStreamResponse(t *testing.T) {
 	}
 	short := `{"model":"pickle-general","messages":[{"role":"user","content":"hi"}]}`
 
-	h := newHarness(t, nil, largeCfg(2, 2))
+	h := newHarness(t, nil, largeCfg(2))
 	h.srv.client = &http.Client{Transport: roundTripFunc(respond)}
 	status, body := h.chat(t, testToken, short)
 	if status != 200 || len(body) < 9<<20 {
@@ -248,7 +247,7 @@ func TestLargeNonStreamResponse(t *testing.T) {
 		t.Fatal("the response slot was not released")
 	}
 
-	off := newHarness(t, nil, largeCfg(0, 0))
+	off := newHarness(t, nil, largeCfg(0))
 	off.srv.client = &http.Client{Transport: roundTripFunc(respond)}
 	if status, body := off.chat(t, testToken, short); status != 502 || errCode(t, body) != "upstream_response_too_large" {
 		t.Fatalf("without a pool: %d %s", status, body)
@@ -259,7 +258,7 @@ func TestLargeNonStreamResponse(t *testing.T) {
 	}
 
 	small := newHarness(t, nil, func(c *config.Config) {
-		largeCfg(2, 2)(c)
+		largeCfg(2)(c)
 		c.ChatLargeResponseMaxBytes = 9 << 20
 	})
 	small.srv.client = &http.Client{Transport: roundTripFunc(respond)}
@@ -337,7 +336,7 @@ func TestLargeBodyReleaseThroughARealTransport(t *testing.T) {
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
 	h := newHarness(t, nil, func(c *config.Config) {
-		largeCfg(2, 2)(c)
+		largeCfg(2)(c)
 		c.Upstreams["mock"] = config.Upstream{Ref: "mock", BaseURL: up, APIKey: upstreamCred, CapField: "max_completion_tokens"}
 	})
 	spy := &spyTransport{base: &http.Transport{}}

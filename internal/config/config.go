@@ -83,11 +83,14 @@ type Config struct {
 	//
 	// A slot is held until the upstream's response headers arrive and then
 	// released together with every reference to the request body; a stream
-	// that runs for ten minutes after that does not keep it. PerKey bounds how
-	// much of the pool one key can take, because the money axis has no
-	// per-key concurrency limit of its own. ChatLargeBodySlots = 0 turns the
-	// pool off, which is the old behaviour: anything above
-	// RequestBodyMaxBytes is refused.
+	// that runs for ten minutes after that does not keep it. The pool has no
+	// per-key share: one key may take every slot, and the next large request
+	// from anyone is refused until one frees. The per-key share that
+	// existed until 2026-10-14 is gone and its variable,
+	// LLMGW_CHAT_LARGE_BODY_SLOTS_PER_KEY, is no longer read, so an
+	// environment file that still sets it starts as before.
+	// ChatLargeBodySlots = 0 turns the pool off, which is the old behaviour:
+	// anything above RequestBodyMaxBytes is refused.
 	//
 	// The same pool admits a non-streamed response that outgrows the 8 MiB
 	// relay bound, and one stream event that does, up to
@@ -111,7 +114,6 @@ type Config struct {
 	ChatLargeBodyMaxBytes     int64
 	ChatLargeResponseMaxBytes int64
 	ChatLargeBodySlots        int
-	ChatLargeBodySlotsPerKey  int
 	// UpstreamRetries is how many extra attempts one upstream gets after a
 	// transient failure, before the model's fallback (if any) is tried. Only
 	// ever applied before any of the response has reached the client.
@@ -234,7 +236,6 @@ func FromEnv() (*Config, error) {
 		ChatLargeBodyMaxBytes:     25 << 20,
 		ChatLargeResponseMaxBytes: 128 << 20,
 		ChatLargeBodySlots:        16,
-		ChatLargeBodySlotsPerKey:  4,
 		RequestMaxDuration:        10 * time.Minute,
 		// Sized for a 512 MB gateway container, which is the smallest one this
 		// daemon is expected to run in. Measured 2026-09-02 against this
@@ -297,7 +298,6 @@ func FromEnv() (*Config, error) {
 		dst  *int
 	}{
 		{"MAX_IN_FLIGHT", &cfg.MaxInFlight},
-		{"CHAT_LARGE_BODY_SLOTS_PER_KEY", &cfg.ChatLargeBodySlotsPerKey},
 		{"PASSTHROUGH_MAX_IN_FLIGHT", &cfg.PassthroughMaxInFlight},
 		{"BODY_QUEUE_SIZE", &cfg.BodyQueueSize},
 		{"BODY_BATCH_SIZE", &cfg.BodyBatchSize},

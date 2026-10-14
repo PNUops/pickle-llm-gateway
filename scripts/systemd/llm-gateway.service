@@ -56,8 +56,8 @@ SystemCallArchitectures=native
 LimitNOFILE=65535
 TasksMax=512
 # The ceilings answer to the large-body pools, not to normal traffic. Each of
-# the sixteen chat large-body slots can hold a 128 MiB answer (or one stream
-# event of that size), which costs about three times its size once GOMEMLIMIT
+# the sixteen chat large-body slots, all of which one key may hold, can hold a
+# 128 MiB answer (or one stream event of that size), which costs about three times its size once GOMEMLIMIT
 # presses, and the sixteen passthrough slots about 1.75 times theirs: about
 # 6.4 GiB plus 4.7 GiB with every slot full at once. Normal load sits orders of
 # magnitude under it. These numbers assume a 16 GiB container; a smaller host

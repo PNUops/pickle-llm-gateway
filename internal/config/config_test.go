@@ -218,7 +218,7 @@ func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
 			strings.HasSuffix(n, "_DAYS"), strings.HasSuffix(n, "_RETRIES"),
 			strings.HasSuffix(n, "_RPM"), strings.HasSuffix(n, "_TPM"),
 			strings.HasSuffix(n, "_CONCURRENCY"), strings.HasSuffix(n, "_IN_FLIGHT"),
-			strings.HasSuffix(n, "_SLOTS"), strings.HasSuffix(n, "_PER_KEY"):
+			strings.HasSuffix(n, "_SLOTS"):
 			return "7"
 		case strings.HasSuffix(n, "_LISTEN"):
 			return "127.0.0.1:9999"
@@ -325,19 +325,21 @@ func TestChatLargeBodyDefaultsAndOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.ChatLargeBodyMaxBytes != 25<<20 || cfg.ChatLargeResponseMaxBytes != 128<<20 ||
-		cfg.ChatLargeBodySlots != 16 || cfg.ChatLargeBodySlotsPerKey != 4 {
-		t.Fatalf("defaults: %d %d %d %d", cfg.ChatLargeBodyMaxBytes, cfg.ChatLargeResponseMaxBytes,
-			cfg.ChatLargeBodySlots, cfg.ChatLargeBodySlotsPerKey)
+		cfg.ChatLargeBodySlots != 16 {
+		t.Fatalf("defaults: %d %d %d", cfg.ChatLargeBodyMaxBytes, cfg.ChatLargeResponseMaxBytes,
+			cfg.ChatLargeBodySlots)
 	}
 	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS", "0")
-	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS_PER_KEY", "1")
+	// The retired per-key share is not read, whatever an old environment
+	// file still holds for it.
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS_PER_KEY", "not-a-number")
 	t.Setenv("LLMGW_CHAT_LARGE_BODY_MAX_BYTES", "10485760")
 	t.Setenv("LLMGW_CHAT_LARGE_RESPONSE_MAX_BYTES", "16777216")
 	cfg, err = FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ChatLargeBodySlots != 0 || cfg.ChatLargeBodySlotsPerKey != 1 ||
+	if cfg.ChatLargeBodySlots != 0 ||
 		cfg.ChatLargeBodyMaxBytes != 10<<20 || cfg.ChatLargeResponseMaxBytes != 16<<20 {
 		t.Fatalf("overrides: %+v", cfg)
 	}

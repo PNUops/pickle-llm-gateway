@@ -8,54 +8,47 @@ import (
 )
 
 // largeBodySlots admits chat bodies, and non-streamed chat responses, above
-// the ordinary bound. The pool is small and counted per key as well as in
-// total: the money axis has no per-key concurrency limit of its own, so
-// without the per-key share one key could take every slot and refuse every
-// other student's large request. See config for the measured numbers.
+// the ordinary bound, and stream events above it. The pool is small and
+// counted in total only: one key may hold every slot, so the count bounds
+// memory, not fairness between keys. See config for the measured numbers.
 type largeBodySlots struct {
-	mu     sync.Mutex
-	total  int
-	perKey int
-	used   int
-	byKey  map[string]int
+	mu    sync.Mutex
+	total int
+	used  int
 }
 
 // newLargeBodySlots returns nil for a pool of size zero, which is how the
 // large path is turned off.
-func newLargeBodySlots(total, perKey int) *largeBodySlots {
+func newLargeBodySlots(total int) *largeBodySlots {
 	if total <= 0 {
 		return nil
 	}
-	if perKey <= 0 || perKey > total {
-		perKey = total
-	}
-	return &largeBodySlots{total: total, perKey: perKey, byKey: map[string]int{}}
+	return &largeBodySlots{total: total}
 }
 
 // acquire takes a slot without waiting. A wait would hold the caller's
 // connection, and with it the gateway-wide slot it already has, for a
 // resource that is scarce on purpose. The returned release is safe to call
 // more than once, so a handler can release early and still defer it.
-func (l *largeBodySlots) acquire(keyID string) (release func(), ok bool) {
+//
+// The key is not counted. The parameter stays so that every caller still
+// names whose request it admits, should a share per key come back.
+func (l *largeBodySlots) acquire(_ string) (release func(), ok bool) {
 	if l == nil {
 		return func() {}, false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.used >= l.total || l.byKey[keyID] >= l.perKey {
+	if l.used >= l.total {
 		return func() {}, false
 	}
 	l.used++
-	l.byKey[keyID]++
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			l.mu.Lock()
 			defer l.mu.Unlock()
 			l.used--
-			if l.byKey[keyID]--; l.byKey[keyID] <= 0 {
-				delete(l.byKey, keyID)
-			}
 		})
 	}, true
 }

@@ -68,7 +68,7 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 			},
 		},
 		passthroughInFlight: make(chan struct{}, cfg.PassthroughMaxInFlight),
-		chatLarge:           newLargeBodySlots(cfg.ChatLargeBodySlots, cfg.ChatLargeBodySlotsPerKey),
+		chatLarge:           newLargeBodySlots(cfg.ChatLargeBodySlots),
 		health:              newUpstreamHealth(nil),
 		metrics:             &counters{},
 		now:                 time.Now,
