@@ -257,7 +257,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		fail(errServiceDisabled)
 		return
 	}
-	key, authErr := s.authenticate(r, keyLookup)
+	// An Anthropic client reads its key the way /v1/messages does, x-api-key
+	// included, so the SDK's model listing works with the same configuration
+	// as its requests.
+	readToken := bearerToken
+	if anthropic {
+		readToken = messagesToken
+	}
+	token, authErr := readToken(r)
+	var key *snapshot.Key
+	if authErr == nil {
+		key, authErr = s.authenticateToken(token, keyLookup)
+	}
 	if authErr != nil {
 		fail(*authErr)
 		return
