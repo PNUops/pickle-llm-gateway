@@ -6,6 +6,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
@@ -191,9 +192,9 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 // list is used that way.
 const toolsField = "tools"
 
-// serverToolPrefix marks the vendor's own tools. A caller's function tool
-// carries its schema under `function`, so its own "parameters" is a different
-// thing entirely and is deliberately not read here.
+// serverToolPrefix marks the vendor's own tools in their canonical spelling. A
+// caller's function tool carries its schema under `function`, so its own
+// "parameters" is a different thing entirely and is deliberately not read here.
 const serverToolPrefix = "openrouter:"
 
 // imageGenerationTool produces an image from the chat path. It answers to the
@@ -205,6 +206,56 @@ const imageGenerationTool = "openrouter:image_generation"
 // answers to the web search capability wherever it appears, nested tool lists
 // included, for the same reason the image tool answers to images.
 const webSearchTool = "openrouter:web_search"
+
+// serverToolFamilies is the one list of the vendor's other spellings for its
+// server tools, by the base name a spelling reduces to. The vendor accepts
+// each tool under several types (its tool catalogue lists them as aliases):
+// web_search, web_search_preview and web_search_preview_2025_03_11 all run
+// the paid search on the chat route, web_search_20250305 does on the Messages
+// route, and advisor_20260301 there takes a model of its own. A fence that
+// reads only the "openrouter:" spelling is walked around by every other one,
+// so every spelling is reduced to its canonical tool before it is judged.
+//
+// A base name is matched as a family: anything that begins with one of these
+// is that tool, which also covers a dated spelling the vendor adds later. The
+// families are the tools a fence here acts on, plus the ones it knowingly lets
+// through so that the list says so: web_fetch passes (operator, 2026-10-14),
+// and tool_search, shell and apply_patch take neither a model nor a grant.
+// code_execution is absent: the vendor refuses it as an unknown shorthand.
+var serverToolFamilies = []struct{ base, tool string }{
+	{"web_search", webSearchTool},
+	{"image_generation", imageGenerationTool},
+	{"advisor", "openrouter:advisor"},
+	{"fusion", "openrouter:fusion"},
+	{"subagent", "openrouter:subagent"},
+	{"web_fetch", "openrouter:web_fetch"},
+	{"tool_search", "openrouter:tool_search"},
+	{"shell", "openrouter:shell"},
+	{"apply_patch", "openrouter:apply_patch"},
+}
+
+// toolVersionSuffix is the date a spelling carries after its base name, in
+// either form the vendor uses: _20250305 or _2025_03_11.
+var toolVersionSuffix = regexp.MustCompile(`_(\d{8}|\d{4}_\d{2}_\d{2})$`)
+
+// canonicalServerTool reduces a tool type to the vendor tool it runs, or ""
+// when it is not one of the vendor's server tools (a caller's function tool, a
+// client-side tool). The "openrouter:" spelling is canonical already and kept
+// as written, so a vendor tool this build has no family for is still judged
+// by the model fields it names.
+func canonicalServerTool(rawType string) string {
+	t := strings.ToLower(strings.TrimSpace(rawType))
+	if strings.HasPrefix(t, serverToolPrefix) {
+		return t
+	}
+	base := toolVersionSuffix.ReplaceAllString(t, "")
+	for _, f := range serverToolFamilies {
+		if strings.HasPrefix(base, f.base) {
+			return f.tool
+		}
+	}
+	return ""
+}
 
 // toolModelParams are the parameters through which a server tool names the
 // model it will call. A tool naming one some other way is forwarded unjudged —
@@ -277,8 +328,8 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 			e := errInvalidParamValue(toolsField)
 			return &e
 		}
-		toolType := strings.ToLower(strings.TrimSpace(rawType))
-		if !strings.HasPrefix(toolType, serverToolPrefix) {
+		toolType := canonicalServerTool(rawType)
+		if toolType == "" {
 			continue
 		}
 		if toolType == imageGenerationTool &&
@@ -291,30 +342,36 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
 			return &e
 		}
-		for _, name := range toolModelParams {
-			v, ok := parameters[name]
-			if !ok {
-				continue
-			}
-			bad, refused, unreadable := judgeModelValue(doc, modelLookup, key, v)
-			if unreadable {
-				e := errInvalidParamValue(toolsField)
-				return &e
-			}
-			if refused {
-				e := errToolModelNotAllowed(bad)
-				return &e
-			}
-			if e := onlineNeedsWebSearch(key, v); e != nil {
-				return e
+		// A tool names its model in its parameters on the chat route and at
+		// its own top level on the Messages route (the advisor's model sits
+		// beside its type there). Both places are read, and a name in either
+		// is judged.
+		for _, place := range []map[string]json.RawMessage{tool, parameters} {
+			for _, name := range toolModelParams {
+				v, ok := place[name]
+				if !ok {
+					continue
+				}
+				bad, refused, unreadable := judgeModelValue(doc, modelLookup, key, v)
+				if unreadable {
+					e := errInvalidParamValue(toolsField)
+					return &e
+				}
+				if refused {
+					e := errToolModelNotAllowed(bad)
+					return &e
+				}
+				if e := onlineNeedsWebSearch(key, v); e != nil {
+					return e
+				}
 			}
 		}
 		if key.HasCreditFence() {
 			for _, name := range toolModelsRequiredOnFencedKey[toolType] {
 				// An empty value is as good as none: the vendor falls back to
 				// its default either way, and an empty list judged nothing.
-				if v, ok := parameters[name]; !ok || emptyModelValue(v) {
-					e := errToolModelRequired(toolType, name)
+				if !namesModel(tool, name) && !namesModel(parameters, name) {
+					e := errToolModelRequired(strings.TrimSpace(rawType), name)
 					return &e
 				}
 			}
@@ -330,6 +387,12 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 		}
 	}
 	return nil
+}
+
+// namesModel reports whether a tool names a model through one field.
+func namesModel(place map[string]json.RawMessage, name string) bool {
+	v, ok := place[name]
+	return ok && !emptyModelValue(v)
 }
 
 // judgeModelValue applies the candidate fence to a field the vendor spells both
