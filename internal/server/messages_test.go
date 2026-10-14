@@ -412,6 +412,34 @@ func TestMessagesWebSearchNeedsGrant(t *testing.T) {
 	}
 }
 
+// The other vendor server tools and remote MCP servers are not web search, so
+// a key without the web_search grant sends them through as written.
+func TestMessagesOtherServerToolsNeedNoWebSearchGrant(t *testing.T) {
+	model := "anthropic/claude-sonnet-4.5"
+	asks := map[string]string{
+		"web fetch tool": messagesWith(model, "tools",
+			`[{"type":"web_fetch_20250910","name":"web_fetch","max_uses":3}]`),
+		"code execution tool": messagesWith(model, "tools",
+			`[{"type":"code_execution_20250825","name":"code_execution"}]`),
+		"mcp servers": messagesWith(model, "mcp_servers",
+			`[{"type":"url","url":"https://mcp.example.com/sse","name":"example"}]`),
+	}
+	h, v := messagesHarness(t, nil)
+	for name, body := range asks {
+		status, out, _ := sendMessages(t, h, nil, body)
+		if status != 200 {
+			t.Fatalf("%s: %d %s", name, status, out)
+		}
+		var sent map[string]json.RawMessage
+		_ = json.Unmarshal([]byte(body), &sent)
+		for _, field := range []string{"tools", "mcp_servers"} {
+			if want, ok := sent[field]; ok && string(v.body[field]) != string(want) {
+				t.Fatalf("%s: upstream %s = %s, want %s", name, field, v.body[field], want)
+			}
+		}
+	}
+}
+
 // Every refusal on the surface is in the Anthropic envelope, the ones written
 // after the upstream answered included.
 func TestMessagesRefusalsUseAnthropicEnvelope(t *testing.T) {
