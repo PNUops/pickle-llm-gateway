@@ -239,6 +239,10 @@ func main() {
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
+	// Streams that ended without a cost write their events once the vendor's
+	// generation record has been read; those still waiting are written now
+	// rather than lost with the spool.
+	srv.DrainCostLookups(shutdownCtx)
 	if err := sp.Close(); err != nil {
 		log.Error("spool close failed", "error", err)
 	}

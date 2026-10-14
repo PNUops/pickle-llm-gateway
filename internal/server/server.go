@@ -39,7 +39,10 @@ type Server struct {
 	// chatLarge admits chat bodies and non-streamed chat responses above the
 	// ordinary bound; nil when the pool is configured off.
 	chatLarge *largeBodySlots
-	now       func() time.Time
+	// costs holds the generation lookups of streams that ended without a
+	// cost; see generation_cost.go.
+	costs *generationCosts
+	now   func() time.Time
 }
 
 // New wires a Server. The shared HTTP client waits bounded time for upstream
@@ -70,6 +73,7 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 		chatLarge:           newLargeBodySlots(cfg.ChatLargeBodySlots, cfg.ChatLargeBodySlotsPerKey),
 		health:              newUpstreamHealth(nil),
 		metrics:             &counters{},
+		costs:               newGenerationCosts(),
 		now:                 time.Now,
 	}
 }

@@ -53,8 +53,18 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// student can quote it in a support request (requirements §13) and so it
 	// ties their report to the metered event. OpenAI SDKs surface this header.
 	w.Header().Set("X-Request-Id", ev.EventUUID)
+	// The request's latency is fixed when its answer ends. Recording usually
+	// happens at that moment, but a stream whose cost is looked up afterwards
+	// stops the clock first, so the lookup is not counted as the request's time.
+	latency := time.Duration(-1)
+	stopClock := func() {
+		if latency < 0 {
+			latency = time.Since(start)
+		}
+	}
 	record := func() {
-		ev.LatencyMs = time.Since(start).Milliseconds()
+		stopClock()
+		ev.LatencyMs = latency.Milliseconds()
 		s.metrics.observe(ev)
 		// A request that never resolved to a key has nobody to account to, and
 		// the spool is a small disk with a long retention that anyone on the
@@ -544,7 +554,15 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	}
 	x := p.newStream(s, a, &ev)
 	recordStream := record
+	if model.CreditAxis() {
+		// Innermost, so a wrapper below that clears an estimate runs first and
+		// the vendor's own figure is what remains: the generation record's cost
+		// is what the vendor billed, not an estimate, so it is kept even on a
+		// record whose token counts were dropped.
+		recordStream = s.withGenerationCost(resp.Header, up, key.CredentialFor(up.Ref), &ev, stopClock, record)
+	}
 	if p.usageRequired {
+		inner := recordStream
 		// The stream has already been relayed by the time this runs, so the
 		// answer cannot be refused; what can still be refused is a record
 		// with made-up counts. Every ending without usage drops the estimate,
@@ -559,7 +577,7 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 				ev.InputTokens, ev.OutputTokens, ev.Estimated = 0, 0, false
 				ev.CachedInputTokens, ev.ReasoningTokens, ev.CostUsd = 0, 0, ""
 			}
-			record()
+			inner()
 		}
 	}
 	s.relayStream(w, resp, x, a, &ev, recordStream)
