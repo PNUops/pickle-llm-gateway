@@ -108,7 +108,16 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		refuse(errServiceDisabled, spool.StatusAuthRejected)
 		return
 	}
-	key, authErr := s.authenticate(r, keyLookup)
+	readToken := p.token
+	if readToken == nil {
+		readToken = bearerToken
+	}
+	token, missing := readToken(r)
+	if missing != nil {
+		refuse(*missing, spool.StatusAuthRejected)
+		return
+	}
+	key, authErr := s.authenticateToken(token, keyLookup)
 	// Attribute before refusing: a key that resolved has an owner, and that is
 	// the fact worth recording about a rejection.
 	if key != nil {
@@ -248,6 +257,15 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		ev.BudgetAxis = snapshot.AxisToken
 	case snapshot.AxisCredit:
 		ev.BudgetAxis = snapshot.AxisCredit
+	}
+	// A surface open to the money axis alone. Judged before the field checks
+	// below, because a self-hosted model is the reason this request cannot be
+	// served whatever fields it carries, and before the model fences, because
+	// the model exists and the key may well be allowed it: the remedy is a
+	// different route or a paid model, not a different grant.
+	if p.creditOnly != nil && !model.CreditAxis() {
+		refuse(*p.creditOnly, spool.StatusBadRequest)
+		return
 	}
 	// The parameter allowlist governs the TOKEN axis and nothing else.
 	//
@@ -485,7 +503,7 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// channel exists — captured text is never written to this host's disk, so
 	// with no channel there is nothing to capture into.
 	var capture *bodies.Record
-	if s.bodies.Enabled() && key.RecordBodies {
+	if p.capture != nil && s.bodies.Enabled() && key.RecordBodies {
 		capture = &bodies.Record{
 			EventUUID:   ev.EventUUID,
 			KeyID:       key.KeyID,
@@ -524,8 +542,30 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		clientCtx:    r.Context(),
 		upCtx:        upCtx,
 	}
-	s.relayStream(w, resp, p.newStream(s, a, &ev), a, &ev, record)
+	x := p.newStream(s, a, &ev)
+	recordStream := record
+	if p.usageRequired {
+		// The stream has already been relayed by the time this runs, so the
+		// answer cannot be refused; what can still be refused is a record
+		// that reads as a clean success with made-up counts. Only the clean
+		// ending is reclassified: every other ending already says it failed.
+		recordStream = func() {
+			if ev.Status == spool.StatusOK && !x.result().haveUsage {
+				ev.Status = spool.StatusUpstreamErr
+				ev.ErrorType = errUsageMissing
+				ev.InputTokens, ev.OutputTokens, ev.Estimated = 0, 0, false
+			}
+			record()
+		}
+	}
+	s.relayStream(w, resp, x, a, &ev, recordStream)
 }
+
+// errUsageMissing is the usage record's name for an answer whose upstream
+// reported no usage on a surface that does not estimate. It never reaches a
+// client as a code: a refused non-streamed answer says upstream_error, the
+// fault being the upstream's.
+const errUsageMissing = "upstream_usage_missing"
 
 // upstreamResponseCapBytes bounds what one upstream response may cost this
 // process without a large-body slot: a whole non-streamed response, or one
@@ -610,6 +650,19 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	}
 	res := p.readResponse(m, publicName)
 	s.noteServedModel(ev, sentModel, res.servedModel)
+	if p.usageRequired && !res.haveUsage && !res.upstreamError {
+		// An answer this surface cannot meter is not relayed. The bucket is
+		// charged by estimate, as for an answer that did not parse, and the
+		// record keeps no counts: the estimate is a rate-limit device, not
+		// accounting.
+		p.writeError(w, errUpstream, ev.EventUUID)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errUsageMissing
+		in, out := estimateTokens(inputBytes, len(res.answer))
+		charge(in + out)
+		record()
+		return
+	}
 	contentChars := 0
 	if !res.haveUsage {
 		contentChars = len(res.answer)
@@ -653,8 +706,15 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	default:
 		ev.Status = spool.StatusOK
 	}
-	s.settleUsage(ev, res.usage, res.haveUsage, inputBytes, contentChars)
-	charge(ev.InputTokens + ev.OutputTokens)
+	if p.usageRequired && !res.haveUsage {
+		// Only a vendor error answer reaches here without usage (see above);
+		// it is relayed as it came and recorded failed, without counts.
+		in, out := estimateTokens(inputBytes, contentChars)
+		charge(in + out)
+	} else {
+		s.settleUsage(ev, res.usage, res.haveUsage, inputBytes, contentChars)
+		charge(ev.InputTokens + ev.OutputTokens)
+	}
 	s.bodies.Offer(capture)
 	if capture != nil {
 		s.metrics.bodiesCaptured.Add(1)

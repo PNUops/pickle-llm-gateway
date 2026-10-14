@@ -24,6 +24,12 @@ type protocol struct {
 	upstreamPath string // appended to the upstream base URL
 	logLine      string // the request log's message
 
+	// token reads the caller's key from the request, or returns the refusal
+	// for a request that presented none. Surfaces differ in which headers a
+	// client of theirs sends the key in, and the refusal names those headers.
+	// nil reads Authorization: Bearer, as every OpenAI-shaped surface does.
+	token func(r *http.Request) (string, *apiError)
+
 	// limits are this surface's body bounds, so an agent surface can be given
 	// its own without touching chat's.
 	limits func(c *config.Config) bodyLimits
@@ -32,6 +38,11 @@ type protocol struct {
 	// The stream flag is stamped by the pipeline before parse runs, so a
 	// refusal here still records whether a stream was asked for.
 	parse func(params map[string]json.RawMessage) (parsedRequest, *refusal)
+	// creditOnly, when set, is the refusal every self-hosted model gets on
+	// this surface: the surface serves the money axis alone. nil serves both.
+	// It is judged once the model has resolved and before tokenAxisParam,
+	// which a surface closed to the self-hosted axis does not need to define.
+	creditOnly *apiError
 	// tokenAxisParam judges one top-level field on the self-hosted axis; nil
 	// means the field may be forwarded.
 	tokenAxisParam func(name string) *refusal
@@ -49,7 +60,16 @@ type protocol struct {
 	// shape renames the model and adds what metering needs.
 	shape func(params map[string]json.RawMessage, req parsedRequest, model *snapshot.Model, streaming bool)
 	// capture renders the request half of a body record from the parsed input.
+	// nil turns body capture off on this surface: no record is made at all,
+	// whatever the key opted into, so a surface whose record format nobody
+	// has designed yet sends nothing rather than an empty record.
 	capture func(input json.RawMessage) (json.RawMessage, bool)
+	// usageRequired refuses to settle an answer without the upstream's usage.
+	// A non-streamed answer that carries none is refused rather than metered
+	// by estimate, and a stream that ends cleanly without one is recorded as
+	// failed with no token counts. An estimate here would be a wrong number
+	// that nothing marks as wrong once it is summed.
+	usageRequired bool
 
 	// readResponse reads a decoded non-streamed answer: it puts the public
 	// name in place of the served one and pulls out what metering needs.
