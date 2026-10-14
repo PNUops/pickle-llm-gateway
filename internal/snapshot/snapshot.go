@@ -497,7 +497,17 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	if k.HasCreditFence() && IsRouterModelName(name) {
 		return false
 	}
-	if len(k.CreditAllowedModels) > 0 && !matchesAnyCreditModel(k.CreditAllowedModels, name) {
+	// A bare vendor name is judged under its vendor prefix as well. The vendor
+	// resolves claude-opus-5-5 on its Messages route to anthropic/claude-opus-5.5
+	// and bills it as that (measured 2026-10-14, a made-up date suffix too), so
+	// a list written in vendor/model patterns has to reach it. The name sent is
+	// not changed; only the judgment reads both spellings. Allowed when either
+	// is allowed, denied when either is denied, denial still winning.
+	names := []string{name}
+	if alias := vendorQualifiedName(name); alias != "" {
+		names = append(names, alias)
+	}
+	if len(k.CreditAllowedModels) > 0 && !anyMatches(k.CreditAllowedModels, names) {
 		return false
 	}
 	// The two lists deliberately part company on the tilde, and this is the one
@@ -515,13 +525,46 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	// So a denial is tested against the tilde-stripped name as well. Denying
 	// wider costs nothing: the worst case is refusing an alias of a model
 	// somebody had already decided this key may not use.
-	if matchesAnyCreditModel(k.CreditDeniedModels, name) {
-		return false
-	}
-	if stripped := strings.TrimLeft(name, "~"); stripped != name {
-		return !matchesAnyCreditModel(k.CreditDeniedModels, stripped)
+	for _, n := range names {
+		if matchesAnyCreditModel(k.CreditDeniedModels, n) {
+			return false
+		}
+		if stripped := strings.TrimLeft(n, "~"); stripped != n &&
+			matchesAnyCreditModel(k.CreditDeniedModels, stripped) {
+			return false
+		}
 	}
 	return true
+}
+
+// bareNameVendors are the bare model-name prefixes the vendor resolves to one
+// of its vendors. Only claude- is known to resolve; any other bare name keeps
+// being judged as written.
+var bareNameVendors = []struct{ prefix, vendor string }{
+	{"claude-", "anthropic"},
+}
+
+// vendorQualifiedName is a lower-cased bare name under the vendor it
+// resolves to, or "" when it has a vendor already or none is known.
+func vendorQualifiedName(lowerName string) string {
+	if strings.Contains(lowerName, "/") {
+		return ""
+	}
+	for _, b := range bareNameVendors {
+		if strings.HasPrefix(lowerName, b.prefix) {
+			return b.vendor + "/" + lowerName
+		}
+	}
+	return ""
+}
+
+func anyMatches(patterns, names []string) bool {
+	for _, n := range names {
+		if matchesAnyCreditModel(patterns, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchesAnyCreditModel reports whether any pattern in one already-normalized
