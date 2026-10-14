@@ -1,5 +1,6 @@
 // Package server terminates the student-facing OpenAI-compatible surface:
-// GET /v1/models and POST /v1/chat/completions, the passthrough routes in
+// GET /v1/models and POST /v1/chat/completions, the Anthropic-compatible
+// POST /v1/messages (messages.go), the passthrough routes in
 // passthrough.go, and a local health probe. Every request is authenticated
 // against the snapshot and metered into the usage spool. Request and response
 // bodies are never logged.
@@ -96,6 +97,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/models/", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	// The Anthropic Messages surface. Its token-counting route has nothing
+	// upstream to forward to and is answered as unknown, in this surface's
+	// own envelope so an Anthropic client can read the refusal.
+	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 	// The passthrough surface. Every pattern here is exact, so none of them
 	// competes with the "/v1/models/" subtree above: a request for
 	// /v1/models/{id} still matches the more specific subtree pattern, and
