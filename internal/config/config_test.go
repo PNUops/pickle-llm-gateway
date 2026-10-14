@@ -270,7 +270,7 @@ func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PassthroughRequestBodyMaxBytes != 25<<20 || cfg.PassthroughResponseMaxBytes != 32<<20 {
+	if cfg.PassthroughRequestBodyMaxBytes != 25<<20 || cfg.PassthroughResponseMaxBytes != 128<<20 {
 		t.Fatalf("byte defaults: %d %d", cfg.PassthroughRequestBodyMaxBytes, cfg.PassthroughResponseMaxBytes)
 	}
 	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 16 {
@@ -324,8 +324,8 @@ func TestChatLargeBodyDefaultsAndOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ChatLargeBodyMaxBytes != 25<<20 || cfg.ChatLargeResponseMaxBytes != 32<<20 ||
-		cfg.ChatLargeBodySlots != 8 || cfg.ChatLargeBodySlotsPerKey != 2 {
+	if cfg.ChatLargeBodyMaxBytes != 25<<20 || cfg.ChatLargeResponseMaxBytes != 128<<20 ||
+		cfg.ChatLargeBodySlots != 16 || cfg.ChatLargeBodySlotsPerKey != 4 {
 		t.Fatalf("defaults: %d %d %d %d", cfg.ChatLargeBodyMaxBytes, cfg.ChatLargeResponseMaxBytes,
 			cfg.ChatLargeBodySlots, cfg.ChatLargeBodySlotsPerKey)
 	}

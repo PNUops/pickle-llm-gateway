@@ -90,9 +90,24 @@ type Config struct {
 	// RequestBodyMaxBytes is refused.
 	//
 	// The same pool admits a non-streamed response that outgrows the 8 MiB
-	// relay bound, up to ChatLargeResponseMaxBytes (the passthrough's 32 MiB);
-	// eight of those measured about 1 GiB. With no slot free the response is
-	// refused by name, after the vendor has billed it.
+	// relay bound, and one stream event that does, up to
+	// ChatLargeResponseMaxBytes. With no slot free the response is refused by
+	// name, after the vendor has billed it.
+	//
+	// The response bound is what sizes the pool, not the request bound. A 4K
+	// image generation answered 53.4 MB in one non-streamed body (a 36 MB
+	// base64 image plus a 17 MB reasoning signature), and streamed the picture
+	// as one event of the same size, so the earlier 32 MiB refused a single
+	// picture. 128 MiB holds that answer about two and a half times over.
+	// Measured 2026-10-14 with answers of that shape: one such answer costs
+	// four to five times its size while it is read, decoded and re-serialised,
+	// and about three times once GOMEMLIMIT presses (the bytes read, the
+	// decoded value and the output are all live at the moment of marshalling,
+	// so three is a floor). One stream event costs the same. A 25 MiB request
+	// costs three to four times its size, so a slot is sized by the response:
+	// sixteen slots at 128 MiB come to about 6.4 GiB with GOMEMLIMIT pressing.
+	// The unit's memory ladder is set from that number plus the passthrough
+	// pool below; raising either bound or the slot count moves it.
 	ChatLargeBodyMaxBytes     int64
 	ChatLargeResponseMaxBytes int64
 	ChatLargeBodySlots        int
@@ -117,22 +132,21 @@ type Config struct {
 	//
 	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
 	//
-	// which at the defaults below is about 2,096 MiB. That is the number to
+	// which at the defaults below is about 4,780 MiB. That is the number to
 	// check a host against, and it is the whole reason this pool is separate:
 	// it holds whatever the chat pool is sized to, so raising one cannot move
 	// the other's arithmetic. The same caps applied to the gateway-wide pool
-	// would give a figure in the tens of gigabytes.
+	// would give a figure in the hundreds of gigabytes.
 	//
-	// The expected load is far below the ceiling. An image response measured
-	// 2026-09-05 is 13.09 MiB at 4K and 1.61 MiB at the default resolution
-	// (base64 expands the image 1.333x), so sixteen concurrent 4K generations
-	// sit at about 366 MiB.
+	// Measured 2026-10-14, sixteen 120 MiB answers held at once peaked at
+	// 3.3 GB of heap, about 1.75 times each, as the formula assumes.
 	//
-	// The response cap, the header wait and the slot count come from that
-	// measurement. An 8 MiB response cap could not hold a 4K image at all, and
-	// 32 MiB leaves room above one; a 4K generation takes 32 seconds and is
-	// not streamed, so the 60s chat header wait has under twice the margin
-	// while 180s has room.
+	// An image response measured 2026-09-05 was 13.09 MiB at 4K and 1.61 MiB
+	// at the default resolution (base64 expands the image 1.333x), but a later
+	// model answered a 4K picture at 36 MB of base64 alone, so the response
+	// cap follows the chat one (128 MiB) rather than that first measurement.
+	// A 4K generation takes 32 seconds and is not streamed, so the 60s chat
+	// header wait had under twice the margin while 180s has room.
 	//
 	// The request cap is the vendor's own documented limit, 25 MB, rather than
 	// a number of ours. Where the vendor accepts a request there is no reason
@@ -218,9 +232,9 @@ func FromEnv() (*Config, error) {
 		// pool bounds what a longer wait can hold.
 		UpstreamHeaderWait:        180 * time.Second,
 		ChatLargeBodyMaxBytes:     25 << 20,
-		ChatLargeResponseMaxBytes: 32 << 20,
-		ChatLargeBodySlots:        8,
-		ChatLargeBodySlotsPerKey:  2,
+		ChatLargeResponseMaxBytes: 128 << 20,
+		ChatLargeBodySlots:        16,
+		ChatLargeBodySlotsPerKey:  4,
 		RequestMaxDuration:        10 * time.Minute,
 		// Sized for a 512 MB gateway container, which is the smallest one this
 		// daemon is expected to run in. Measured 2026-09-02 against this
@@ -242,7 +256,7 @@ func FromEnv() (*Config, error) {
 		// need: a generation is not streamed, so the upstream sends no headers
 		// until it has finished producing the image.
 		PassthroughRequestBodyMaxBytes: 25 << 20,
-		PassthroughResponseMaxBytes:    32 << 20,
+		PassthroughResponseMaxBytes:    128 << 20,
 		PassthroughHeaderWait:          180 * time.Second,
 		PassthroughMaxInFlight:         16,
 		DefaultRpm:                     20,
