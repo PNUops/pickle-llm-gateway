@@ -82,10 +82,12 @@ var (
 	errLargeRequestBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "large_request_busy",
 		"큰 요청(2 MiB 초과)을 처리할 자리가 지금은 없습니다. 잠시 후 다시 시도하거나, 파일과 이미지를 URL로 보내 요청을 줄여주세요."}
 	// The chat response bound, said out loud: a non-streamed answer bigger than
-	// this service relays. Streaming is the remedy, because a stream is bounded
-	// per event rather than in total.
+	// this service relays, or one that found no large-body slot free.
+	// Streaming helps only a long text answer, whose events are small; a
+	// picture streams as one event under the same slot and bound, so the
+	// remedy for an image is a smaller or fewer one.
 	errChatResponseTooLarge = apiError{http.StatusBadGateway, "server_error", "upstream_response_too_large",
-		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. stream으로 받거나 최대 출력 길이(max_tokens)를 줄여주세요."}
+		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 긴 텍스트 응답이면 stream으로 받거나 최대 출력 길이(max_tokens)를 줄이고, 이미지 생성이면 해상도나 개수를 줄여주세요."}
 	errServerBusy = apiError{http.StatusServiceUnavailable, "server_error", "server_busy",
 		"요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요."}
 	errRequestTooLarge = apiError{http.StatusBadRequest, "invalid_request_error", "request_too_large",

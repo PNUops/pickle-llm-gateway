@@ -104,9 +104,11 @@ type Config struct {
 	// picture. 128 MiB holds that answer about two and a half times over.
 	// Measured 2026-10-14 with answers of that shape: one such answer costs
 	// four to five times its size while it is read, decoded and re-serialised,
-	// and about three times once GOMEMLIMIT presses (the bytes read, the
-	// decoded value and the output are all live at the moment of marshalling,
-	// so three is a floor). One stream event costs the same. A 25 MiB request
+	// and about 3.2 times once GOMEMLIMIT presses (the bytes read, the decoded
+	// value and the output are all live at the moment of marshalling, so three
+	// is a floor; the pressed figure was taken with the heap over the limit).
+	// One stream event costs the same. The slot is held until the answer has
+	// been written, so the copy waiting on a slow reader is counted too. A 25 MiB request
 	// costs three to four times its size, so a slot is sized by the response:
 	// sixteen slots at 128 MiB come to about 6.4 GiB with GOMEMLIMIT pressing.
 	// The unit's memory ladder is set from that number plus the passthrough
@@ -214,6 +216,10 @@ func (c *Config) UpstreamRefs() []string {
 }
 
 const envPrefix = "LLMGW_"
+
+// ordinaryResponseBytes is the relay bound a response or stream event gets
+// without a large-body slot (upstreamResponseCapBytes in the server).
+const ordinaryResponseBytes = 8 << 20
 
 // FromEnv builds the configuration. Missing required values are reported all
 // at once so the operator fixes one startup, not five.
@@ -405,6 +411,11 @@ func FromEnv() (*Config, error) {
 
 	if cfg.ChatLargeBodySlots > 0 && cfg.ChatLargeBodyMaxBytes < cfg.RequestBodyMaxBytes {
 		errs = append(errs, envPrefix+"CHAT_LARGE_BODY_MAX_BYTES must not be below "+envPrefix+"REQUEST_BODY_MAX_BYTES")
+	}
+	// At or under the ordinary 8 MiB relay bound the large response path
+	// never admits anything, which would turn it off without a word.
+	if cfg.ChatLargeBodySlots > 0 && cfg.ChatLargeResponseMaxBytes <= ordinaryResponseBytes {
+		errs = append(errs, envPrefix+"CHAT_LARGE_RESPONSE_MAX_BYTES must be above 8 MiB, the ordinary relay bound, while the large-body pool is open")
 	}
 
 	ups, upErrs := upstreamsFromEnv(os.Environ())

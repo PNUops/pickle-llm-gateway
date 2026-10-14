@@ -214,7 +214,11 @@ func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
 		case strings.HasSuffix(n, "_PUSH"), strings.HasSuffix(n, "_CAPTURE"),
 			strings.HasSuffix(n, "_RESET"):
 			return "on"
-		case strings.HasSuffix(n, "_BYTES"), strings.HasSuffix(n, "_SIZE"),
+		case strings.HasSuffix(n, "_BYTES"):
+			// Above the ordinary 8 MiB relay bound, which the large response
+			// bound must clear.
+			return "33554432"
+		case strings.HasSuffix(n, "_SIZE"),
 			strings.HasSuffix(n, "_DAYS"), strings.HasSuffix(n, "_RETRIES"),
 			strings.HasSuffix(n, "_RPM"), strings.HasSuffix(n, "_TPM"),
 			strings.HasSuffix(n, "_CONCURRENCY"), strings.HasSuffix(n, "_IN_FLIGHT"),
@@ -343,6 +347,12 @@ func TestChatLargeBodyDefaultsAndOverride(t *testing.T) {
 		cfg.ChatLargeBodyMaxBytes != 10<<20 || cfg.ChatLargeResponseMaxBytes != 16<<20 {
 		t.Fatalf("overrides: %+v", cfg)
 	}
+	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS", "4")
+	t.Setenv("LLMGW_CHAT_LARGE_RESPONSE_MAX_BYTES", "8388608")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "CHAT_LARGE_RESPONSE_MAX_BYTES") {
+		t.Fatalf("a large response bound at the ordinary one was accepted: %v", err)
+	}
+	t.Setenv("LLMGW_CHAT_LARGE_RESPONSE_MAX_BYTES", "16777216")
 	t.Setenv("LLMGW_CHAT_LARGE_BODY_SLOTS", "-1")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("a negative slot count was accepted")

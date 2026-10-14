@@ -59,8 +59,15 @@ TasksMax=512
 # the sixteen chat large-body slots, all of which one key may hold, can hold a
 # 128 MiB answer (or one stream event of that size), which costs about three times its size once GOMEMLIMIT
 # presses, and the sixteen passthrough slots about 1.75 times theirs: about
-# 6.4 GiB plus 4.7 GiB with every slot full at once. Normal load sits orders of
-# magnitude under it. These numbers assume a 16 GiB container; a smaller host
+# 6.4 GiB plus 4.7 GiB with every slot full at once. A large answer holds its
+# slot until it is written, under a write deadline, so the copy waiting on a
+# slow reader is inside that figure. Answers and events under 8 MiB and
+# requests under 2 MiB take no slot and are bounded by LLMGW_MAX_IN_FLIGHT
+# alone, up to about 40 MiB each: at its default of 16 that is about 0.6 GiB,
+# inside the margin above GOMEMLIMIT below; an environment that raises it
+# (to 1024, say) puts that term outside this ladder and has to recompute.
+# Normal load sits orders of magnitude under all of it. These numbers assume a
+# 16 GiB container; a smaller host
 # lowers the pool sizes in the environment file together with the three
 # values below, and a container smaller than MemoryMax silently makes the
 # container's limit the real one, with GOMEMLIMIT then above it.
