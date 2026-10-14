@@ -230,7 +230,10 @@ response_format  tools  tool_choice  parallel_tool_calls
 `credit_unavailable`(403)이고, 한도는 부여됐는데 그 Key의 업스트림 자격증명이 아직
 만들어지지 않았으면 `credit_pending`(503)입니다. 뒤쪽은 관리 API가 문서에
 `creditPending`으로 표시해 주는 상태이고 저절로 끝나므로, 응답에 `Retry-After`가
-실립니다. 앞쪽은 사람이 한도를 신청해야 풀리므로 헤더가 없습니다. 문서에
+실립니다. 단 `/v1/messages`에서는 오류 종류를 `overloaded_error`가 아닌 `api_error`로 하고
+`x-should-retry: false`를 붙입니다. Anthropic SDK와 Claude Code는 이 헤더를 보면 스스로
+재시도하지 않지만, Claude Code는 `overloaded_error`면 헤더와 상관없이 재시도합니다. 그대로 두면
+상태가 몇 분 이어지는 동안 학생 화면이 멈춥니다. 앞쪽은 사람이 한도를 신청해야 풀리므로 헤더가 없습니다. 문서에
 `creditPending`이 없는 관리 API를 쓰면 두 경우 모두 `credit_unavailable`이 됩니다.
 
 문서 최상위의 `passthroughRef`가 설정돼 있으면, 카탈로그에 없는 모델명은 그 업스트림으로

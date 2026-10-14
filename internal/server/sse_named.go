@@ -111,6 +111,13 @@ func anthropicErrorType(e apiError) string {
 	if e.code == errRequestTooLarge.code {
 		return "request_too_large"
 	}
+	// A refusal an agent client must not retry on its own. overloaded_error is
+	// retried by Claude Code whatever the headers say, so these take the type
+	// it does not single out, and writeAnthropicError adds the header both it
+	// and the SDK obey.
+	if anthropicNoRetry[e.code] {
+		return "api_error"
+	}
 	switch e.typ {
 	case "authentication_error", "permission_error", "rate_limit_error":
 		return e.typ
@@ -129,6 +136,22 @@ func anthropicErrorType(e apiError) string {
 		return "overloaded_error"
 	}
 	return "api_error"
+}
+
+// anthropicNoRetry are the refusals an Anthropic client is told not to retry
+// by itself. credit_pending is a 503 because it does end without anyone
+// acting, but on the scale of minutes when provisioning is slow, and an agent
+// client retrying it holds the student's screen that long: Claude Code was
+// measured retrying it eleven times over 180 seconds (2026-10-14). The message
+// still says to try again shortly, which is for the person, not the client.
+//
+// What stops the retry, read from the clients themselves: the Anthropic SDK
+// returns "no retry" on x-should-retry: false before it looks at the status,
+// and Claude Code does the same except that it retries an overloaded_error
+// body before reading the header. So the header and a type other than
+// overloaded_error, both.
+var anthropicNoRetry = map[string]bool{
+	"credit_pending": true,
 }
 
 // anthropicStreamErrorType is the type of a terminal error the gateway writes
@@ -157,6 +180,9 @@ func anthropicErrorBody(typ, code, msg, requestID string) []byte {
 // same status and Retry-After the OpenAI-shaped refusal carries.
 func writeAnthropicError(w http.ResponseWriter, e apiError, requestID string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if anthropicNoRetry[e.code] {
+		w.Header().Set("X-Should-Retry", "false")
+	}
 	if seconds := retryAfterSeconds[e.code]; seconds > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	}
