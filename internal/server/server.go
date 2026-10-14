@@ -151,15 +151,34 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // without it the event says only that somebody was turned away. Only a token
 // that matched nothing (or was never presented) has no owner to name.
 func (s *Server) authenticate(r *http.Request, lookup func(string) *snapshot.Key) (*snapshot.Key, *apiError) {
+	token, missing := bearerToken(r)
+	if missing != nil {
+		return nil, missing
+	}
+	return s.authenticateToken(token, lookup)
+}
+
+// bearerToken reads the key from Authorization: Bearer, the one place an
+// OpenAI-compatible client sends it.
+func bearerToken(r *http.Request) (string, *apiError) {
+	if token := bearerValue(r); token != "" {
+		return token, nil
+	}
+	return "", &errMissingKey
+}
+
+// bearerValue is the token in Authorization: Bearer, or "" when there is none.
+func bearerValue(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	const scheme = "bearer "
 	if len(h) <= len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
-		return nil, &errMissingKey
+		return ""
 	}
-	token := strings.TrimSpace(h[len(scheme):])
-	if token == "" {
-		return nil, &errMissingKey
-	}
+	return strings.TrimSpace(h[len(scheme):])
+}
+
+// authenticateToken is authenticate for a token already read off the request.
+func (s *Server) authenticateToken(token string, lookup func(string) *snapshot.Key) (*snapshot.Key, *apiError) {
 	key := lookup(snapshot.HashToken(token))
 	if key == nil {
 		return nil, &errInvalidKey
