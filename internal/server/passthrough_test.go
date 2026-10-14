@@ -805,9 +805,9 @@ func TestPassthroughRefusalNamesTheCapability(t *testing.T) {
 	}
 }
 
-// The old vocabulary must not spread into the strings this round adds. The
+// The old vocabulary must not spread into the passthrough strings. The
 // display terms are 유료 모델 and 자체 서빙 모델; 상용 모델 is retired, and the
-// axis words belong to the design docs, not to anything a student reads.
+// axis words are internal terms that nothing a student reads carries.
 func TestPassthroughMessagesUseCurrentVocabulary(t *testing.T) {
 	for _, e := range []apiError{
 		errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages)),

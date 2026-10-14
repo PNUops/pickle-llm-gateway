@@ -326,9 +326,9 @@ func TestSelfHostedRefusesCandidateModels(t *testing.T) {
 // fence has had a decision made about which models it may reach, and this name
 // walks around that decision.
 //
-// The reachable shape is the one the plan calls the representative use — allow
-// open, deny the expensive names — because an empty allow list admits the
-// router and the deny list never matches it.
+// The reachable shape is the usual one: the allow list left open and the
+// expensive names denied. An empty allow list admits the router, and the deny
+// list never matches it.
 func TestRouterModelRefusedOnFencedKey(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
