@@ -53,8 +53,18 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// student can quote it in a support request (requirements §13) and so it
 	// ties their report to the metered event. OpenAI SDKs surface this header.
 	w.Header().Set("X-Request-Id", ev.EventUUID)
+	// The request's latency is fixed when its answer ends. Recording usually
+	// happens at that moment, but a stream whose cost is looked up afterwards
+	// stops the clock first, so the lookup is not counted as the request's time.
+	latency := time.Duration(-1)
+	stopClock := func() {
+		if latency < 0 {
+			latency = time.Since(start)
+		}
+	}
 	record := func() {
-		ev.LatencyMs = time.Since(start).Milliseconds()
+		stopClock()
+		ev.LatencyMs = latency.Milliseconds()
 		s.metrics.observe(ev)
 		// A request that never resolved to a key has nobody to account to, and
 		// the spool is a small disk with a long retention that anyone on the
@@ -544,14 +554,22 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	}
 	x := p.newStream(s, a, &ev)
 	recordStream := record
+	if model.CreditAxis() {
+		// Innermost, so a wrapper below that clears an estimate runs first and
+		// the vendor's own figure is what remains: the generation record's cost
+		// is what the vendor billed, not an estimate, so it is kept even on a
+		// record whose token counts were dropped.
+		recordStream = s.withGenerationCost(resp.Header, up, key.CredentialFor(up.Ref), &ev, stopClock, record)
+	}
 	if p.noUsageEstimate {
+		inner := recordStream
 		// Every ending without usage drops the estimate from the record; the
 		// answer itself has already been relayed as it came.
 		recordStream = func() {
 			if !x.result().haveUsage {
 				dropUsageEstimate(&ev)
 			}
-			record()
+			inner()
 		}
 	}
 	s.relayStream(w, resp, x, a, &ev, recordStream)
@@ -827,11 +845,13 @@ func (s *Server) settleUsage(ev *spool.Event, u usage, haveUsage bool, inputByte
 		ev.ReasoningTokens = nonNegative(u.CompletionTokensDetails.ReasoningTokens)
 		return
 	}
-	// The estimate path writes no price and no breakdown. An estimate has
-	// neither, and leaving a value from somewhere else would be a number
-	// claiming to be exact next to a flag saying the tokens are not. Every
-	// caller reaches this function, which is why the rule lives here rather
-	// than at each of the four call sites.
+	// The estimate path writes no price and no breakdown: an estimate has
+	// neither, so none is derived from it. The one price an estimated record
+	// may still get is the vendor's own billed figure, read from its
+	// generation record after a money-axis stream (generation_cost.go); that
+	// is exact, and Estimated describes the token counts only. Every caller
+	// reaches this function, which is why the rule lives here rather than at
+	// each of the four call sites.
 	ev.InputTokens, ev.OutputTokens = estimateTokens(inputBytes, contentChars)
 	ev.Estimated = true
 }

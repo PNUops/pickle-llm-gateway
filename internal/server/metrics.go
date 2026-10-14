@@ -21,6 +21,10 @@ type counters struct {
 	upstreamFallbacks  atomic.Int64
 	bodiesCaptured     atomic.Int64
 	spoolWriteFailures atomic.Int64
+	// Streams whose cost was read from the vendor's generation record, and
+	// those whose lookup found none and were recorded without one.
+	streamCostFilled  atomic.Int64
+	streamCostMissing atomic.Int64
 }
 
 func (c *counters) observe(ev spool.Event) {
@@ -72,6 +76,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"upstreamFallbacks":      s.metrics.upstreamFallbacks.Load(),
 		"bodiesCaptured":         s.metrics.bodiesCaptured.Load(),
 		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
+		"streamCostFilled":       s.metrics.streamCostFilled.Load(),
+		"streamCostMissing":      s.metrics.streamCostMissing.Load(),
 	})
 }
 

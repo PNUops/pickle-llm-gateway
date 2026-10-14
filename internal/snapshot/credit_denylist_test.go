@@ -197,3 +197,16 @@ func TestCreditDenyPatternsNormalizeAtLoad(t *testing.T) {
 		t.Fatal("a pattern stored with capitals denied nothing after the load")
 	}
 }
+
+func TestVendorQualifiedName(t *testing.T) {
+	for in, want := range map[string]string{
+		"claude-opus-5-5":           "anthropic/claude-opus-5-5",
+		"anthropic/claude-opus-5.5": "",
+		"gpt-5":                     "",
+		"~anthropic/claude-x":       "",
+	} {
+		if got := vendorQualifiedName(in); got != want {
+			t.Errorf("%s -> %q, want %q", in, got, want)
+		}
+	}
+}

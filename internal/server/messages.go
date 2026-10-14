@@ -54,7 +54,6 @@ var protoMessages = &protocol{
 		fenceFallbacks,
 		fenceServerToolsStep,
 		fenceDeferredTools,
-		fenceNativeWebSearch,
 		fencePluginsStep,
 		fenceChatCapabilities,
 	},
@@ -178,43 +177,11 @@ func fenceFallbacks(_ *Server, doc *snapshot.Document, lookup func(string) *snap
 	return nil
 }
 
-// nativeWebSearchPrefix is the type prefix of Anthropic's own web search
-// server tool (web_search_20250305 and its successors). On this surface a
-// client can ask for a search in that shape as well as the vendor's own, and
-// a search is a search whichever spelling asked for it, so it answers to the
-// same grant. Whether the vendor runs or bills it is not what decides: a key
-// without the grant has not been given searches, and asking is refused.
-const nativeWebSearchPrefix = "web_search_"
-
-func fenceNativeWebSearch(_ *Server, _ *snapshot.Document, _ func(string) *snapshot.Model,
-	key *snapshot.Key, _ *snapshot.Model, params map[string]json.RawMessage) *refusal {
-	if key.AllowsEndpoint(snapshot.EndpointWebSearch) {
-		return nil
-	}
-	for _, field := range []string{toolsField, deferredToolsField} {
-		raw, present := params[field]
-		if !present || string(bytes.TrimSpace(raw)) == "null" {
-			continue
-		}
-		// Both lists were already read whole by the fences before this one,
-		// which refuse what they cannot read.
-		var tools []map[string]json.RawMessage
-		_ = json.Unmarshal(raw, &tools)
-		for _, tool := range tools {
-			var typ string
-			_ = json.Unmarshal(tool["type"], &typ)
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(typ)), nativeWebSearchPrefix) {
-				return &refusal{e: errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch)),
-					errorType: "endpoint_not_allowed"}
-			}
-		}
-	}
-	return nil
-}
-
 // deferredToolsField carries tool definitions the model loads on demand. A
 // server tool there runs on this key exactly as one in `tools` does, so it is
-// fenced the same way, and an unreadable list fails closed.
+// fenced the same way, and an unreadable list fails closed. Anthropic's own
+// spellings of the vendor's tools (web_search_20250305, advisor_20260301) are
+// reduced to the tool they run by the same fence, in either list.
 const deferredToolsField = "deferred_tools"
 
 func fenceDeferredTools(_ *Server, doc *snapshot.Document, lookup func(string) *snapshot.Model,
@@ -242,10 +209,22 @@ type messagesUsage struct {
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
 	// Cost is read raw and kept only when it is a number: a malformed one
 	// must not take the token counts down with it.
-	Cost                json.RawMessage `json:"cost"`
+	Cost json.RawMessage `json:"cost"`
+	// The vendor reports thinking as thinking_tokens on this surface; the
+	// chat surface's reasoning_tokens is read too, in case a provider sends
+	// that name, and thinking_tokens wins when both are present.
 	OutputTokensDetails struct {
-		ReasoningTokens int `json:"reasoning_tokens"`
+		ThinkingTokens  *int `json:"thinking_tokens"`
+		ReasoningTokens *int `json:"reasoning_tokens"`
 	} `json:"output_tokens_details"`
+}
+
+// thinkingTokens is the output spent thinking, under either name.
+func (m messagesUsage) thinkingTokens() int {
+	if d := m.OutputTokensDetails; d.ThinkingTokens != nil {
+		return nonNegative(*d.ThinkingTokens)
+	}
+	return nonNegative(intOf(m.OutputTokensDetails.ReasoningTokens))
 }
 
 // cost is the vendor's price when it reported one as a number, else "".
@@ -295,7 +274,7 @@ func (m messagesUsage) normalized() (usage, bool) {
 	u.TotalTokens = u.PromptTokens + u.CompletionTokens
 	u.Cost = m.cost()
 	u.PromptTokensDetails.CachedTokens = read
-	u.CompletionTokensDetails.ReasoningTokens = m.OutputTokensDetails.ReasoningTokens
+	u.CompletionTokensDetails.ReasoningTokens = m.thinkingTokens()
 	return u, true
 }
 
@@ -395,7 +374,7 @@ func (m *messagesStream) read(e sseEvent, res *streamResult) ([]byte, bool) {
 				m.cacheCreation = nonNegative(*mu.CacheCreationInputTokens)
 			}
 			res.usage.CompletionTokens = nonNegative(*mu.OutputTokens)
-			res.usage.CompletionTokensDetails.ReasoningTokens = mu.OutputTokensDetails.ReasoningTokens
+			res.usage.CompletionTokensDetails.ReasoningTokens = mu.thinkingTokens()
 			if c := mu.cost(); c != "" {
 				res.usage.Cost = c
 			}
