@@ -214,7 +214,7 @@ func TestStreamWithCostSkipsTheGenerationRecord(t *testing.T) {
 func TestGenerationCostSurvivesDroppedEstimate(t *testing.T) {
 	h, _ := generationHarness(t, []time.Duration{time.Millisecond}, generationAnswer{200, generationRecordOK})
 	h.mock.set(func(o *mockOpts) { o.noUsage = true })
-	p := chatVariant(func(p *protocol) { p.usageRequired = true })
+	p := chatVariant(func(p *protocol) { p.noUsageEstimate = true })
 	if rec := serveVariant(t, h, p, nil, creditStreamBody); rec.Code != 200 {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}

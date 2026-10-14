@@ -23,6 +23,11 @@ type apiError struct {
 var (
 	errMissingKey = apiError{http.StatusUnauthorized, "authentication_error", "missing_api_key",
 		"API Key가 없습니다. Authorization: Bearer <API Key> 헤더를 보내주세요."}
+	// The same refusal for an Anthropic client, which sends its key in
+	// x-api-key or as a bearer depending on how it was configured; naming only
+	// one would send half of them to change the wrong setting.
+	errMissingKeyMessages = apiError{http.StatusUnauthorized, "authentication_error", "missing_api_key",
+		"API Key가 없습니다. x-api-key: <API Key> 또는 Authorization: Bearer <API Key> 헤더를 보내주세요."}
 	errInvalidKey = apiError{http.StatusUnauthorized, "authentication_error", "invalid_api_key",
 		"API Key가 올바르지 않습니다. 콘솔에서 발급한 Key인지 확인해주세요."}
 	errKeyExpired = apiError{http.StatusUnauthorized, "authentication_error", "api_key_expired",
@@ -45,6 +50,11 @@ var (
 		"유료 모델에 부여된 금액 한도를 모두 사용했습니다. 증액이 필요하면 콘솔에서 신청해주세요."}
 	errServiceDisabled = apiError{http.StatusServiceUnavailable, "server_error", "service_disabled",
 		"LLM API 서비스가 점검 중입니다. 잠시 후 다시 시도해주세요."}
+	// A self-hosted model on a route that serves paid models only. 400 rather
+	// than 404: the model exists and is served elsewhere, and the caller can
+	// act on that by naming a paid model or using the chat route.
+	errModelNotOnMessages = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
+		"자체 서빙 모델은 아직 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
 		"요청한 모델이 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
 	// Two fences answer with this code, and they need different advice, so the
@@ -82,8 +92,6 @@ var (
 		"요청 본문이 허용 크기를 초과했습니다."}
 	errInputTooLong = apiError{http.StatusBadRequest, "invalid_request_error", "input_too_long",
 		"입력이 모델의 최대 입력 길이를 초과했습니다."}
-	errOutputTooLong = apiError{http.StatusBadRequest, "invalid_request_error", "output_limit_exceeded",
-		"요청한 최대 출력 길이가 모델의 허용치를 초과했습니다."}
 	// The upload stopped before the declared body arrived. Distinct from a
 	// malformed body: nothing the caller sent was wrong, it was cut off.
 	errRequestBodyUnreadable = apiError{http.StatusBadRequest, "invalid_request_error", "request_body_incomplete",
@@ -104,7 +112,7 @@ var (
 		"upstream_response_too_large",
 		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
-		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, " +
+		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/messages, " +
 			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
@@ -252,6 +260,28 @@ func errCandidateModelNotAllowed(name string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 		"이 API Key로는 대체 모델 목록(models)의 " + name + "을(를) 사용할 수 없습니다. " +
 			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
+// The same refusal for the Messages surface's own fallback list, named the
+// way the caller wrote it.
+func errFallbackModelNotAllowed(name string) apiError {
+	if name == "" || len(name) > maxPassthroughNameBytes {
+		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+			"이 API Key로는 대체 모델 목록(fallbacks)에 적힌 모델을 사용할 수 없습니다. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		"이 API Key로는 대체 모델 목록(fallbacks)의 " + name + "을(를) 사용할 수 없습니다. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+}
+
+// errOutputTooLong names the field and the model's cap, which is the only
+// thing a caller needs to fix the request: an agent client that sends its own
+// default output length gets this on every request until the value is lowered.
+func errOutputTooLong(field string, max int) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "output_limit_exceeded",
+		"요청한 최대 출력 길이가 모델의 허용치를 초과했습니다. " + field + " 값을 " +
+			strconv.Itoa(max) + " 이하로 지정해주세요."}
 }
 
 func errUnsupportedParam(name string) apiError {

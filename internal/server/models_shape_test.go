@@ -118,3 +118,41 @@ func TestModelsAnthropicRetrieveAndRefusals(t *testing.T) {
 		t.Fatalf("openai refusal: %d %s", status, body)
 	}
 }
+
+// An Anthropic SDK lists models with the key in x-api-key, as it sends its
+// messages. Without the header the route reads only the bearer, as before.
+func TestModelsAnthropicReadsAPIKeyHeader(t *testing.T) {
+	h := newHarness(t, creditDoc, nil)
+	get := func(anthropic bool) (int, []byte) {
+		req, err := http.NewRequest(http.MethodGet, h.gw.URL+"/v1/models", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Api-Key", testToken)
+		if anthropic {
+			req.Header.Set("Anthropic-Version", "2023-06-01")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, out
+	}
+	if status, body := get(true); status != 200 {
+		t.Fatalf("x-api-key with anthropic-version: %d %s", status, body)
+	}
+	status, body := get(false)
+	if status != 401 || errCode(t, body) != "missing_api_key" {
+		t.Fatalf("x-api-key alone: %d %s", status, body)
+	}
+	// The Anthropic refusal names both headers, as on /v1/messages.
+	status, body = getModels(t, h, "/v1/models", "", true)
+	var e struct {
+		Error struct{ Message string } `json:"error"`
+	}
+	if status != 401 || json.Unmarshal(body, &e) != nil || e.Error.Message != errMissingKeyMessages.message {
+		t.Fatalf("missing key: %d %s", status, body)
+	}
+}
