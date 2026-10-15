@@ -328,6 +328,20 @@ func errEndpointNotAllowed(label string) apiError {
 			"콘솔에서 이 기능을 신청하면 승인 후 사용할 수 있습니다."}
 }
 
+// errContainerToolNotAllowed refuses a server tool that runs in a container.
+// It keeps the capability refusal's code, so a caller and the usage record see
+// the same event as any other missing grant, but not its advice: the approval
+// screen does not offer this capability yet, so "ask for it in the console"
+// would send a student to look for a checkbox that is not there. What they can
+// do is drop the tool. When the capability becomes grantable this goes back to
+// errEndpointNotAllowed.
+func errContainerToolNotAllowed(label string) apiError {
+	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
+		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
+			"모델이 샌드박스에서 명령을 실행하는 서버 도구(shell, bash)는 아직 신청할 수 없는 기능입니다. " +
+			"요청에서 이 도구를 빼고 다시 보내주세요."}
+}
+
 func errMissingParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "missing_parameter",
 		"필수 파라미터가 없습니다: " + name}

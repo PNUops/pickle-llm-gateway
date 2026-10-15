@@ -56,6 +56,9 @@ func TestNormalizeEndpoints(t *testing.T) {
 		// A token this build does not route is kept rather than filtered: the
 		// vocabulary is the control plane's, and nothing here can match it.
 		{"unknown kept", []string{"audio", "images"}, []string{"audio", "images"}},
+		// The control plane already names this one; once it grants it, the
+		// token has to arrive as the gateway spells it.
+		{"containers", []string{"chat", " Containers "}, []string{"chat", EndpointContainers}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := normalizeEndpoints(tc.in)

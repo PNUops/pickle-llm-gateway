@@ -129,6 +129,7 @@ var endpointNames = map[string]string{
 	snapshot.EndpointPdfOcr:     "PDF OCR",
 	snapshot.EndpointImages:     "이미지 생성",
 	snapshot.EndpointEmbeddings: "임베딩",
+	snapshot.EndpointContainers: "코드 실행",
 }
 
 // endpointLabel renders one capability for a message. A token with no name

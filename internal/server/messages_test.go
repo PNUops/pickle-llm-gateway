@@ -337,10 +337,13 @@ func TestMessagesModelFences(t *testing.T) {
 			messagesWith("anthropic/claude-sonnet-4.5", "tools",
 				`[{"type":"openrouter:advisor","parameters":{"model":"openai/gpt-5"}}]`),
 			"model_not_allowed", "tools", 403},
+		// The bash server tool needs the containers grant, and a tool's
+		// capability is judged before the model it names, as for the image
+		// tool: the missing grant is the answer whatever the model.
 		{"bash server tool naming a model outside the list",
 			messagesWith("anthropic/claude-sonnet-4.5", "tools",
 				`[{"type":"openrouter:bash","parameters":{"model":"openai/gpt-5"}}]`),
-			"model_not_allowed", "tools", 403},
+			"endpoint_not_allowed", "containers", 403},
 		{"deferred server tool naming a model outside the list",
 			messagesWith("anthropic/claude-sonnet-4.5", "deferred_tools",
 				`[{"type":"openrouter:subagent","parameters":{"model":"openai/gpt-5"}}]`),
@@ -368,12 +371,14 @@ func TestMessagesModelFences(t *testing.T) {
 			}
 		})
 	}
-	// The same shapes inside the list pass, a bare server tool included.
+	// The same shapes inside the list pass, a bare server tool included. That
+	// tool used to be openrouter:bash, which now needs the containers grant;
+	// tool_search names no model either and needs no grant.
 	h, _ := messagesHarness(t, fenced)
 	for _, body := range []string{
 		messagesWith("anthropic/claude-sonnet-4.5", "fallbacks", `[{"model":"anthropic/claude-haiku-4.5"}]`),
 		messagesWith("anthropic/claude-sonnet-4.5", "tools",
-			`[{"name":"read_file","description":"d","input_schema":{"type":"object"}},{"type":"openrouter:bash"}]`),
+			`[{"name":"read_file","description":"d","input_schema":{"type":"object"}},{"type":"openrouter:tool_search"},{"type":"bash_20250124","name":"bash"}]`),
 	} {
 		if status, out, _ := sendMessages(t, h, nil, body); status != 200 {
 			t.Fatalf("%s: %d %s", body, status, out)

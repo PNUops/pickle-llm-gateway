@@ -150,6 +150,16 @@ response_format  tools  tool_choice  parallel_tool_calls
 때는 필요 없다면 그것은 권한이 아니기 때문입니다. 웹 검색 도구(`openrouter:web_search`)도 같은
 이유로 `web_search` 기능 권한을 요구합니다. 중첩된 도구 목록 안에 있어도 같습니다.
 
+**샌드박스에서 명령을 실행하는 서버 도구(`openrouter:shell`, `openrouter:bash`)는 `containers`
+기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 어느 Key에서나 403
+`endpoint_not_allowed`로 거절하고, 거절 문구는 신청 대신 도구를 빼고 다시 보내라고 안내합니다.
+공급자의 컨테이너는 Key가 아니라 공급자 계정 단위로 묶이고, 어느 컨테이너를 쓸지는 요청에서
+정해집니다. 호출자가 고른 id(`container_reference`)나 `session_id`, `X-Session-Id` 헤더,
+`prompt_cache_key`에서 유도한 id입니다. 같은 계정 아래의 두 Key가 같은 id에 닿으면 서로의 파일을
+읽고 쓸 수 있으므로, Key마다 컨테이너를 따로 쓰게 될 때까지 도구 쪽을 막아 둡니다. 세션 값과
+`prompt_cache_key`는 그대로 전달합니다. 컨테이너가 없으면 프롬프트 캐시용 공급자 고정에만
+쓰이기 때문입니다. 같은 도구가 지정한 모델도 거절 대상이면 이 거절이 먼저입니다.
+
 **공급자는 서버 도구 하나를 여러 `type` 철자로 받습니다.** `openrouter:web_search` 말고도
 `web_search`, `web_search_preview`, `web_search_preview_2025_03_11`, `web_search_2025_08_26`가
 Chat에서 같은 유료 검색을 실행하고, Messages에서는 `web_search_20250305` 같은 Anthropic 철자와
@@ -157,7 +167,10 @@ Chat에서 같은 유료 검색을 실행하고, Messages에서는 `web_search_2
 접미사(`_20250305`, `_2025_03_11`)를 뗀 기본 이름으로 어떤 도구인지 정한 뒤 판정합니다. 기본
 이름이 `web_search`, `image_generation`, `advisor` 등으로 시작하면 그 도구로 봅니다.
 `web_fetch`는 권한 없이 통과하고, `code_execution_*`는 공급자가 400으로 거절하므로 그대로
-보냅니다.
+보냅니다. `shell`, `shell_<날짜>`는 `openrouter:shell`로, 날짜 없는 `bash`는 `openrouter:bash`로
+봅니다. `bash_20250124` 같은 날짜 붙은 `bash`는 공급자 문서가 명령을 애플리케이션에 돌려주는
+클라이언트 도구로 설명하므로 서버 도구로 보지 않고 통과시킵니다. `apply_patch`는 패치를
+애플리케이션이 적용하는 도구라 컨테이너를 쓰지 않으므로 권한 없이 통과합니다.
 
 모델 제한이 걸린 Key에서는 **모델을 비워 둔 서버 도구도 거절합니다.** `openrouter:advisor`(와
 `advisor_20260301`)는 `model`이 도구 최상위에도 `parameters`에도 없으면 답을 만드는 모델이 생성 도중에 자문 모델을 고르고,
@@ -319,6 +332,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
+| `containers` | 유료 모델 채팅의 샌드박스 명령 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`), `openrouter:bash` 도구와 날짜 없는 `bash`. **아직 부여하지 않습니다** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은
 거절하지 않고, 거절할 때는 요청을 고쳐 넘기지 않고 403으로 답합니다. 그래서 판정하지 않는 것이
