@@ -35,6 +35,8 @@ var (
 	containerSpellings = []string{
 		"openrouter:shell", "shell", "shell_20250124", "shell_2026_01_01", "SHELL",
 		" openrouter:Shell ", "openrouter:bash", " openrouter:bash ", "bash", "BASH",
+		"openrouter:shell_20250124", "openrouter: shell", "openrouter:bash_20250124",
+		"openrouter:bash_2026_01_01",
 	}
 )
 
@@ -58,14 +60,17 @@ func TestCanonicalServerTool(t *testing.T) {
 			t.Errorf("%s -> %q", s, got)
 		}
 	}
-	for _, s := range []string{"openrouter:shell", "shell", "shell_20250124", "SHELL", " openrouter:Shell "} {
+	for _, s := range []string{"openrouter:shell", "shell", "shell_20250124", "SHELL", " openrouter:Shell ",
+		"openrouter:shell_20250124", "openrouter: shell"} {
 		if got := canonicalServerTool(s); got != shellTool {
 			t.Errorf("%s -> %q", s, got)
 		}
 	}
-	// Only the bare word is the vendor's bash; a dated spelling is
-	// Anthropic's client tool and must not be pulled into the family.
-	for _, s := range []string{"openrouter:bash", "bash", "BASH", " bash "} {
+	// Unprefixed, only the bare word is the vendor's bash; a dated spelling
+	// is Anthropic's client tool and must not be pulled into the family.
+	// Under the vendor's own prefix every spelling is the vendor's bash.
+	for _, s := range []string{"openrouter:bash", "bash", "BASH", " bash ",
+		"openrouter:bash_20250124", "openrouter: bash"} {
 		if got := canonicalServerTool(s); got != bashTool {
 			t.Errorf("%s -> %q", s, got)
 		}

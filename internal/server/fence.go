@@ -282,7 +282,20 @@ var toolVersionSuffix = regexp.MustCompile(`_(\d{8}|\d{4}_\d{2}_\d{2})$`)
 func canonicalServerTool(rawType string) string {
 	t := strings.ToLower(strings.TrimSpace(rawType))
 	if strings.HasPrefix(t, serverToolPrefix) {
-		return t
+		// The vendor's own namespace: a dated or spaced spelling there is
+		// still that tool, so it reduces like the bare one. Under this
+		// prefix even a dated bash is the vendor's bash, not a client tool.
+		name := strings.TrimSpace(strings.TrimPrefix(t, serverToolPrefix))
+		base := toolVersionSuffix.ReplaceAllString(name, "")
+		if base == "bash" {
+			return bashTool
+		}
+		for _, f := range serverToolFamilies {
+			if strings.HasPrefix(base, f.base) {
+				return f.tool
+			}
+		}
+		return serverToolPrefix + name
 	}
 	if t == "bash" {
 		return bashTool

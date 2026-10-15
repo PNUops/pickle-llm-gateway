@@ -339,7 +339,7 @@ func errContainerToolNotAllowed(label string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
 		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
 			"모델이 샌드박스에서 명령을 실행하는 서버 도구(shell, bash)는 아직 신청할 수 없는 기능입니다. " +
-			"요청의 tools에서 이 도구를 빼고 다시 보내주세요."}
+			"요청에서 이 도구를 빼고 다시 보내주세요."}
 }
 
 func errMissingParam(name string) apiError {
