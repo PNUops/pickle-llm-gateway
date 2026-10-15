@@ -2021,6 +2021,7 @@ func allAPIErrors() map[string]apiError {
 		"errPassthroughNoStreaming":      errPassthroughNoStreaming,
 		"errPassthroughResponseTooLarge": errPassthroughResponseTooLarge,
 		"errEndpointNotAllowed(x)":       errEndpointNotAllowed("x"),
+		"errContainerToolNotAllowed(x)":  errContainerToolNotAllowed("x"),
 		"errCandidateModelNotAllowed(x)": errCandidateModelNotAllowed("x"),
 		"errToolModelNotAllowed(x)":      errToolModelNotAllowed("x"),
 		"errRouterModelNotAllowed(x)":    errRouterModelNotAllowed("x"),
@@ -2046,6 +2047,9 @@ func allAPIErrors() map[string]apiError {
 var sharedCodes = map[string]bool{
 	"model_not_allowed":     true,
 	"unsupported_parameter": true,
+	// A container tool refused for a missing grant is a missing grant; only the
+	// advice differs, because that grant cannot be asked for yet.
+	"endpoint_not_allowed": true,
 }
 
 func TestEveryAPIErrorIsWellFormed(t *testing.T) {

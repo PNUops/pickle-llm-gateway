@@ -190,6 +190,12 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 // not price — the "their own balance" argument stops holding, because the harm
 // is then no longer the caller's to absorb. Revisit this the first time a deny
 // list is used that way.
+//
+// The same reasoning does not cover a tool that runs in a container, because
+// what leaks there is not money but another key's files: the vendor shares
+// containers across every key of an account. The two container tools known
+// today are refused below; a container tool the vendor adds later would pass
+// through this gap until it is added to that list.
 const toolsField = "tools"
 
 // serverToolPrefix marks the vendor's own tools in their canonical spelling. A
@@ -207,6 +213,26 @@ const imageGenerationTool = "openrouter:image_generation"
 // included, for the same reason the image tool answers to images.
 const webSearchTool = "openrouter:web_search"
 
+// shellTool and bashTool run commands in a sandbox container on the vendor's
+// side. A container is scoped to the vendor account, not to a key, and the id
+// that selects one comes from the request: an id the caller names, or one
+// derived from session_id, the X-Session-Id header or prompt_cache_key. Two
+// keys under one account that arrive at the same id reach the same files, and
+// a common session value is enough for that to happen by accident. So both
+// answer to the containers capability, which is not grantable yet; the inputs
+// that derive the id are left alone, since without a container they only pin
+// a provider for prompt caching.
+const (
+	shellTool = "openrouter:shell"
+	bashTool  = "openrouter:bash"
+)
+
+// containerTools are the server tools that create or reach a container. The
+// vendor's container guide names these two and no others. apply_patch is not
+// one: the vendor documents it as a patch proposal that the caller's own
+// application applies, with no backend beyond the inference request.
+var containerTools = map[string]bool{shellTool: true, bashTool: true}
+
 // serverToolFamilies is the one list of the vendor's other spellings for its
 // server tools, by the base name a spelling reduces to. The vendor accepts
 // each tool under several types (its tool catalogue lists them as aliases):
@@ -220,8 +246,18 @@ const webSearchTool = "openrouter:web_search"
 // is that tool, which also covers a dated spelling the vendor adds later. The
 // families are the tools a fence here acts on, plus the ones it knowingly lets
 // through so that the list says so: web_fetch passes (operator, 2026-10-14),
-// and tool_search, shell and apply_patch take neither a model nor a grant.
-// code_execution is absent: the vendor refuses it as an unknown shorthand.
+// and tool_search and apply_patch take neither a model nor a grant. shell
+// needs the containers grant. code_execution is absent: the vendor refuses it
+// as an unknown shorthand.
+//
+// bash is not a family, because its dated spellings are a different tool. The
+// vendor's bash runs in its sandbox only under its own engine, and documents
+// Anthropic's built-in bash_20250124 as a tool that returns the command to the
+// caller's application, which runs it. So only the bare word "bash" is read as
+// the vendor's tool (see canonicalServerTool), and bash_<date> passes as the
+// client tool it is. A live call (2026-10-16) bore that out: bash_20250124 came
+// back as a tool_use for the caller with no container, while openrouter:shell,
+// and openrouter:bash under the vendor's engine, ran in one and returned its id.
 var serverToolFamilies = []struct{ base, tool string }{
 	{"web_search", webSearchTool},
 	{"image_generation", imageGenerationTool},
@@ -230,7 +266,7 @@ var serverToolFamilies = []struct{ base, tool string }{
 	{"subagent", "openrouter:subagent"},
 	{"web_fetch", "openrouter:web_fetch"},
 	{"tool_search", "openrouter:tool_search"},
-	{"shell", "openrouter:shell"},
+	{"shell", shellTool},
 	{"apply_patch", "openrouter:apply_patch"},
 }
 
@@ -247,6 +283,9 @@ func canonicalServerTool(rawType string) string {
 	t := strings.ToLower(strings.TrimSpace(rawType))
 	if strings.HasPrefix(t, serverToolPrefix) {
 		return t
+	}
+	if t == "bash" {
+		return bashTool
 	}
 	base := toolVersionSuffix.ReplaceAllString(t, "")
 	for _, f := range serverToolFamilies {
@@ -288,8 +327,8 @@ const nestedToolsParam = "tools"
 const maxNestedToolDepth = 3
 
 // fenceServerTools judges every model a server tool names, and applies the
-// image capability to the tool that generates images. It returns the refusal to
-// send, or nil.
+// image, web search and containers capabilities to the tools that need them. It
+// returns the refusal to send, or nil.
 func (s *Server) fenceServerTools(doc *snapshot.Document, modelLookup func(string) *snapshot.Model,
 	key *snapshot.Key, params map[string]json.RawMessage) *apiError {
 	raw, present := params[toolsField]
@@ -340,6 +379,11 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 		if toolType == webSearchTool &&
 			!key.AllowsEndpoint(snapshot.EndpointWebSearch) {
 			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
+			return &e
+		}
+		if containerTools[toolType] &&
+			!key.AllowsEndpoint(snapshot.EndpointContainers) {
+			e := errContainerToolNotAllowed(endpointLabel(snapshot.EndpointContainers))
 			return &e
 		}
 		// A tool names its model in its parameters on the chat route and at

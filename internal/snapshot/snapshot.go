@@ -94,6 +94,13 @@ const (
 	// is meaningful only beside EndpointChat (the control plane enforces that).
 	EndpointWebSearch = "web_search"
 	EndpointPdfOcr    = "pdf_ocr"
+	// EndpointContainers governs the vendor's server tools that run commands
+	// in a hosted sandbox container. Like the two above it is a part of chat,
+	// judged from the chat body. Containers belong to the vendor account rather
+	// than to a key, and the id that picks one can be chosen by the caller or
+	// derived from a session value, so two keys can land in the same container.
+	// It stays ungranted until each key gets containers of its own.
+	EndpointContainers = "containers"
 )
 
 // reservedModelPrefixes are the prefixes reserved for curated self-serve

@@ -17,8 +17,12 @@ import (
 //     interleaved thinking, which the vendor otherwise strips.
 //   - x-session-id: sticky provider routing for prompt caching. The body's
 //     session_id already passes. Stickiness is tracked per account, so two
-//     students choosing the same value share a provider choice and nothing
-//     else.
+//     students choosing the same value share a provider choice. The same
+//     value also derives the id of the sandbox container the vendor's shell
+//     and bash tools run in, and containers are per account as well, so it
+//     would let them share files too. That is closed by refusing those tools
+//     without the containers grant (see containerTools), not here; whoever
+//     opens that grant has to stop the value from reaching across keys first.
 //   - X-OpenRouter-Metadata: routing metadata in the response body, the
 //     provider, the fallback order and BYOK use for this request. The same
 //     object carries the organisation's guardrail verdicts, so it shows the
