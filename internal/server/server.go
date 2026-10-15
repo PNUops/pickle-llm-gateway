@@ -69,6 +69,11 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 				ResponseHeaderTimeout: cfg.PassthroughHeaderWait,
 				MaxIdleConnsPerHost:   16,
 				IdleConnTimeout:       90 * time.Second,
+				// Ask for an identity body so the declared length reaches
+				// the response: a gzip answer arrives with ContentLength -1,
+				// which sends every large answer down the growing-buffer
+				// path instead of the sized read the memory budget assumes.
+				DisableCompression: true,
 			},
 		},
 		passthroughLarge: newLargeBodySlots(cfg.PassthroughMaxInFlight),
