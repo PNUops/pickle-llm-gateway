@@ -55,7 +55,7 @@ func (h *harness) passthrough(t *testing.T, method, path, token, body string) (i
 
 const imageBody = `{"model":"openai/gpt-image-1","prompt":"a cat"}`
 
-// The fence is the whole point of the round: a key that exists today carries
+// The fence is the point of the grant model: a key that exists today carries
 // no endpoint grant, and must not reach a single new path because the gateway
 // learned to serve them.
 func TestPassthroughEndpointFenceClosedByDefault(t *testing.T) {

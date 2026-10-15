@@ -2014,7 +2014,7 @@ func allAPIErrors() map[string]apiError {
 		"errUnsupportedParam(x)":  errUnsupportedParam("x"),
 		"errInvalidParamValue(x)": errInvalidParamValue("x"),
 		"errMissingParam(x)":      errMissingParam("x"),
-		// Added by the passthrough round. A new error that is not listed here
+		// Added with the passthrough endpoints. A new error that is not listed here
 		// is one the leak check never reads.
 		"errCreditPending":               errCreditPending,
 		"errPresetNotAllowed":            errPresetNotAllowed,

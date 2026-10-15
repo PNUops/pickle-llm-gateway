@@ -160,7 +160,7 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 // smaller worker, fusion runs a panel plus an analyst, and image_generation
 // produces an image. The advisor's documentation says its model may be any
 // model on the platform and gives a tilde floating alias as the first example —
-// the shape closed everywhere else this round.
+// the shape every other fence here closes.
 //
 // image_generation is the one that matters most, because it runs on the chat
 // path and so reaches past the capability fence that governs the image routes.

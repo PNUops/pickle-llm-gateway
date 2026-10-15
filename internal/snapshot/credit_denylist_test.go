@@ -94,7 +94,7 @@ func TestUnusableCreditDenyPatternDropsTheKey(t *testing.T) {
 	}
 }
 
-// The shapes this round adds have to survive an actual load, in both lists.
+// The wildcard shapes have to survive an actual load, in both lists.
 // The matcher table cannot show this: it is handed patterns directly, so it
 // would stay green while the pattern check dropped every key that used one.
 func TestWildcardPatternsSurviveLoad(t *testing.T) {
@@ -131,7 +131,7 @@ func TestWildcardPatternsSurviveLoad(t *testing.T) {
 // a key entry are ignored on purpose, so a misspelling does not fail the load —
 // it arrives as an empty list, and an empty deny list denies nothing. The
 // models somebody closed are open again while every screen still shows them
-// closed, which is the worst shape this round can fail in.
+// closed, which is the worst way a deny list can fail.
 //
 // The mistake this pins is a real one: the database column is snake_case and
 // the document field is not, so the column name is the misspelling that comes

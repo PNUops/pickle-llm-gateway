@@ -119,8 +119,8 @@ var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 // THIS IS A PREFIX AND NOT A LIST OF NAMES, and the difference is the point. A
 // list was written first with the one name then known; it missed four more that
 // already existed and would have missed every one added later. That is how the
-// same defect was found three times in one round, the third time created by the
-// list itself. A read of the vendor's model listing (431 models, 2026-09-05)
+// same defect was found three times before the list was replaced, the third
+// time created by the list itself. A read of the vendor's model listing (431 models, 2026-09-05)
 // found six names under this vendor: auto, auto-beta, free, fusion,
 // pareto-code and bodybuilder, none of them a real model. **That listing is
 // not the whole catalogue** — the image models sit on a separate listing and
@@ -236,7 +236,7 @@ func IsPresetModelName(publicName string) bool {
 //
 // The guards here close those six. THEY DO NOT CLOSE THE CLASS. The previous
 // version of this note said the same thing about five and was proved right
-// within the round, by the sixth. Nothing here can close it: the structural
+// soon after, by the sixth. Nothing here can close it: the structural
 // answer is to admit only names the vendor's catalogue calls a concrete model,
 // and the gateway has no catalogue (the control plane does). The vendor marks
 // selectors `tokenizer: Router`, so the discriminator exists and is not
@@ -482,7 +482,7 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	// untrimmed, and a comparison that normalizes one side always leaks this
 	// way. For a catalogue model the name is a server value and cannot carry
 	// padding; for a passthrough model it is synthesized from the request
-	// string, so it is the caller's, and this round is what opens that surface.
+	// string, so it is the caller's, and passthrough is what opens that surface.
 	name := strings.ToLower(strings.TrimSpace(m.PublicName))
 	// A router name sidesteps both lists: whichever model it resolves to is
 	// what gets billed, and that model is chosen after this fence has run. A

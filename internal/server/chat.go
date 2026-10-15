@@ -69,7 +69,7 @@ func renameFirstCandidate(params map[string]json.RawMessage, upstream string) {
 // only thing standing between a caller and thinking. Opening it is a service
 // decision, not a consistency fix: completion tokens go up by orders of
 // magnitude when thinking is on, and that lands on the shared token allowance.
-// (The often-quoted ratio from the benchmark round is an estimate, not a
+// (The often-quoted ratio from benchmarking is an estimate, not a
 // measurement — its thinking-off side was converted from a different
 // checkpoint. Do not restate it as measured.)
 var tokenAxisParams = map[string]bool{
