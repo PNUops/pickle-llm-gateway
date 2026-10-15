@@ -31,12 +31,13 @@ type Server struct {
 	log      *slog.Logger
 	client   *http.Client
 	inFlight chan struct{}
-	// The passthrough surface's own transport and slot pool. Separate from the
-	// two above so that neither its header wait nor its concurrency can move
-	// what chat does, and so the memory this surface can hold is one
-	// multiplication with a bounded slot count in it — see config.
-	passthroughClient   *http.Client
-	passthroughInFlight chan struct{}
+	// The passthrough surface's own transport and large-body pool. Separate
+	// from chat's so that neither its header wait nor its large answers can
+	// move what chat does, and so the memory its large bodies can hold is one
+	// multiplication with a bounded slot count in it — see config. Small
+	// passthrough requests take no slot here, only the gateway-wide one.
+	passthroughClient *http.Client
+	passthroughLarge  *largeBodySlots
 	// chatLarge admits chat bodies and non-streamed chat responses above the
 	// ordinary bound; nil when the pool is configured off.
 	chatLarge *largeBodySlots
@@ -70,12 +71,12 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 				IdleConnTimeout:       90 * time.Second,
 			},
 		},
-		passthroughInFlight: make(chan struct{}, cfg.PassthroughMaxInFlight),
-		chatLarge:           newLargeBodySlots(cfg.ChatLargeBodySlots),
-		health:              newUpstreamHealth(nil),
-		metrics:             &counters{},
-		costs:               newGenerationCosts(),
-		now:                 time.Now,
+		passthroughLarge: newLargeBodySlots(cfg.PassthroughMaxInFlight),
+		chatLarge:        newLargeBodySlots(cfg.ChatLargeBodySlots),
+		health:           newUpstreamHealth(nil),
+		metrics:          &counters{},
+		costs:            newGenerationCosts(),
+		now:              time.Now,
 	}
 }
 
@@ -84,9 +85,10 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 // nothing acts on it.
 func (s *Server) InFlight() int { return len(s.inFlight) }
 
-// PassthroughInFlight is the same gauge for the passthrough surface's own
-// pool, which is bounded separately and much lower.
-func (s *Server) PassthroughInFlight() int { return len(s.passthroughInFlight) }
+// PassthroughInFlight is how many of the passthrough surface's large-body
+// slots are taken. The name predates the split: a small passthrough request
+// takes a gateway-wide slot only and is counted by InFlight, not here.
+func (s *Server) PassthroughInFlight() int { return s.passthroughLarge.inUse() }
 
 // SetBodySink enables prompt/response capture for keys that opted in. Without
 // a sink no capture happens at all, whatever the snapshot says — the channel

@@ -7,7 +7,9 @@
 // Two properties are load-bearing and are the reason the file is separate.
 // The fences run in a fixed order (authenticate, endpoint, credential, model),
 // and every bound this surface answers to is its own: its own body cap, its
-// own response cap, its own header wait and its own pool of in-flight slots.
+// own response cap, its own header wait and its own pool of large-body slots.
+// Only the gateway-wide in-flight cap is shared with chat, and it is what
+// bounds a small passthrough request, as it bounds a small chat one.
 package server
 
 import (
@@ -233,24 +235,50 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			return
 		}
 
-		// This surface's own slot pool, taken after the cheap refusals so a
-		// key that cannot pass a fence never occupies one, and before the body
-		// read, which is the first thing that costs memory. Separate from the
-		// gateway-wide pool on purpose: it is what bounds this surface's heap
-		// to a number that can be written down, and it stops a two-minute
-		// image generation from holding a slot chat needs.
+		// The gateway-wide slot, taken after the cheap refusals so a key that
+		// cannot pass a fence never occupies one, and before the body read,
+		// which is the first thing that costs memory. Same pool and same
+		// refusal as chat: a small passthrough request costs about what a
+		// small chat request does, and MAX_IN_FLIGHT is what bounds those.
 		select {
-		case s.passthroughInFlight <- struct{}{}:
-			defer func() { <-s.passthroughInFlight }()
+		case s.inFlight <- struct{}{}:
+			defer func() { <-s.inFlight }()
 		default:
 			refuse(errServerBusy, spool.StatusRateLimited)
 			return
 		}
+		// The large-body slot, if this request turns out to need one. It is
+		// taken at most once, here for a large request or in
+		// finishPassthrough for a large answer, and held until the handler
+		// returns: the request is not let go of at the headers as chat's is,
+		// so one slot covers a large request and its answer together, which
+		// is how the slot is costed (see config).
+		large := &passthroughLargeHold{pool: s.passthroughLarge, keyID: key.KeyID}
+		defer large.done()
 
 		var body []byte
 		inputBytes := 0
 		if route.readsBody {
-			r.Body = http.MaxBytesReader(w, r.Body, s.cfg.PassthroughRequestBodyMaxBytes)
+			// Two tiers, as on chat. A body up to the ordinary bound takes no
+			// large-body slot; above it, one is taken before anything is read,
+			// judged on the declared length, so refusing never comes after the
+			// memory it exists to bound has been spent. A request that declares
+			// nothing or declares a small size is read through the small cap,
+			// so a false declaration cannot reach the large one.
+			small := min(s.cfg.RequestBodyMaxBytes, s.cfg.PassthroughRequestBodyMaxBytes)
+			bodyLimit := small
+			if r.ContentLength > small {
+				if s.passthroughLarge == nil || r.ContentLength > s.cfg.PassthroughRequestBodyMaxBytes {
+					refuse(errRequestTooLarge, spool.StatusBadRequest)
+					return
+				}
+				if !large.take() {
+					refuse(errLargeRequestBusy, spool.StatusRateLimited)
+					return
+				}
+				bodyLimit = s.cfg.PassthroughRequestBodyMaxBytes
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 			raw, err := io.ReadAll(r.Body)
 			if err != nil {
 				var tooLarge *http.MaxBytesError
@@ -466,7 +494,36 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// `choices[0].message.content` out — and neither has a counterpart in
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
-		s.finishPassthrough(w, resp, route, inputBytes, &ev, record)
+		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, record)
+	}
+}
+
+// passthroughLargeHold is one request's claim on the passthrough large-body
+// pool: none until take succeeds, then one slot until done.
+type passthroughLargeHold struct {
+	pool    *largeBodySlots
+	keyID   string
+	release func()
+	held    bool
+}
+
+// take claims a slot, or reports that the one already claimed is still held.
+// It never waits, for the reason acquire gives.
+func (h *passthroughLargeHold) take() bool {
+	if h.held {
+		return true
+	}
+	release, ok := h.pool.acquire(h.keyID)
+	if !ok {
+		return false
+	}
+	h.release, h.held = release, true
+	return true
+}
+
+func (h *passthroughLargeHold) done() {
+	if h.held {
+		h.release()
 	}
 }
 
@@ -479,17 +536,47 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 // multi-megabyte base64 payload would put a second copy of it on the heap for
 // no gain. The usage object is lifted out with a decode into a two-field
 // envelope, which walks the body without materialising it.
+//
+// An answer up to the ordinary relay bound (upstreamResponseCapBytes) needs no
+// large-body slot, as on chat; past it, the rest is read only with one, up to
+// this surface's response cap. A declared length past the bound takes the slot
+// before the first byte is read; an undeclared or understated one takes it the
+// moment the bound is crossed. Either way the vendor has billed the answer, so
+// a refusal for want of a slot is named like one for size.
 func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, route passthroughRoute,
-	inputBytes int, ev *spool.Event, record func()) {
+	large *passthroughLargeHold, inputBytes int, ev *spool.Event, record func()) {
+	tooLarge := func() {
+		writeAPIError(w, errPassthroughResponseTooLarge)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errPassthroughResponseTooLarge.code
+		record()
+	}
+	limit := s.cfg.PassthroughResponseMaxBytes
+	ordinary := min(int64(upstreamResponseCapBytes), limit)
+	readCap := ordinary
+	if large.held {
+		readCap = limit
+	}
+	if n := resp.ContentLength; n > limit {
+		// Declared past the cap: nothing it could send would be relayed, so
+		// no slot is spent reading it.
+		tooLarge()
+		return
+	} else if n > readCap {
+		if !large.take() {
+			tooLarge()
+			return
+		}
+		readCap = limit
+	}
 	// One byte past the cap, so hitting it is detectable. io.LimitReader stops
 	// silently, and a body cut mid-JSON is indistinguishable from an upstream
 	// sending garbage — which is the wrong thing to tell someone whose request
 	// was merely too big to relay.
-	limit := s.cfg.PassthroughResponseMaxBytes
-	reader := io.LimitReader(resp.Body, limit+1)
+	reader := &io.LimitedReader{R: resp.Body, N: readCap + 1}
 	var body []byte
 	var err error
-	if n := resp.ContentLength; n > 0 && n <= limit {
+	if n := resp.ContentLength; n > 0 && n <= readCap {
 		// Read the declared length into exactly one allocation. io.ReadAll and
 		// bytes.Buffer.ReadFrom both grow by doubling and hold the old and the
 		// new buffer at once while copying, so a large answer briefly costs
@@ -521,11 +608,19 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	} else {
 		body, err = io.ReadAll(reader)
 	}
+	if err == nil && int64(len(body)) > readCap && readCap < limit {
+		// Past the ordinary bound with no slot yet: take one and read on.
+		if !large.take() {
+			tooLarge()
+			return
+		}
+		reader.N += limit - readCap
+		buf := bytes.NewBuffer(body)
+		_, err = buf.ReadFrom(reader)
+		body = buf.Bytes()
+	}
 	if err == nil && int64(len(body)) > limit {
-		writeAPIError(w, errPassthroughResponseTooLarge)
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = errPassthroughResponseTooLarge.code
-		record()
+		tooLarge()
 		return
 	}
 	if err != nil {
@@ -553,12 +648,6 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		return
 	}
 
-	// Bound the write to the client. The slot this request holds is released
-	// only when the handler returns, and nothing else bounds a caller that
-	// reads its answer a byte at a time: upCtx covers the upstream call, and
-	// the server sets no write timeout. With a pool this small, two slow
-	// readers would otherwise be the whole surface.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.cfg.RequestMaxDuration))
 	// The caller sees the vendor's own model field here, since this surface
 	// forwards the body untouched — but nothing on our side would, and a
 	// fallback is exactly the case somebody later has to explain.
@@ -573,7 +662,14 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 
 	relayGenerationID(w, resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if _, err := w.Write(body); err != nil {
+	// Bound the write to the client with the deadline chat's large answers
+	// get, sized to this answer (see largeWriteBudget). A slot, when one is
+	// held, is released only when the handler returns, and nothing else bounds
+	// a caller that reads its answer a byte at a time: upCtx covers the
+	// upstream call, and the server sets no write timeout.
+	var werr error
+	writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	if werr != nil {
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
 	} else {

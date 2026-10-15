@@ -292,9 +292,9 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		UpstreamHeaderWait:  5 * time.Second,
 		RequestMaxDuration:  30 * time.Second,
 		MaxInFlight:         16,
-		// The passthrough surface fails closed on a zero slot count, so a
-		// harness that left these unset would 503 every passthrough test for
-		// the wrong reason.
+		// A zero slot count closes the passthrough large path and a zero cap
+		// refuses every body, so a harness that left these unset would fail
+		// passthrough tests for the wrong reason.
 		PassthroughRequestBodyMaxBytes: 1 << 20,
 		PassthroughResponseMaxBytes:    1 << 20,
 		PassthroughHeaderWait:          5 * time.Second,

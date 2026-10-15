@@ -8,10 +8,12 @@ import (
 	"time"
 )
 
-// largeBodySlots admits chat bodies, and non-streamed chat responses, above
-// the ordinary bound, and stream events above it. The pool is small and
-// counted in total only: one key may hold every slot, so the count bounds
-// memory, not fairness between keys. See config for the measured numbers.
+// largeBodySlots admits bodies above the ordinary bound. Chat has one pool,
+// for requests, non-streamed responses and stream events above it; the
+// passthrough surface has another of the same type, for requests and answers
+// above it. Each pool is small and counted in total only: one key may hold
+// every slot, so the count bounds memory, not fairness between keys. See
+// config for the measured numbers.
 type largeBodySlots struct {
 	mu    sync.Mutex
 	total int
