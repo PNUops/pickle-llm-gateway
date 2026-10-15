@@ -274,10 +274,10 @@ func TestPassthroughLimitsDefaultAndOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PassthroughRequestBodyMaxBytes != 25<<20 || cfg.PassthroughResponseMaxBytes != 128<<20 {
+	if cfg.PassthroughRequestBodyMaxBytes != 25<<20 || cfg.PassthroughResponseMaxBytes != 64<<20 {
 		t.Fatalf("byte defaults: %d %d", cfg.PassthroughRequestBodyMaxBytes, cfg.PassthroughResponseMaxBytes)
 	}
-	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 16 {
+	if cfg.PassthroughHeaderWait != 180*time.Second || cfg.PassthroughMaxInFlight != 4 {
 		t.Fatalf("wait/pool defaults: %v %d", cfg.PassthroughHeaderWait, cfg.PassthroughMaxInFlight)
 	}
 	// The four the chat path reads are untouched by all of this. The chat
@@ -329,7 +329,7 @@ func TestChatLargeBodyDefaultsAndOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.ChatLargeBodyMaxBytes != 25<<20 || cfg.ChatLargeResponseMaxBytes != 128<<20 ||
-		cfg.ChatLargeBodySlots != 16 {
+		cfg.ChatLargeBodySlots != 3 {
 		t.Fatalf("defaults: %d %d %d", cfg.ChatLargeBodyMaxBytes, cfg.ChatLargeResponseMaxBytes,
 			cfg.ChatLargeBodySlots)
 	}
