@@ -76,16 +76,18 @@ var (
 		"자체 서빙 모델의 분당 토큰 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
 	errRateConcurrency = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_concurrency",
 		"자체 서빙 모델의 동시 요청 수 한도를 초과했습니다. 진행 중인 요청이 끝난 뒤 다시 시도해주세요."}
-	// A body above the ordinary bound when every large-body slot, or this
-	// key's share of them, is taken. 429 because waiting is the remedy and
-	// the shortage is a limit rather than a fault.
+	// A body above the ordinary bound when every large-body slot of its
+	// surface is taken, chat's or the passthrough's. 429 because waiting is
+	// the remedy and the shortage is a limit rather than a fault.
 	errLargeRequestBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "large_request_busy",
 		"큰 요청(2 MiB 초과)을 처리할 자리가 지금은 없습니다. 잠시 후 다시 시도하거나, 파일과 이미지를 URL로 보내 요청을 줄여주세요."}
 	// The chat response bound, said out loud: a non-streamed answer bigger than
-	// this service relays. Streaming is the remedy, because a stream is bounded
-	// per event rather than in total.
+	// this service relays, or one that found no large-body slot free.
+	// Streaming helps only a long text answer, whose events are small; a
+	// picture streams as one event under the same slot and bound, so the
+	// remedy for an image is a smaller or fewer one.
 	errChatResponseTooLarge = apiError{http.StatusBadGateway, "server_error", "upstream_response_too_large",
-		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. stream으로 받거나 최대 출력 길이(max_tokens)를 줄여주세요."}
+		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 긴 텍스트 응답이면 stream으로 받거나 최대 출력 길이(max_tokens)를 줄이고, 이미지 생성이면 해상도나 개수를 줄여주세요."}
 	errServerBusy = apiError{http.StatusServiceUnavailable, "server_error", "server_busy",
 		"요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요."}
 	errRequestTooLarge = apiError{http.StatusBadRequest, "invalid_request_error", "request_too_large",
@@ -107,10 +109,11 @@ var (
 	// The response cap, said out loud. io.LimitReader truncates silently, so
 	// without this the caller gets "the upstream sent something unparseable" —
 	// a server fault they cannot act on — for a response that was simply
-	// bigger than this service relays. The remedy is theirs, so it is named.
+	// bigger than this service relays, or that found no large-body slot free.
+	// The remedy is theirs, so it is named.
 	errPassthroughResponseTooLarge = apiError{http.StatusBadGateway, "server_error",
 		"upstream_response_too_large",
-		"모델 서버 응답이 중계 가능한 크기를 넘었습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
+		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
 		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/messages, " +
 			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings입니다."}
@@ -136,8 +139,13 @@ var retryAfterSeconds = map[string]int{
 	// on a far longer period, so this fits the common case, not the degraded
 	// one — a client that keeps getting 503 is seeing a real fault.
 	"credit_pending": 10,
-	// A large body holds its slot only until the upstream starts answering,
-	// so slots come free on the scale of a generation's first token.
+	// A large chat request holds its slot only until the upstream starts
+	// answering, so request slots come free on the scale of a first token.
+	// A large answer holds one until it is written, up to its write deadline
+	// (largeWriteBudget), and a large passthrough request holds one through
+	// its whole call (an image generation takes about half a minute), so a
+	// full pool can take minutes to drain; five seconds is the retry pace,
+	// not a promise that one is free by then.
 	"large_request_busy": 5,
 }
 

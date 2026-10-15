@@ -605,11 +605,11 @@ const upstreamResponseCapBytes = 8 << 20
 
 func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.Response, publicName, sentModel string, creditAxis bool, charge func(int), ev *spool.Event, record func(), inputBytes int, capture *bodies.Record) {
 	largeResponseMax := p.limits(s.cfg).largeResponse
-	// releaseLargeResponse frees a large-body slot taken below. It runs once
-	// the output is marshalled, before the write: the slot bounds what parsing
-	// costs, and a client that reads slowly must not hold it while it reads
-	// (the edge does not buffer responses).
-	releaseLargeResponse := func() {}
+	// large is set once this answer has taken a large-body slot. The slot is
+	// held through the write, under a deadline sized to the answer, so the
+	// output waiting on a slow reader is counted by the pool (see
+	// writeUnderDeadline); the deferred release frees it on every path.
+	large := false
 	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamResponseCapBytes+1))
 	if err == nil && len(body) > upstreamResponseCapBytes {
 		// Past the ordinary bound. The rest is read only with a large-body
@@ -623,7 +623,7 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 			return
 		}
 		defer release()
-		releaseLargeResponse = release
+		large = true
 		limit := largeResponseMax - int64(len(body))
 		buf := bytes.NewBuffer(body)
 		_, err = buf.ReadFrom(io.LimitReader(resp.Body, limit+1))
@@ -703,15 +703,20 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 		return
 	}
 	body, m = nil, nil
-	releaseLargeResponse()
 	// Only on the answer actually relayed: a refusal above is the gateway's
 	// own error, not the vendor's generation.
 	if creditAxis {
 		relayGenerationID(w, resp.Header)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	switch _, err := w.Write(out); {
-	case err != nil:
+	var werr error
+	if large {
+		writeUnderDeadline(w, len(out), func() { _, werr = w.Write(out) })
+	} else {
+		_, werr = w.Write(out)
+	}
+	switch {
+	case werr != nil:
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
 	case res.upstreamError:
