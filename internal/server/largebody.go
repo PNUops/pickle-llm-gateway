@@ -57,17 +57,21 @@ func (l *largeBodySlots) acquire(_ string) (release func(), ok bool) {
 // A large answer holds its slot until it has been written to the client, so
 // the pool bounds every copy of it, the one waiting on a slow reader included
 // (the edge does not buffer responses). What stops a slow reader from holding
-// a slot indefinitely is a write deadline sized to the answer: a fixed floor
-// plus one second per MiB, so 128 MiB has a little under three minutes. A
-// client that cannot read at that rate is cut off and recorded as gone.
+// a slot indefinitely is a write deadline sized to the answer: sixty seconds
+// plus two seconds per MiB, so a 53 MB 4K picture has about 160 seconds and
+// 128 MiB has 316, the longest one slot can be held by a reader. That is a
+// floor of about 0.5 MiB/s (4 Mbit/s); a client slower than that is cut off,
+// after the vendor has billed the answer, and recorded as gone. The rate is
+// the decision: lower it and a slot can be held longer.
 const (
-	largeWriteFloor   = 30 * time.Second
-	largeWriteMinRate = 1 << 20 // bytes a second
+	largeWriteFloor      = 60 * time.Second
+	largeWriteSecPerMiB  = 2
+	largeWriteBytesInMiB = 1 << 20
 )
 
 // largeWriteBudget is how long an answer of n bytes may take to write.
 func largeWriteBudget(n int) time.Duration {
-	return largeWriteFloor + time.Duration(n/largeWriteMinRate)*time.Second
+	return largeWriteFloor + time.Duration(largeWriteSecPerMiB*(n/largeWriteBytesInMiB))*time.Second
 }
 
 // writeUnderDeadline runs write with the deadline for an n-byte answer and

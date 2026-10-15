@@ -148,7 +148,7 @@ func TestLargeNonStreamHoldsItsSlotUntilRead(t *testing.T) {
 }
 
 func TestLargeWriteBudget(t *testing.T) {
-	if got := largeWriteBudget(128 << 20); got != 158*time.Second {
+	if got := largeWriteBudget(128 << 20); got != 316*time.Second {
 		t.Fatalf("128 MiB budget %s", got)
 	}
 	if got := largeWriteBudget(1); got != largeWriteFloor {

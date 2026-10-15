@@ -138,8 +138,11 @@ var retryAfterSeconds = map[string]int{
 	// on a far longer period, so this fits the common case, not the degraded
 	// one — a client that keeps getting 503 is seeing a real fault.
 	"credit_pending": 10,
-	// A large body holds its slot only until the upstream starts answering,
-	// so slots come free on the scale of a generation's first token.
+	// A large request holds its slot only until the upstream starts
+	// answering, so request slots come free on the scale of a first token.
+	// A large answer holds one until it is written, up to its write deadline
+	// (largeWriteBudget), so a full pool can take minutes to drain; five
+	// seconds is the retry pace, not a promise that one is free by then.
 	"large_request_busy": 5,
 }
 
