@@ -114,7 +114,7 @@ type Config struct {
 	//
 	// The slot count is what the container decides. The default is for an
 	// 8 GiB container (unit GOMEMLIMIT 5120 MiB): three slots (about 1.2 GiB)
-	// plus the passthrough pool below (about 0.7 GiB) leave about 3.1 GiB under
+	// plus the passthrough pool below (about 0.6 GiB) leave about 3.2 GiB under
 	// GOMEMLIMIT for traffic that takes no slot, against an estimated class
 	// peak of about 3 GiB with LLMGW_MAX_IN_FLIGHT at 1,024. A 16 GiB container
 	// takes sixteen. The 128 MiB bound does not move with the container: it
@@ -135,40 +135,55 @@ type Config struct {
 	// passthrough surface opens, so an answer about image sizes can never
 	// change what a chat request may send or hold.
 	//
-	// The separate slot pool is what makes the memory arithmetic provable.
-	// A request is held three times over — the bytes as read, the decoded
-	// top-level members, and the body re-serialized for the upstream, which is
-	// what makes the model fence sound (see passthrough.go). The response is
-	// held once, because it is forwarded verbatim rather than re-marshalled.
-	// Taking the measured 1.75x amplification (2026-09-02) on the response
-	// side as the conservative bound, the ceiling these caps guarantee is
+	// Admission has the same two tiers as chat. A request up to
+	// RequestBodyMaxBytes, judged on its declared length, and an answer up to
+	// the 8 MiB relay bound take no slot of this surface's own and are bounded
+	// by MaxInFlight alone, like a small chat request; each costs well under
+	// the about 40 MiB a small chat request can (2 MiB three times over plus
+	// 8 MiB 1.75 times over). That is what lets an embedding class send dozens
+	// of small calls at once. A request past that bound, or an answer that
+	// crosses the relay bound, takes one of PassthroughMaxInFlight large-body
+	// slots, refused without one: a large request with 429 large_request_busy
+	// before the vendor is called, a large answer by name after it has billed
+	// (see errPassthroughResponseTooLarge). The variable keeps its name so an
+	// environment file that sets it still starts; it now counts large bodies
+	// only.
+	//
+	// The pool is its own, not chat's, for two reasons. A slot here costs a
+	// different amount (below), so one shared count would have to price every
+	// slot at the dearer surface's figure. And a large passthrough request
+	// holds its slot through the whole call, about half a minute for a 4K
+	// picture, where chat lets go at the headers, so sharing would let image
+	// edits hold the slots a chat answer the vendor has already billed needs.
+	//
+	// A slot is held from the moment it is taken until the answer has been
+	// written, covering a large request and its answer together. A request is
+	// held three times over — the bytes as read, the decoded top-level
+	// members, and the body re-serialized for the upstream, which is what
+	// makes the model fence sound (see passthrough.go). The response is held
+	// once, because it is forwarded verbatim rather than re-marshalled. Taking
+	// the measured 1.75x amplification (2026-09-02) on the response side as the
+	// conservative bound, the ceiling these caps guarantee is
 	//
 	//	(PassthroughRequestBodyMaxBytes*3 + PassthroughResponseMaxBytes*1.75) * PassthroughMaxInFlight
 	//
-	// which at the defaults below is about 748 MiB (four at 187 MiB; a
-	// 16 GiB container takes sixteen, about 2,990 MiB). That is the number to
-	// check a host against, and it is the whole reason this pool is separate:
-	// it holds whatever the chat pool is sized to, so raising one cannot move
-	// the other's arithmetic. The same caps applied to the gateway-wide pool
-	// would give a figure in the hundreds of gigabytes.
+	// which at the defaults below is about 598 MiB (two at 299 MiB; a 16 GiB
+	// container takes twelve, about 3,588 MiB). That is the number to check a
+	// host against, and it holds whatever the chat pool is sized to, so
+	// raising one cannot move the other's arithmetic.
 	//
 	// Measured 2026-10-14, sixteen 120 MiB answers held at once peaked at
 	// 3.3 GB of heap, about 1.75 times each, as the formula assumes.
 	//
-	// An image response measured 2026-09-05 was 13.09 MiB at 4K and 1.61 MiB
-	// at the default resolution (base64 expands the image 1.333x), but a later
-	// model answered a 4K picture at 36 MB of base64 alone, 53.4 MB with its
-	// reasoning signature. The response cap is 64 MiB, which holds that one
-	// picture with a quarter to spare; 128 MiB would only add room for two
-	// such pictures in one call, which a client can split. The concurrency is
-	// what pays for the smaller container: lowering the response cap alone
-	// cannot fit, because the request term (25 MiB three times over, sixteen
-	// at once) is 1,200 MiB by itself. A full pool refuses with 503 before the
-	// vendor is called, so a refusal here costs a retry, not a billed answer,
-	// which is why the chat pool keeps the larger share. Embeddings share this
-	// pool.
-	// A 4K generation takes 32 seconds and is not streamed, so the 60s chat
-	// header wait had under twice the margin while 180s has room.
+	// The response cap is chat's, 128 MiB. A later model answered a 4K picture
+	// at 36 MB of base64 alone (34.3 MiB), so two 4K pictures in one call
+	// (n=2) come to about 69 MiB and three to about 103 MiB; a smaller cap
+	// would refuse them after the vendor had billed both. The slot count is
+	// what pays for it: three slots here (897 MiB) beside chat's three
+	// (1,229 MiB) would leave 2,994 MiB under an 8 GiB container's GOMEMLIMIT,
+	// short of the 3 GiB class estimate, so the default is two. A 4K
+	// generation takes 32 seconds and is not streamed, so the 60s chat header
+	// wait had under twice the margin while 180s has room.
 	//
 	// The request cap is the vendor's own documented limit, 25 MB, rather than
 	// a number of ours. Where the vendor accepts a request there is no reason
@@ -281,9 +296,9 @@ func FromEnv() (*Config, error) {
 		// need: a generation is not streamed, so the upstream sends no headers
 		// until it has finished producing the image.
 		PassthroughRequestBodyMaxBytes: 25 << 20,
-		PassthroughResponseMaxBytes:    64 << 20,
+		PassthroughResponseMaxBytes:    128 << 20,
 		PassthroughHeaderWait:          180 * time.Second,
-		PassthroughMaxInFlight:         4,
+		PassthroughMaxInFlight:         2,
 		DefaultRpm:                     20,
 		DefaultTpm:                     20000,
 		DefaultConcurrency:             2,

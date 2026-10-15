@@ -59,25 +59,26 @@ TasksMax=512
 # pools plus the traffic that takes no slot. Each of the three chat large-body
 # slots, all of which one key may hold, can hold a 128 MiB answer (or one
 # stream event of that size), which costs about 3.2 times its size once
-# GOMEMLIMIT presses: about 1.2 GiB. The four passthrough slots cost a 25 MiB
-# request three times over plus a 64 MiB answer 1.75 times over: about
-# 0.7 GiB. A large answer holds its slot until it is written, under a write
-# deadline, so the copy waiting on a slow reader is inside that figure. That
-# leaves about 3.1 GiB under GOMEMLIMIT for answers and events under 8 MiB
-# and requests under 2 MiB, which take no slot and are bounded by
-# LLMGW_MAX_IN_FLIGHT alone, against an estimated class peak of about 3 GiB
-# with that cap at 1,024. Each can reach about 40 MiB, but that worst case is
-# not part of the ladder at any in-flight cap worth running: 1,024 of them
-# would not fit any container, and a cap low enough to fit them under a full
-# pool (about 78 here) would refuse a whole class at once. It cannot be
-# reached without the vendor billing every one of those answers, so the key's
-# money limit bounds it. Measured, 1,024 ordinary requests held at once came
-# to 248 MB. The risk is a full pool meeting a burst of near-8 MiB answers;
-# its sign is MemoryHigh throttling in the journal and inFlight on /metrics.
+# GOMEMLIMIT presses: about 1.2 GiB. The two passthrough large-body slots
+# cost a 25 MiB request three times over plus a 128 MiB answer 1.75 times
+# over: about 0.6 GiB. A large answer holds its slot until it is written,
+# under a write deadline, so the copy waiting on a slow reader is inside that
+# figure. That leaves about 3.2 GiB under GOMEMLIMIT for answers and events
+# under 8 MiB and requests under 2 MiB, chat and passthrough alike, which take
+# no slot and are bounded by LLMGW_MAX_IN_FLIGHT alone, against an estimated
+# class peak of about 3 GiB with that cap at 1,024. Each can reach about
+# 40 MiB, but that worst case is not part of the ladder at any in-flight cap
+# worth running: 1,024 of them would not fit any container, and a cap low
+# enough to fit them under a full pool (about 82 here) would refuse a whole
+# class at once. It cannot be reached without the vendor billing every one of
+# those answers, so the key's money limit bounds it. Measured, 1,024 ordinary
+# requests held at once came to 248 MB. The risk is a full pool meeting a
+# burst of near-8 MiB answers; its sign is MemoryHigh throttling in the
+# journal and inFlight on /metrics.
 # The multipliers come from the 2026-10-14 measurement; these values were
 # computed from them, not measured at this size. A 16 GiB container takes
-# MemoryMax=15872M, MemoryHigh=14848M, GOMEMLIMIT=13312MiB with sixteen of
-# each pool; the README has the table. A container smaller than MemoryMax
+# MemoryMax=15872M, MemoryHigh=14848M, GOMEMLIMIT=13312MiB with sixteen chat
+# and twelve passthrough slots; the README has the table. A container smaller than MemoryMax
 # silently makes the container's limit the real one, with GOMEMLIMIT then
 # above it.
 #
