@@ -104,6 +104,7 @@ const (
 	EndpointImages      = "images"
 	EndpointImageModels = "images_models"
 	EndpointEmbeddings  = "embeddings"
+	EndpointMessages    = "messages"
 )
 
 // costLiteralMax bounds the marshaled price. A real one is a handful of

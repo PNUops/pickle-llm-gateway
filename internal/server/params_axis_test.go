@@ -120,7 +120,11 @@ func TestProviderFieldsReachThePaidUpstream(t *testing.T) {
 		// of removing the list rather than lengthening it.
 		{`"some_field_added_next_month":42`, "some_field_added_next_month", `42`},
 	} {
-		h := newHarness(t, creditDoc, nil)
+		h := newHarness(t, func(d *snapshot.Document) {
+			creditDoc(d)
+			// The web plugin is a paid part of chat with a grant of its own.
+			d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointChat, snapshot.EndpointWebSearch}
+		}, nil)
 		body := `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],` + tc.field + `}`
 		status, resp := h.chat(t, testToken, body)
 		if status != 200 {
@@ -322,9 +326,9 @@ func TestSelfHostedRefusesCandidateModels(t *testing.T) {
 // fence has had a decision made about which models it may reach, and this name
 // walks around that decision.
 //
-// The reachable shape is the one the plan calls the representative use — allow
-// open, deny the expensive names — because an empty allow list admits the
-// router and the deny list never matches it.
+// The reachable shape is the usual one: the allow list left open and the
+// expensive names denied. An empty allow list admits the router, and the deny
+// list never matches it.
 func TestRouterModelRefusedOnFencedKey(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -530,7 +534,7 @@ func TestServerToolModelsAreFenced(t *testing.T) {
 	fenced := func(d *snapshot.Document) {
 		creditPassthroughDoc(d)
 		d.Keys[0].CreditDeniedModels = []string{"openai/*-pro", "anthropic/*"}
-		d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointImages}
+		d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointChat, snapshot.EndpointImages, snapshot.EndpointWebSearch}
 		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
 	}
 	for _, tc := range []struct{ name, tools string }{
@@ -593,7 +597,7 @@ func TestImageGenerationToolAnswersToTheCapabilityFence(t *testing.T) {
 	// Granted, it works — the fence is the grant, not the path.
 	h2 := newHarness(t, func(d *snapshot.Document) {
 		creditPassthroughDoc(d)
-		d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointImages}
+		d.Keys[0].PassthroughEndpoints = []string{snapshot.EndpointChat, snapshot.EndpointImages}
 	}, nil)
 	if status, resp := h2.chat(t, testToken, body); status != 200 {
 		t.Fatalf("granted key: %d %s", status, resp)

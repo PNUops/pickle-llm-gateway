@@ -7,10 +7,13 @@
 // Two properties are load-bearing and are the reason the file is separate.
 // The fences run in a fixed order (authenticate, endpoint, credential, model),
 // and every bound this surface answers to is its own: its own body cap, its
-// own response cap, its own header wait and its own pool of in-flight slots.
+// own response cap, its own header wait and its own pool of large-body slots.
+// Only the gateway-wide in-flight cap is shared with chat, and it is what
+// bounds a small passthrough request, as it bounds a small chat one.
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,6 +65,12 @@ type passthroughRoute struct {
 	// does not run — stated here rather than inferred from the method, so that
 	// adding a route makes the question unavoidable.
 	readsBody bool
+	// openAIImages marks the OpenAI SDK's image path. The body goes to the
+	// vendor unchanged, as on /v1/images, but the fields an OpenAI client may
+	// send that the vendor cannot honour are refused first (see
+	// refuseOpenAIImageFields), because the vendor would drop them without a
+	// word and the caller would get something other than what they asked for.
+	openAIImages bool
 }
 
 var (
@@ -71,6 +80,20 @@ var (
 		method:       http.MethodPost,
 		upstreamPath: "/images",
 		readsBody:    true,
+	}
+	// The path the OpenAI SDK's images.generate posts to. The vendor's own path
+	// is /images, so this is the same route under the SDK's name: the same
+	// capability, fences, metering and caps, and the same name in the usage
+	// record, because it is the same call. The OpenAI SDK's edit and
+	// variation paths are not opened: the vendor has neither path, and an
+	// edit from a reference image goes through input_references on this one.
+	routeImageGenerations = passthroughRoute{
+		capability:   snapshot.EndpointImages,
+		name:         spool.EndpointImages,
+		method:       http.MethodPost,
+		upstreamPath: "/images",
+		readsBody:    true,
+		openAIImages: true,
 	}
 	// The image catalogue is served unfiltered, unlike GET /v1/models. That
 	// list is the platform's own and says what we serve; this one is the
@@ -101,8 +124,12 @@ var (
 // covers (editing and the catalogue read travel with it), and matching the
 // screen still wins over being more precise here than the screen is.
 var endpointNames = map[string]string{
+	snapshot.EndpointChat:       "Chat",
+	snapshot.EndpointWebSearch:  "웹 검색",
+	snapshot.EndpointPdfOcr:     "PDF OCR",
 	snapshot.EndpointImages:     "이미지 생성",
 	snapshot.EndpointEmbeddings: "임베딩",
+	snapshot.EndpointContainers: "코드 실행",
 }
 
 // endpointLabel renders one capability for a message. A token with no name
@@ -117,10 +144,9 @@ func endpointLabel(capability string) string {
 }
 
 // handlePassthrough builds the handler for one route. The fence order it runs
-// is the order the caller needs the answers in, and it is not the same as
-// chat's: the endpoint fence comes first because a key that was never granted
-// the capability should hear that, not a complaint about a money budget it may
-// well have.
+// is the order the caller needs the answers in, and like chat's it starts with
+// the endpoint fence: a key that was never granted the capability should hear
+// that, not a complaint about a money budget it may well have.
 func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != route.method {
@@ -210,24 +236,50 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			return
 		}
 
-		// This surface's own slot pool, taken after the cheap refusals so a
-		// key that cannot pass a fence never occupies one, and before the body
-		// read, which is the first thing that costs memory. Separate from the
-		// gateway-wide pool on purpose: it is what bounds this surface's heap
-		// to a number that can be written down, and it stops a two-minute
-		// image generation from holding a slot chat needs.
+		// The gateway-wide slot, taken after the cheap refusals so a key that
+		// cannot pass a fence never occupies one, and before the body read,
+		// which is the first thing that costs memory. Same pool and same
+		// refusal as chat: a small passthrough request costs about what a
+		// small chat request does, and MAX_IN_FLIGHT is what bounds those.
 		select {
-		case s.passthroughInFlight <- struct{}{}:
-			defer func() { <-s.passthroughInFlight }()
+		case s.inFlight <- struct{}{}:
+			defer func() { <-s.inFlight }()
 		default:
 			refuse(errServerBusy, spool.StatusRateLimited)
 			return
 		}
+		// The large-body slot, if this request turns out to need one. It is
+		// taken at most once, here for a large request or in
+		// finishPassthrough for a large answer, and held until the handler
+		// returns: the request is not let go of at the headers as chat's is,
+		// so one slot covers a large request and its answer together, which
+		// is how the slot is costed (see config).
+		large := &passthroughLargeHold{pool: s.passthroughLarge, keyID: key.KeyID}
+		defer large.done()
 
 		var body []byte
 		inputBytes := 0
 		if route.readsBody {
-			r.Body = http.MaxBytesReader(w, r.Body, s.cfg.PassthroughRequestBodyMaxBytes)
+			// Two tiers, as on chat. A body up to the ordinary bound takes no
+			// large-body slot; above it, one is taken before anything is read,
+			// judged on the declared length, so refusing never comes after the
+			// memory it exists to bound has been spent. A request that declares
+			// nothing or declares a small size is read through the small cap,
+			// so a false declaration cannot reach the large one.
+			small := min(s.cfg.RequestBodyMaxBytes, s.cfg.PassthroughRequestBodyMaxBytes)
+			bodyLimit := small
+			if r.ContentLength > small {
+				if s.passthroughLarge == nil || r.ContentLength > s.cfg.PassthroughRequestBodyMaxBytes {
+					refuse(errRequestTooLarge, spool.StatusBadRequest)
+					return
+				}
+				if !large.take() {
+					refuse(errLargeRequestBusy, spool.StatusRateLimited)
+					return
+				}
+				bodyLimit = s.cfg.PassthroughRequestBodyMaxBytes
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 			raw, err := io.ReadAll(r.Body)
 			if err != nil {
 				var tooLarge *http.MaxBytesError
@@ -266,6 +318,14 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			if v, ok := params["model"]; !ok || json.Unmarshal(v, &publicModel) != nil || publicModel == "" {
 				refuse(errMissingParam("model"), spool.StatusBadRequest)
 				return
+			}
+			// Request-shape refusals come before the permission fences, as on
+			// chat, so a malformed request answers 400 rather than 403.
+			if route.openAIImages {
+				if e := refuseOpenAIImageFields(params); e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
 			}
 
 			// The model fence, unchanged and not rebuilt. passthroughModel
@@ -324,6 +384,11 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// And the models the vendor's server tools name, for the reason
 			// given on chat.
 			if e := s.fenceServerTools(&doc, func(string) *snapshot.Model { return nil },
+				key, params); e != nil {
+				refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
+				return
+			}
+			if e := s.fencePlugins(&doc, func(string) *snapshot.Model { return nil },
 				key, params); e != nil {
 				refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 				return
@@ -408,10 +473,16 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				}
 				refuse(*ae.refusal, status)
 			case ae.throttled:
+				if ae.retryAfter != "" {
+					w.Header().Set("Retry-After", ae.retryAfter)
+				}
 				refuse(errServerBusy, spool.StatusUpstreamErr)
 			default:
 				s.log.Error("passthrough upstream request failed", "keyId", key.KeyID,
 					"path", r.URL.Path, "error", ae.err)
+				if ae.retryAfter != "" {
+					w.Header().Set("Retry-After", ae.retryAfter)
+				}
 				refuse(errUpstream, spool.StatusUpstreamErr)
 			}
 			return
@@ -424,7 +495,36 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// `choices[0].message.content` out — and neither has a counterpart in
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
-		s.finishPassthrough(w, resp, route, inputBytes, &ev, record)
+		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, record)
+	}
+}
+
+// passthroughLargeHold is one request's claim on the passthrough large-body
+// pool: none until take succeeds, then one slot until done.
+type passthroughLargeHold struct {
+	pool    *largeBodySlots
+	keyID   string
+	release func()
+	held    bool
+}
+
+// take claims a slot, or reports that the one already claimed is still held.
+// It never waits, for the reason acquire gives.
+func (h *passthroughLargeHold) take() bool {
+	if h.held {
+		return true
+	}
+	release, ok := h.pool.acquire(h.keyID)
+	if !ok {
+		return false
+	}
+	h.release, h.held = release, true
+	return true
+}
+
+func (h *passthroughLargeHold) done() {
+	if h.held {
+		h.release()
 	}
 }
 
@@ -437,17 +537,47 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 // multi-megabyte base64 payload would put a second copy of it on the heap for
 // no gain. The usage object is lifted out with a decode into a two-field
 // envelope, which walks the body without materialising it.
+//
+// An answer up to the ordinary relay bound (upstreamResponseCapBytes) needs no
+// large-body slot, as on chat; past it, the rest is read only with one, up to
+// this surface's response cap. A declared length past the bound takes the slot
+// before the first byte is read; an undeclared or understated one takes it the
+// moment the bound is crossed. Either way the vendor has billed the answer, so
+// a refusal for want of a slot is named like one for size.
 func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, route passthroughRoute,
-	inputBytes int, ev *spool.Event, record func()) {
+	large *passthroughLargeHold, inputBytes int, ev *spool.Event, record func()) {
+	tooLarge := func() {
+		writeAPIError(w, errPassthroughResponseTooLarge)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = errPassthroughResponseTooLarge.code
+		record()
+	}
+	limit := s.cfg.PassthroughResponseMaxBytes
+	ordinary := min(int64(upstreamResponseCapBytes), limit)
+	readCap := ordinary
+	if large.held {
+		readCap = limit
+	}
+	if n := resp.ContentLength; n > limit {
+		// Declared past the cap: nothing it could send would be relayed, so
+		// no slot is spent reading it.
+		tooLarge()
+		return
+	} else if n > readCap {
+		if !large.take() {
+			tooLarge()
+			return
+		}
+		readCap = limit
+	}
 	// One byte past the cap, so hitting it is detectable. io.LimitReader stops
 	// silently, and a body cut mid-JSON is indistinguishable from an upstream
 	// sending garbage — which is the wrong thing to tell someone whose request
 	// was merely too big to relay.
-	limit := s.cfg.PassthroughResponseMaxBytes
-	reader := io.LimitReader(resp.Body, limit+1)
+	reader := &io.LimitedReader{R: resp.Body, N: readCap + 1}
 	var body []byte
 	var err error
-	if n := resp.ContentLength; n > 0 && n <= limit {
+	if n := resp.ContentLength; n > 0 && n <= readCap {
 		// Read the declared length into exactly one allocation. io.ReadAll and
 		// bytes.Buffer.ReadFrom both grow by doubling and hold the old and the
 		// new buffer at once while copying, so a large answer briefly costs
@@ -479,11 +609,19 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	} else {
 		body, err = io.ReadAll(reader)
 	}
+	if err == nil && int64(len(body)) > readCap && readCap < limit {
+		// Past the ordinary bound with no slot yet: take one and read on.
+		if !large.take() {
+			tooLarge()
+			return
+		}
+		reader.N += limit - readCap
+		buf := bytes.NewBuffer(body)
+		_, err = buf.ReadFrom(reader)
+		body = buf.Bytes()
+	}
 	if err == nil && int64(len(body)) > limit {
-		writeAPIError(w, errPassthroughResponseTooLarge)
-		ev.Status = spool.StatusUpstreamErr
-		ev.ErrorType = errPassthroughResponseTooLarge.code
-		record()
+		tooLarge()
 		return
 	}
 	if err != nil {
@@ -511,12 +649,6 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		return
 	}
 
-	// Bound the write to the client. The slot this request holds is released
-	// only when the handler returns, and nothing else bounds a caller that
-	// reads its answer a byte at a time: upCtx covers the upstream call, and
-	// the server sets no write timeout. With a pool this small, two slow
-	// readers would otherwise be the whole surface.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.cfg.RequestMaxDuration))
 	// The caller sees the vendor's own model field here, since this surface
 	// forwards the body untouched — but nothing on our side would, and a
 	// fallback is exactly the case somebody later has to explain.
@@ -529,8 +661,16 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// identity is asserted where it is created.
 	s.noteServedModel(ev, ev.PublicModelName, served)
 
+	relayGenerationID(w, resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if _, err := w.Write(body); err != nil {
+	// Bound the write to the client with the deadline chat's large answers
+	// get, sized to this answer (see largeWriteBudget). A slot, when one is
+	// held, is released only when the handler returns, and nothing else bounds
+	// a caller that reads its answer a byte at a time: upCtx covers the
+	// upstream call, and the server sets no write timeout.
+	var werr error
+	writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	if werr != nil {
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
 	} else {
@@ -654,10 +794,13 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 //
 // The rest are not close calls. `Accept-Encoding` would hand back a body this
 // surface cannot read. `User-Agent` describes the student's machine to a third
-// party for no benefit. Vendor attribution headers name the vendor in code
-// that is deliberately vendor-neutral, and would attribute a student's call to
-// our account regardless. `Content-Type` and `Authorization` are set by the
-// gateway itself and are not the client's to choose.
+// party for no benefit. Vendor attribution headers are refused on chat too,
+// because the vendor publishes attributed traffic under a URL anybody can name
+// (see chatHeaderAllowlist). The two chat forwards have no counterpart here:
+// the vendor documents its beta opt-ins for chat, and on these routes a
+// session id only groups requests in the account's own logs. `Content-Type`
+// and `Authorization` are set by the gateway itself and are not the client's
+// to choose.
 var passthroughHeaderAllowlist = []string{}
 
 // passthroughForwardedHeaders copies the allowlisted client headers, dropping
@@ -675,4 +818,53 @@ func passthroughForwardedHeaders(h http.Header) http.Header {
 		out[http.CanonicalHeaderKey(name)] = append([]string(nil), v...)
 	}
 	return out
+}
+
+// refuseOpenAIImageFields refuses the OpenAI image fields the vendor's image
+// endpoint cannot honour. None of them is in the vendor's request schema and
+// its documentation does not say what happens to them, so the likely outcome
+// is that they are dropped, and each one dropped changes the result without an
+// error:
+//
+//   - response_format "url": the vendor always answers base64, so data[].url
+//     would be empty and code reading it would fail later, away from the
+//     call. "b64_json" is what the vendor returns anyway and passes.
+//   - style: has no effect, so the image comes back without the style asked
+//     for. OpenAI itself retired it for its current image models.
+//   - moderation: the vendor takes it only as a provider option for OpenAI
+//     models (provider.options.openai.moderation); at the top level the
+//     default filtering applies instead of the level asked for.
+//
+// partial_images is not refused. It only acts on a stream, and this surface
+// refuses stream:true, so dropping it changes nothing the caller receives.
+func refuseOpenAIImageFields(params map[string]json.RawMessage) *apiError {
+	present := func(name string) (json.RawMessage, bool) {
+		raw, ok := params[name]
+		if !ok || string(bytes.TrimSpace(raw)) == "null" {
+			return nil, false
+		}
+		return raw, true
+	}
+	if raw, ok := present("response_format"); ok {
+		var format string
+		if json.Unmarshal(raw, &format) != nil {
+			e := errInvalidParamValue("response_format")
+			return &e
+		}
+		if format != "b64_json" {
+			e := errUnsupportedValue("response_format",
+				"이 경로는 이미지를 b64_json으로만 돌려줍니다. response_format을 빼거나 b64_json으로 보내주세요.")
+			return &e
+		}
+	}
+	if _, ok := present("style"); ok {
+		e := errUnsupportedValue("style", "style은 지원하지 않습니다. 원하는 스타일은 prompt에 적어주세요.")
+		return &e
+	}
+	if _, ok := present("moderation"); ok {
+		e := errUnsupportedValue("moderation",
+			"moderation은 이 위치에서 지원하지 않습니다. OpenAI 모델이면 provider.options.openai.moderation으로 보내주세요.")
+		return &e
+	}
+	return nil
 }

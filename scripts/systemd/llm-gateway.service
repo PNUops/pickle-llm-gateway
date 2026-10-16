@@ -55,12 +55,32 @@ SystemCallArchitectures=native
 # far above the in-flight cap rather than just above it.
 LimitNOFILE=65535
 TasksMax=512
-# The ceilings answer to the response read cap, not to normal traffic. A
-# response near that cap costs about 13 MB to buffer, decode and re-serialise,
-# so what the ladder below has to survive is a broken or hostile upstream
-# returning those in bulk — normal load sits two orders of magnitude under it.
-# Raising the in-flight cap moved that failure closer, which is why these grew
-# with it rather than after it.
+# The ceilings are sized for an 8 GiB container and answer to the large-body
+# pools plus the traffic that takes no slot. Each of the three chat large-body
+# slots, all of which one key may hold, can hold a 128 MiB answer (or one
+# stream event of that size), which costs about 3.2 times its size once
+# GOMEMLIMIT presses: about 1.2 GiB. The two passthrough large-body slots
+# cost a 25 MiB request three times over plus a 128 MiB answer 1.75 times
+# over: about 0.6 GiB. A large answer holds its slot until it is written,
+# under a write deadline, so the copy waiting on a slow reader is inside that
+# figure. That leaves about 3.2 GiB under GOMEMLIMIT for answers and events
+# under 8 MiB and requests under 2 MiB, chat and passthrough alike, which take
+# no slot and are bounded by LLMGW_MAX_IN_FLIGHT alone, against an estimated
+# class peak of about 3 GiB with that cap at 1,024. Each can reach about
+# 40 MiB, but that worst case is not part of the ladder at any in-flight cap
+# worth running: 1,024 of them would not fit any container, and a cap low
+# enough to fit them under a full pool (about 82 here) would refuse a whole
+# class at once. It cannot be reached without the vendor billing every one of
+# those answers, so the key's money limit bounds it. Measured, 1,024 ordinary
+# requests held at once came to 248 MB. The risk is a full pool meeting a
+# burst of near-8 MiB answers; its sign is MemoryHigh throttling in the
+# journal and inFlight on /metrics.
+# The multipliers come from the 2026-10-14 measurement; these values were
+# computed from them, not measured at this size. A 16 GiB container takes
+# MemoryMax=15872M, MemoryHigh=14848M, GOMEMLIMIT=13312MiB with sixteen chat
+# and twelve passthrough slots; the README has the table. A container smaller than MemoryMax
+# silently makes the container's limit the real one, with GOMEMLIMIT then
+# above it.
 #
 # MemoryMax stays below the container's own limit on purpose, and the gap is
 # not spare capacity — it decides which process dies. Were the two equal, the
@@ -70,18 +90,22 @@ TasksMax=512
 # Below it, the daemon always reaches its own ceiling first and dies alone.
 # The gap only has to cover the rest of the container, which measured 12 MB
 # idle plus page cache, so 512 MB is already generous.
-MemoryMax=3584M
+MemoryMax=7680M
 # A rung below the kill, so pressure from such an upstream shows up as
 # throttling and reclaim in the logs while the service still answers. Without
 # it the first symptom is a SIGKILL, and a restart takes every in-memory
 # rate-limit bucket with it — an OOM loop is a limit bypass.
-MemoryHigh=3072M
+MemoryHigh=6656M
 # Go sizes its heap from the machine, not from the cgroup, so without this it
 # grows toward twice the live heap and the cgroup kills the process before the
-# collector runs. Kept below both rungs so the collector acts first. Note it
-# governs the Go heap only: socket buffers count against MemoryMax and are
-# invisible here, which is part of why the gap to MemoryMax is wide.
-Environment=GOMEMLIMIT=2560MiB
+# collector runs. Kept below both rungs so the collector acts first, and above
+# the full-pool figure plus the class estimate above, both pressed: with every
+# slot full the collector is working hard, not losing. The gaps follow the
+# 16 GiB ladder: MemoryHigh a gigabyte under MemoryMax, this 1.5 GiB under that.
+# Note it governs the Go heap only: socket buffers count against MemoryMax and
+# are invisible here, which is why each gap below MemoryMax is a gigabyte or
+# more while the one above it, to the container, stays at 512 MB.
+Environment=GOMEMLIMIT=5120MiB
 
 [Install]
 WantedBy=multi-user.target

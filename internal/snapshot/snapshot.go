@@ -87,6 +87,20 @@ const (
 const (
 	EndpointImages     = "images"
 	EndpointEmbeddings = "embeddings"
+	// EndpointChat governs every completion surface, on both axes.
+	EndpointChat = "chat"
+	// The two below are parts of chat that cost money per use. They are
+	// judged from the chat body, on the money axis only, and a grant of either
+	// is meaningful only beside EndpointChat (the control plane enforces that).
+	EndpointWebSearch = "web_search"
+	EndpointPdfOcr    = "pdf_ocr"
+	// EndpointContainers governs the vendor's server tools that run commands
+	// in a hosted sandbox container. Like the two above it is a part of chat,
+	// judged from the chat body. Containers belong to the vendor account rather
+	// than to a key, and the id that picks one can be chosen by the caller or
+	// derived from a session value, so two keys can land in the same container.
+	// It stays ungranted until each key gets containers of its own.
+	EndpointContainers = "containers"
 )
 
 // reservedModelPrefixes are the prefixes reserved for curated self-serve
@@ -112,8 +126,8 @@ var reservedModelPrefixes = []string{"pickle-", "pnu-"}
 // THIS IS A PREFIX AND NOT A LIST OF NAMES, and the difference is the point. A
 // list was written first with the one name then known; it missed four more that
 // already existed and would have missed every one added later. That is how the
-// same defect was found three times in one round, the third time created by the
-// list itself. A read of the vendor's model listing (431 models, 2026-09-05)
+// same defect was found three times before the list was replaced, the third
+// time created by the list itself. A read of the vendor's model listing (431 models, 2026-09-05)
 // found six names under this vendor: auto, auto-beta, free, fusion,
 // pareto-code and bodybuilder, none of them a real model. **That listing is
 // not the whole catalogue** — the image models sit on a separate listing and
@@ -166,6 +180,36 @@ func IsRouterModelName(publicName string) bool {
 	return strings.HasPrefix(lower, routerVendorPrefix)
 }
 
+// routerPluginIDs are the `plugins` entries that configure one of the vendor's
+// routers. Each steers which model a router picks, and none names a model this
+// fence can judge: auto-router, auto-beta-router and jev-router take wildcard
+// patterns, pareto-router takes a score and a price, and switchyard-router
+// takes a judge model on top of picking the answering one. The vendor documents
+// each as read by its own router model, which a fenced key cannot call, so on
+// such a key the entry is either inert or steering something nobody judged.
+//
+// fusion is not here. It names its models outright and is judged rather than
+// refused (see the server's plugin fence).
+var routerPluginIDs = []string{
+	"auto-router",
+	"auto-beta-router",
+	"pareto-router",
+	"jev-router",
+	"switchyard-router",
+}
+
+// RouterPluginID returns the canonical id when a plugin id names a router, or
+// "" otherwise. The canonical form is what a refusal may echo, since the id as
+// sent is client input.
+func RouterPluginID(id string) string {
+	for _, known := range routerPluginIDs {
+		if strings.EqualFold(strings.TrimSpace(id), known) {
+			return known
+		}
+	}
+	return ""
+}
+
 // presetMarker attaches a saved configuration to a request. The vendor accepts
 // it three ways: a top-level "preset" field, a model named "@preset/slug", and
 // a model with one appended, "openai/gpt-4@preset/slug". A preset can carry the
@@ -199,7 +243,7 @@ func IsPresetModelName(publicName string) bool {
 //
 // The guards here close those six. THEY DO NOT CLOSE THE CLASS. The previous
 // version of this note said the same thing about five and was proved right
-// within the round, by the sixth. Nothing here can close it: the structural
+// soon after, by the sixth. Nothing here can close it: the structural
 // answer is to admit only names the vendor's catalogue calls a concrete model,
 // and the gateway has no catalogue (the control plane does). The vendor marks
 // selectors `tokenizer: Router`, so the discriminator exists and is not
@@ -207,6 +251,12 @@ func IsPresetModelName(publicName string) bool {
 //
 // When a seventh appears, the question is not which guard to add. It is whether
 // the catalogue belongs here.
+//
+// The seventh appeared (2026-10-10): the `plugins` field configures routers
+// and a fusion panel, and server tools left without a model have the vendor
+// choose one. They were closed the same way, case by case, because moving the
+// catalogue here is a separate decision that was not this change's to make.
+// The question above still stands.
 
 // IsReservedModelName reports whether a public model name sits under a
 // reserved self-serve prefix, current or retired. Such a name is served only
@@ -320,9 +370,12 @@ type Key struct {
 	// send the member at all, since a gateway too old to read it does not
 	// serve these routes either.
 	//
-	// Nothing here governs chat completions or the model catalogue: those keep
-	// the fences they already have, so this list can never take away something
-	// a key has today.
+	// It governs chat completions too (EndpointChat), on both axes. An empty
+	// list is therefore a key that can do nothing but read the model
+	// catalogue, which stays open to every key because it costs nothing. The
+	// control plane granted chat to every key that existed before this was
+	// enforced, so a document from a control plane too old to know the word
+	// shuts every key out of chat: roll back the gateway first.
 	PassthroughEndpoints []string `json:"passthroughEndpoints,omitempty"`
 	Limits               Limits   `json:"limits"`
 	QuotaExhausted       bool     `json:"quotaExhausted,omitempty"`
@@ -436,7 +489,7 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	// untrimmed, and a comparison that normalizes one side always leaks this
 	// way. For a catalogue model the name is a server value and cannot carry
 	// padding; for a passthrough model it is synthesized from the request
-	// string, so it is the caller's, and this round is what opens that surface.
+	// string, so it is the caller's, and passthrough is what opens that surface.
 	name := strings.ToLower(strings.TrimSpace(m.PublicName))
 	// A router name sidesteps both lists: whichever model it resolves to is
 	// what gets billed, and that model is chosen after this fence has run. A
@@ -451,7 +504,17 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	if k.HasCreditFence() && IsRouterModelName(name) {
 		return false
 	}
-	if len(k.CreditAllowedModels) > 0 && !matchesAnyCreditModel(k.CreditAllowedModels, name) {
+	// A bare vendor name is judged under its vendor prefix as well. The vendor
+	// resolves claude-opus-5-5 on its Messages route to anthropic/claude-opus-5.5
+	// and bills it as that (measured 2026-10-14, a made-up date suffix too), so
+	// a list written in vendor/model patterns has to reach it. The name sent is
+	// not changed; only the judgment reads both spellings. Allowed when either
+	// is allowed, denied when either is denied, denial still winning.
+	names := []string{name}
+	if alias := vendorQualifiedName(name); alias != "" {
+		names = append(names, alias)
+	}
+	if len(k.CreditAllowedModels) > 0 && !anyMatches(k.CreditAllowedModels, names) {
 		return false
 	}
 	// The two lists deliberately part company on the tilde, and this is the one
@@ -469,13 +532,46 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	// So a denial is tested against the tilde-stripped name as well. Denying
 	// wider costs nothing: the worst case is refusing an alias of a model
 	// somebody had already decided this key may not use.
-	if matchesAnyCreditModel(k.CreditDeniedModels, name) {
-		return false
-	}
-	if stripped := strings.TrimLeft(name, "~"); stripped != name {
-		return !matchesAnyCreditModel(k.CreditDeniedModels, stripped)
+	for _, n := range names {
+		if matchesAnyCreditModel(k.CreditDeniedModels, n) {
+			return false
+		}
+		if stripped := strings.TrimLeft(n, "~"); stripped != n &&
+			matchesAnyCreditModel(k.CreditDeniedModels, stripped) {
+			return false
+		}
 	}
 	return true
+}
+
+// bareNameVendors are the bare model-name prefixes the vendor resolves to one
+// of its vendors. Only claude- is known to resolve; any other bare name keeps
+// being judged as written.
+var bareNameVendors = []struct{ prefix, vendor string }{
+	{"claude-", "anthropic"},
+}
+
+// vendorQualifiedName is a lower-cased bare name under the vendor it
+// resolves to, or "" when it has a vendor already or none is known.
+func vendorQualifiedName(lowerName string) string {
+	if strings.Contains(lowerName, "/") {
+		return ""
+	}
+	for _, b := range bareNameVendors {
+		if strings.HasPrefix(lowerName, b.prefix) {
+			return b.vendor + "/" + lowerName
+		}
+	}
+	return ""
+}
+
+func anyMatches(patterns, names []string) bool {
+	for _, n := range names {
+		if matchesAnyCreditModel(patterns, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchesAnyCreditModel reports whether any pattern in one already-normalized

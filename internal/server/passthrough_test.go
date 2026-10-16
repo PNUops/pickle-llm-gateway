@@ -21,7 +21,7 @@ func passthroughDoc(endpoints ...string) func(*snapshot.Document) {
 	return func(d *snapshot.Document) {
 		d.PassthroughRef = "mock"
 		d.Keys[0].UpstreamCredentials = map[string]string{"mock": upstreamCred}
-		d.Keys[0].PassthroughEndpoints = endpoints
+		d.Keys[0].PassthroughEndpoints = append([]string{snapshot.EndpointChat}, endpoints...)
 	}
 }
 
@@ -55,7 +55,7 @@ func (h *harness) passthrough(t *testing.T, method, path, token, body string) (i
 
 const imageBody = `{"model":"openai/gpt-image-1","prompt":"a cat"}`
 
-// The fence is the whole point of the round: a key that exists today carries
+// The fence is the point of the grant model: a key that exists today carries
 // no endpoint grant, and must not reach a single new path because the gateway
 // learned to serve them.
 func TestPassthroughEndpointFenceClosedByDefault(t *testing.T) {
@@ -499,11 +499,18 @@ func TestPassthroughCapsAreSeparateFromChat(t *testing.T) {
 	}
 }
 
-// The passthrough pool is separate from the gateway-wide one. The property
-// that matters is concurrency, so this occupies the passthrough slots and
-// holds them there while chat is exercised — a version of this test that only
-// made requests in sequence passed with one shared pool, which is to say it
-// tested nothing.
+// The passthrough large-body pool is separate from chat's. The property that
+// matters is concurrency, so this occupies the passthrough slots and holds
+// them there while chat is exercised — a version of this test that only made
+// requests in sequence passed with one shared pool, which is to say it tested
+// nothing.
+//
+// Until the pool admitted only large bodies, every passthrough request took a
+// slot and a full pool answered 503 server_busy. It now admits only requests
+// past the ordinary bound (and answers past the relay bound), so the parked
+// requests here are large ones and a full pool answers chat's 429
+// large_request_busy with its Retry-After. A pool of zero no longer closes the
+// surface: it closes the large path, as on chat.
 func TestPassthroughSlotPoolIsSeparate(t *testing.T) {
 	const slots = 2
 	release := make(chan struct{})
@@ -515,7 +522,9 @@ func TestPassthroughSlotPoolIsSeparate(t *testing.T) {
 	// rather than a failed one.
 	t.Cleanup(unpark)
 	var parked sync.WaitGroup
+	smallBound := func(c *config.Config) { c.RequestBodyMaxBytes = 256 }
 	h := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
+		smallBound(c)
 		c.PassthroughMaxInFlight = slots
 	})
 	// Park every passthrough slot inside the upstream call.
@@ -524,7 +533,7 @@ func TestPassthroughSlotPoolIsSeparate(t *testing.T) {
 	for i := 0; i < slots; i++ {
 		go func() {
 			defer parked.Done()
-			h.passthroughStatus(http.MethodPost, "/v1/images", testToken, imageBody)
+			h.passthroughStatus(http.MethodPost, "/v1/images", testToken, largeImageBody)
 		}()
 	}
 	// Wait until the upstream has actually been entered by both, so the slots
@@ -540,13 +549,16 @@ func TestPassthroughSlotPoolIsSeparate(t *testing.T) {
 		t.Fatalf("passthrough in flight %d, want %d", got, slots)
 	}
 
-	// The surface is full: another passthrough request is refused, and refused
+	// The pool is full: another large request is refused, and refused
 	// without reaching the upstream. The probe carries its own short deadline
 	// so that a pool which is not actually bounded fails here with a timeout
 	// rather than parking this test forever.
-	status, body := h.passthroughProbe(t, imageBody, 3*time.Second)
-	if status != http.StatusServiceUnavailable || errCode(t, body) != "server_busy" {
+	status, hdr, body := h.passthroughProbe(t, largeImageBody, 3*time.Second)
+	if status != http.StatusTooManyRequests || errCode(t, body) != "large_request_busy" {
 		t.Fatalf("full pool: %d %s", status, body)
+	}
+	if hdr.Get("Retry-After") != "5" {
+		t.Fatalf("full pool Retry-After %q", hdr.Get("Retry-After"))
 	}
 	if got := h.mock.blockedCount(); got != slots {
 		t.Fatalf("a refused request still reached the upstream: %d parked, want %d", got, slots)
@@ -561,20 +573,36 @@ func TestPassthroughSlotPoolIsSeparate(t *testing.T) {
 	if got := h.srv.PassthroughInFlight(); got != 0 {
 		t.Fatalf("slot leaked: %d", got)
 	}
+	// A large request refused after it took its slot gives the slot back.
+	status, body = h.passthrough(t, http.MethodPost, "/v1/images", testToken,
+		`{"model":"openai/gpt-image-1","prompt":"`+strings.Repeat("a", 1024))
+	if status != http.StatusBadRequest || errCode(t, body) != "invalid_json" {
+		t.Fatalf("broken large body: %d %s", status, body)
+	}
+	if got := h.srv.PassthroughInFlight(); got != 0 {
+		t.Fatalf("slot leaked by a refusal: %d", got)
+	}
 
-	// A pool with no capacity at all refuses rather than opening the surface.
+	// A pool with no capacity closes the large path and nothing else.
 	h2 := newHarness(t, passthroughDoc(snapshot.EndpointImages), func(c *config.Config) {
+		smallBound(c)
 		c.PassthroughMaxInFlight = 0
 	})
-	status, body = h2.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody)
-	if status != http.StatusServiceUnavailable || errCode(t, body) != "server_busy" {
-		t.Fatalf("zero pool: %d %s", status, body)
+	status, body = h2.passthrough(t, http.MethodPost, "/v1/images", testToken, largeImageBody)
+	if status != http.StatusBadRequest || errCode(t, body) != "request_too_large" {
+		t.Fatalf("zero pool, large request: %d %s", status, body)
+	}
+	if status, body := h2.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody); status != 200 {
+		t.Fatalf("zero pool, small request: %d %s", status, body)
 	}
 }
 
+// largeImageBody is past the 256-byte ordinary bound the pool tests set.
+var largeImageBody = `{"model":"openai/gpt-image-1","prompt":"` + strings.Repeat("a", 1024) + `"}`
+
 // passthroughProbe is one passthrough request with its own deadline, for the
 // tests where hanging is the failure being guarded against.
-func (h *harness) passthroughProbe(t *testing.T, body string, timeout time.Duration) (int, []byte) {
+func (h *harness) passthroughProbe(t *testing.T, body string, timeout time.Duration) (int, http.Header, []byte) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/images", strings.NewReader(body))
 	if err != nil {
@@ -592,7 +620,7 @@ func (h *harness) passthroughProbe(t *testing.T, body string, timeout time.Durat
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resp.StatusCode, out
+	return resp.StatusCode, resp.Header, out
 }
 
 func (h *harness) passthroughStatus(method, path, token, body string) int {
@@ -805,9 +833,9 @@ func TestPassthroughRefusalNamesTheCapability(t *testing.T) {
 	}
 }
 
-// The old vocabulary must not spread into the strings this round adds. The
+// The old vocabulary must not spread into the passthrough strings. The
 // display terms are 유료 모델 and 자체 서빙 모델; 상용 모델 is retired, and the
-// axis words belong to the design docs, not to anything a student reads.
+// axis words are internal terms that nothing a student reads carries.
 func TestPassthroughMessagesUseCurrentVocabulary(t *testing.T) {
 	for _, e := range []apiError{
 		errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages)),

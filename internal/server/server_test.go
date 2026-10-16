@@ -257,6 +257,7 @@ func defaultDoc() snapshot.Document {
 		}},
 		Keys: []snapshot.Key{{
 			KeyID: "k-test", TokenHash: snapshot.HashToken(testToken), Status: snapshot.KeyActive,
+			PassthroughEndpoints: []string{snapshot.EndpointChat},
 		}},
 	}
 }
@@ -291,9 +292,9 @@ func newHarness(t *testing.T, mutateDoc func(*snapshot.Document), mutateCfg func
 		UpstreamHeaderWait:  5 * time.Second,
 		RequestMaxDuration:  30 * time.Second,
 		MaxInFlight:         16,
-		// The passthrough surface fails closed on a zero slot count, so a
-		// harness that left these unset would 503 every passthrough test for
-		// the wrong reason.
+		// A zero slot count closes the passthrough large path and a zero cap
+		// refuses every body, so a harness that left these unset would fail
+		// passthrough tests for the wrong reason.
 		PassthroughRequestBodyMaxBytes: 1 << 20,
 		PassthroughResponseMaxBytes:    1 << 20,
 		PassthroughHeaderWait:          5 * time.Second,
@@ -683,6 +684,10 @@ func TestOutputCapRefusal(t *testing.T) {
 	status, body := h.chat(t, testToken, `{"model":"pickle-general","messages":[],"max_tokens":999999}`)
 	if status != 400 || errCode(t, body) != "output_limit_exceeded" {
 		t.Fatalf("got %d %s", status, body)
+	}
+	// The refusal says which field and how far down.
+	if !strings.Contains(string(body), "max_tokens 값을 4096 이하로") {
+		t.Fatalf("message without the cap: %s", body)
 	}
 }
 
@@ -1119,7 +1124,8 @@ func TestRestrictedModelHiddenAndDenied(t *testing.T) {
 			Visibility: snapshot.ModelRestricted})
 		d.Keys = append(d.Keys, snapshot.Key{
 			KeyID: "k-priv", TokenHash: snapshot.HashToken("pickle-priv"), Status: snapshot.KeyActive,
-			AllowedModels: []string{"pickle-general", "pickle-internal"}})
+			AllowedModels:        []string{"pickle-general", "pickle-internal"},
+			PassthroughEndpoints: []string{snapshot.EndpointChat}})
 	}, nil)
 
 	// Open key: list excludes the restricted model, chat is denied, retrieve 404.
@@ -1336,7 +1342,7 @@ func TestBodyCaptureOnlyForOptedInKeys(t *testing.T) {
 		d.Keys[0].RecordBodies = true
 		d.Keys = append(d.Keys, snapshot.Key{
 			KeyID: "k-plain", TokenHash: snapshot.HashToken("pickle-plain"),
-			Status: snapshot.KeyActive})
+			Status: snapshot.KeyActive, PassthroughEndpoints: []string{snapshot.EndpointChat}})
 	}, nil)
 	cb := h.withBodyCapture(t)
 
@@ -1999,7 +2005,7 @@ func allAPIErrors() map[string]apiError {
 		"errRateRequests":      errRateRequests, "errRateTokens": errRateTokens,
 		"errRateConcurrency": errRateConcurrency, "errServiceDisabled": errServiceDisabled,
 		"errModelNotFound": errModelNotFound, "errModelNotAllowed": errModelNotAllowed,
-		"errOutputTooLong": errOutputTooLong, "errInputTooLong": errInputTooLong,
+		"errOutputTooLong(x, 1)": errOutputTooLong("x", 1), "errInputTooLong": errInputTooLong,
 		"errRequestTooLarge": errRequestTooLarge, "errBadJSON": errBadJSON,
 		"errUpstream": errUpstream, "errUpstreamTimeout": errUpstreamTimeout,
 		"errUpstreamRejected": errUpstreamRejected,
@@ -2008,13 +2014,14 @@ func allAPIErrors() map[string]apiError {
 		"errUnsupportedParam(x)":  errUnsupportedParam("x"),
 		"errInvalidParamValue(x)": errInvalidParamValue("x"),
 		"errMissingParam(x)":      errMissingParam("x"),
-		// Added by the passthrough round. A new error that is not listed here
+		// Added with the passthrough endpoints. A new error that is not listed here
 		// is one the leak check never reads.
 		"errCreditPending":               errCreditPending,
 		"errPresetNotAllowed":            errPresetNotAllowed,
 		"errPassthroughNoStreaming":      errPassthroughNoStreaming,
 		"errPassthroughResponseTooLarge": errPassthroughResponseTooLarge,
 		"errEndpointNotAllowed(x)":       errEndpointNotAllowed("x"),
+		"errContainerToolNotAllowed(x)":  errContainerToolNotAllowed("x"),
 		"errCandidateModelNotAllowed(x)": errCandidateModelNotAllowed("x"),
 		"errToolModelNotAllowed(x)":      errToolModelNotAllowed("x"),
 		"errRouterModelNotAllowed(x)":    errRouterModelNotAllowed("x"),
@@ -2040,6 +2047,9 @@ func allAPIErrors() map[string]apiError {
 var sharedCodes = map[string]bool{
 	"model_not_allowed":     true,
 	"unsupported_parameter": true,
+	// A container tool refused for a missing grant is a missing grant; only the
+	// advice differs, because that grant cannot be asked for yet.
+	"endpoint_not_allowed": true,
 }
 
 func TestEveryAPIErrorIsWellFormed(t *testing.T) {

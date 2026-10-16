@@ -1,5 +1,6 @@
 // Package server terminates the student-facing OpenAI-compatible surface:
-// GET /v1/models and POST /v1/chat/completions, the passthrough routes in
+// GET /v1/models and POST /v1/chat/completions, the Anthropic-compatible
+// POST /v1/messages (messages.go), the passthrough routes in
 // passthrough.go, and a local health probe. Every request is authenticated
 // against the snapshot and metered into the usage spool. Request and response
 // bodies are never logged.
@@ -30,13 +31,20 @@ type Server struct {
 	log      *slog.Logger
 	client   *http.Client
 	inFlight chan struct{}
-	// The passthrough surface's own transport and slot pool. Separate from the
-	// two above so that neither its header wait nor its concurrency can move
-	// what chat does, and so the memory this surface can hold is one
-	// multiplication with a bounded slot count in it — see config.
-	passthroughClient   *http.Client
-	passthroughInFlight chan struct{}
-	now                 func() time.Time
+	// The passthrough surface's own transport and large-body pool. Separate
+	// from chat's so that neither its header wait nor its large answers can
+	// move what chat does, and so the memory its large bodies can hold is one
+	// multiplication with a bounded slot count in it — see config. Small
+	// passthrough requests take no slot here, only the gateway-wide one.
+	passthroughClient *http.Client
+	passthroughLarge  *largeBodySlots
+	// chatLarge admits chat bodies and non-streamed chat responses above the
+	// ordinary bound; nil when the pool is configured off.
+	chatLarge *largeBodySlots
+	// costs holds the generation lookups of streams that ended without a
+	// cost; see generation_cost.go.
+	costs *generationCosts
+	now   func() time.Time
 }
 
 // New wires a Server. The shared HTTP client waits bounded time for upstream
@@ -61,12 +69,19 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 				ResponseHeaderTimeout: cfg.PassthroughHeaderWait,
 				MaxIdleConnsPerHost:   16,
 				IdleConnTimeout:       90 * time.Second,
+				// Ask for an identity body so the declared length reaches
+				// the response: a gzip answer arrives with ContentLength -1,
+				// which sends every large answer down the growing-buffer
+				// path instead of the sized read the memory budget assumes.
+				DisableCompression: true,
 			},
 		},
-		passthroughInFlight: make(chan struct{}, cfg.PassthroughMaxInFlight),
-		health:              newUpstreamHealth(nil),
-		metrics:             &counters{},
-		now:                 time.Now,
+		passthroughLarge: newLargeBodySlots(cfg.PassthroughMaxInFlight),
+		chatLarge:        newLargeBodySlots(cfg.ChatLargeBodySlots),
+		health:           newUpstreamHealth(nil),
+		metrics:          &counters{},
+		costs:            newGenerationCosts(),
+		now:              time.Now,
 	}
 }
 
@@ -75,9 +90,10 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 // nothing acts on it.
 func (s *Server) InFlight() int { return len(s.inFlight) }
 
-// PassthroughInFlight is the same gauge for the passthrough surface's own
-// pool, which is bounded separately and much lower.
-func (s *Server) PassthroughInFlight() int { return len(s.passthroughInFlight) }
+// PassthroughInFlight is how many of the passthrough surface's large-body
+// slots are taken. The name predates the split: a small passthrough request
+// takes a gateway-wide slot only and is counted by InFlight, not here.
+func (s *Server) PassthroughInFlight() int { return s.passthroughLarge.inUse() }
 
 // SetBodySink enables prompt/response capture for keys that opted in. Without
 // a sink no capture happens at all, whatever the snapshot says — the channel
@@ -92,11 +108,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/models/", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	// The Anthropic Messages surface. Nothing under it is served beyond the
+	// route itself: the token-counting route has nothing upstream to forward
+	// to, and it and every other subpath are answered as unknown, in this
+	// surface's own envelope so an Anthropic client can read the refusal.
+	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/messages/", s.handleMessagesUnknown)
 	// The passthrough surface. Every pattern here is exact, so none of them
 	// competes with the "/v1/models/" subtree above: a request for
 	// /v1/models/{id} still matches the more specific subtree pattern, and
 	// /v1/images/models matches its own exact pattern rather than either.
 	mux.HandleFunc("/v1/images", s.handlePassthrough(routeImages))
+	mux.HandleFunc("/v1/images/generations", s.handlePassthrough(routeImageGenerations))
 	mux.HandleFunc("/v1/images/models", s.handlePassthrough(routeImageModels))
 	mux.HandleFunc("/v1/embeddings", s.handlePassthrough(routeEmbeddings))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -146,15 +169,34 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // without it the event says only that somebody was turned away. Only a token
 // that matched nothing (or was never presented) has no owner to name.
 func (s *Server) authenticate(r *http.Request, lookup func(string) *snapshot.Key) (*snapshot.Key, *apiError) {
+	token, missing := bearerToken(r)
+	if missing != nil {
+		return nil, missing
+	}
+	return s.authenticateToken(token, lookup)
+}
+
+// bearerToken reads the key from Authorization: Bearer, the one place an
+// OpenAI-compatible client sends it.
+func bearerToken(r *http.Request) (string, *apiError) {
+	if token := bearerValue(r); token != "" {
+		return token, nil
+	}
+	return "", &errMissingKey
+}
+
+// bearerValue is the token in Authorization: Bearer, or "" when there is none.
+func bearerValue(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	const scheme = "bearer "
 	if len(h) <= len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
-		return nil, &errMissingKey
+		return ""
 	}
-	token := strings.TrimSpace(h[len(scheme):])
-	if token == "" {
-		return nil, &errMissingKey
-	}
+	return strings.TrimSpace(h[len(scheme):])
+}
+
+// authenticateToken is authenticate for a token already read off the request.
+func (s *Server) authenticateToken(token string, lookup func(string) *snapshot.Key) (*snapshot.Key, *apiError) {
 	key := lookup(snapshot.HashToken(token))
 	if key == nil {
 		return nil, &errInvalidKey
@@ -187,19 +229,59 @@ func entryFor(m *snapshot.Model) modelEntry {
 	return modelEntry{ID: m.PublicName, Object: "model", Created: modelsCreatedEpoch, OwnedBy: "pnu-cloud"}
 }
 
+// anthropicModelEntry is one model in the shape Anthropic's models API uses,
+// which its SDKs and agent clients read when they send anthropic-version.
+type anthropicModelEntry struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// modelsCreatedAt is modelsCreatedEpoch in the RFC 3339 form that shape uses.
+var modelsCreatedAt = time.Unix(modelsCreatedEpoch, 0).UTC().Format(time.RFC3339)
+
+func anthropicEntryFor(m *snapshot.Model) anthropicModelEntry {
+	return anthropicModelEntry{Type: "model", ID: m.PublicName, DisplayName: m.PublicName, CreatedAt: modelsCreatedAt}
+}
+
+// The models route answers two client families from one path, and the
+// anthropic-version header is what tells them apart: an Anthropic client
+// sends it on every request and an OpenAI one never does. The list and the
+// refusals both follow it, so neither family is handed a shape it cannot read.
+// What the list contains is the same either way.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	anthropic := r.Header.Get("Anthropic-Version") != ""
+	fail := func(e apiError) {
+		if anthropic {
+			writeAnthropicError(w, e, "")
+			return
+		}
+		writeAPIError(w, e)
+	}
 	if r.Method != http.MethodGet {
-		writeAPIError(w, errMethod)
+		fail(errMethod)
 		return
 	}
 	doc, keyLookup, modelLookup := s.store.Current()
 	if !doc.ServiceEnabled {
-		writeAPIError(w, errServiceDisabled)
+		fail(errServiceDisabled)
 		return
 	}
-	key, authErr := s.authenticate(r, keyLookup)
+	// An Anthropic client reads its key the way /v1/messages does, x-api-key
+	// included, so the SDK's model listing works with the same configuration
+	// as its requests.
+	readToken := bearerToken
+	if anthropic {
+		readToken = messagesToken
+	}
+	token, authErr := readToken(r)
+	var key *snapshot.Key
+	if authErr == nil {
+		key, authErr = s.authenticateToken(token, keyLookup)
+	}
 	if authErr != nil {
-		writeAPIError(w, *authErr)
+		fail(*authErr)
 		return
 	}
 
@@ -223,26 +305,52 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		// it will not serve exists, and a restricted key learning which names
 		// are real would undo that.
 		if m == nil || !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
-			writeAPIError(w, errModelNotFound)
+			fail(errModelNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if anthropic {
+			writeJSON(w, anthropicEntryFor(m))
+			return
+		}
 		writeJSON(w, entryFor(m))
 		return
 	}
 
-	list := struct {
-		Object string       `json:"object"`
-		Data   []modelEntry `json:"data"`
-	}{Object: "list", Data: []modelEntry{}}
+	var models []*snapshot.Model
 	for i := range doc.Models {
 		m := &doc.Models[i]
 		if !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
 			continue
 		}
-		list.Data = append(list.Data, entryFor(m))
+		models = append(models, m)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if anthropic {
+		// One page holds the whole list, so there is never a next one; the
+		// two ids are the page's ends, null on an empty page.
+		page := struct {
+			Data    []anthropicModelEntry `json:"data"`
+			HasMore bool                  `json:"has_more"`
+			FirstID *string               `json:"first_id"`
+			LastID  *string               `json:"last_id"`
+		}{Data: []anthropicModelEntry{}}
+		for _, m := range models {
+			page.Data = append(page.Data, anthropicEntryFor(m))
+		}
+		if n := len(page.Data); n > 0 {
+			page.FirstID, page.LastID = &page.Data[0].ID, &page.Data[n-1].ID
+		}
+		writeJSON(w, page)
+		return
+	}
+	list := struct {
+		Object string       `json:"object"`
+		Data   []modelEntry `json:"data"`
+	}{Object: "list", Data: []modelEntry{}}
+	for _, m := range models {
+		list.Data = append(list.Data, entryFor(m))
+	}
 	writeJSON(w, list)
 }
 

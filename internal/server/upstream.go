@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +28,9 @@ type attemptError struct {
 	// generic upstream failure.
 	throttled bool
 	refusal   *apiError
+	// retryAfter is the vendor's own wait on a 429 or 503, in seconds, empty
+	// when it gave none. It is relayed only on the money axis.
+	retryAfter string
 }
 
 // upstreamHealth tracks consecutive failures per upstream so a dead one stops
@@ -176,8 +178,8 @@ func (h *upstreamHealth) recordSuccess(ref string) {
 // The returned count is how many upstream attempts were made, including the
 // one that succeeded: 1 is the ordinary path and anything above it means the
 // request cost more than it looks like it did.
-func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *snapshot.Key,
-	params map[string]json.RawMessage, outputCap int) (*http.Response, config.Upstream, int, *attemptError) {
+func (s *Server) callUpstream(ctx context.Context, p *protocol, model *snapshot.Model, key *snapshot.Key,
+	params map[string]json.RawMessage, outputCap int, clientHeaders http.Header) (*http.Response, config.Upstream, int, *attemptError) {
 	attempts := 0
 
 	refs := []string{model.UpstreamRef}
@@ -202,6 +204,10 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 	}
 
 	var last *attemptError
+	// waitFor is the longest wait any upstream asked for. A fallback that
+	// answers with a shorter one does not make the first one's request to
+	// back off any less true.
+	waitFor := ""
 	// The last upstream a request was actually sent to. On total failure the
 	// caller still has to record who was tried, and `up` below is scoped to
 	// the loop. It stays zero-valued while nothing has been contacted, which
@@ -230,19 +236,26 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 			}
 		}
 		lastUp = up
-		body, err := s.bodyFor(params, up, outputCap)
+		capField := p.capWriteField
+		if capField == "" {
+			capField = up.CapField
+		}
+		body, err := bodyFor(params, capField, outputCap)
 		if err != nil {
 			return nil, up, attempts, &attemptError{err: err}
 		}
 		for attempt := 0; attempt <= s.cfg.UpstreamRetries; attempt++ {
 			attempts++
 			s.health.recordAttempt(ref)
-			resp, ae := s.attempt(ctx, up, body, cred, model.CreditAxis())
+			resp, ae := s.do(ctx, up, attemptFor(p, s.client, body, cred, model, clientHeaders))
 			if ae == nil {
 				s.health.recordSuccess(ref)
 				return resp, up, attempts, nil
 			}
 			s.health.recordPassiveFailure(ref, ae.kind)
+			if longerWait(ae.retryAfter, waitFor) {
+				waitFor = ae.retryAfter
+			}
 			last = ae
 			if ae.refusal != nil {
 				// The upstream understood and refused: another upstream would
@@ -290,12 +303,13 @@ func (s *Server) callUpstream(ctx context.Context, model *snapshot.Model, key *s
 	if last == nil {
 		last = &attemptError{err: errUnconfiguredUpstream}
 	}
+	last.retryAfter = waitFor
 	return nil, lastUp, attempts, last
 }
 
 // bodyFor renders the request for one upstream, injecting the output cap on
 // the field that upstream honors.
-func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, outputCap int) ([]byte, error) {
+func bodyFor(params map[string]json.RawMessage, capField string, outputCap int) ([]byte, error) {
 	if outputCap <= 0 {
 		return json.Marshal(params)
 	}
@@ -303,7 +317,7 @@ func (s *Server) bodyFor(params map[string]json.RawMessage, up config.Upstream, 
 	for k, v := range params {
 		out[k] = v
 	}
-	out[up.CapField] = json.RawMessage(strconv.Itoa(outputCap))
+	out[capField] = json.RawMessage(strconv.Itoa(outputCap))
 	return json.Marshal(out)
 }
 
@@ -329,6 +343,37 @@ type attemptSpec struct {
 	// headers are the client headers an allowlist chose to forward. The
 	// gateway's own Content-Type and Authorization are set after these and win.
 	headers http.Header
+	// upstreamModel and publicModel let a relayed rejection name the model the
+	// way the caller does. The swap has to happen on the raw message, before
+	// it is cleaned and cut: a cut through the id leaves a fragment no later
+	// replacement can recognise. Empty on the passthrough surface, where the
+	// name forwarded is already the caller's own.
+	upstreamModel string
+	publicModel   string
+}
+
+// attemptFor is the shape of one call on a surface for a model. Client
+// headers go only to a money-axis model: those are the vendor's features on
+// the student's own vendor key, while a self-hosted server has no use for
+// them and they would describe the student to the platform's own upstream.
+// The surface picks which headers; the axis decides whether any go at all,
+// and that decision stays here so no surface can forget it.
+func attemptFor(p *protocol, client *http.Client, body []byte, cred string, model *snapshot.Model, clientHeaders http.Header) attemptSpec {
+	var headers http.Header
+	if model.CreditAxis() {
+		headers = p.requestHeaders(clientHeaders)
+	}
+	return attemptSpec{
+		headers:       headers,
+		client:        client,
+		method:        http.MethodPost,
+		path:          p.upstreamPath,
+		body:          body,
+		cred:          cred,
+		creditAxis:    model.CreditAxis(),
+		upstreamModel: model.UpstreamModel,
+		publicModel:   model.PublicName,
+	}
 }
 
 // attempt performs one chat-completions call carrying the given bearer (empty
@@ -348,13 +393,23 @@ func (s *Server) attempt(ctx context.Context, up config.Upstream, body []byte, c
 
 // do performs one upstream call and classifies its outcome.
 func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (*http.Response, *attemptError) {
-	var reader io.Reader = http.NoBody
+	// The body goes through a holder the caller can empty once the headers
+	// are in (see upstreamBody), found again through the request context.
+	var holder *upstreamBody
 	if spec.body != nil {
-		reader = bytes.NewReader(spec.body)
+		holder = &upstreamBody{b: spec.body}
+		ctx = context.WithValue(ctx, upstreamBodyKey{}, holder)
 	}
-	req, err := http.NewRequestWithContext(ctx, spec.method, up.BaseURL+spec.path, reader)
+	req, err := http.NewRequestWithContext(ctx, spec.method, up.BaseURL+spec.path, http.NoBody)
 	if err != nil {
 		return nil, &attemptError{err: err, kind: failureInvalidResponse}
+	}
+	if holder != nil {
+		// Set by hand: net/http only infers the length and the rewind for its
+		// own reader types, and without a length the body would go chunked.
+		req.Body = holder.reader()
+		req.GetBody = func() (io.ReadCloser, error) { return holder.reader(), nil }
+		req.ContentLength = int64(len(spec.body))
 	}
 	for name, values := range spec.headers {
 		req.Header[name] = values
@@ -381,14 +436,16 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 	if resp.StatusCode == http.StatusOK {
 		return resp, nil
 	}
-	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	detail, _ := io.ReadAll(io.LimitReader(resp.Body, rejectionReadLimit))
 	resp.Body.Close()
 	s.log.Warn("upstream refused request", "status", resp.StatusCode,
 		"upstreamRef", up.Ref, "detail", upstreamReason(detail))
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		// The request itself is wrong; no other upstream will like it better.
-		return nil, &attemptError{refusal: &errUpstreamRejected, kind: failureRequestRejected}
+		// The caller gets the upstream's reason, cleaned (see rejection.go).
+		refusal := upstreamRejection(resp.StatusCode, detail, spec.upstreamModel, spec.publicModel)
+		return nil, &attemptError{refusal: &refusal, kind: failureRequestRejected}
 	case http.StatusTooManyRequests:
 		// The upstream is throttling us. Retrying immediately makes it worse,
 		// and the student should be told the service is busy rather than that
@@ -398,7 +455,8 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if creditAxis {
 			kind = failureKeyThrottled
 		}
-		return nil, &attemptError{err: errUpstreamThrottled, throttled: true, kind: kind}
+		return nil, &attemptError{err: errUpstreamThrottled, throttled: true, kind: kind,
+			retryAfter: upstreamRetryAfter(resp.Header)}
 	case http.StatusUnauthorized, http.StatusForbidden:
 		// Our credential, not the student's problem — and not something a
 		// retry fixes. Fall through to another upstream if one exists.
@@ -428,7 +486,11 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if resp.StatusCode >= http.StatusInternalServerError {
 			kind = failureUpstream
 		}
-		return nil, &attemptError{err: errUpstreamStatus, kind: kind}
+		ae := &attemptError{err: errUpstreamStatus, kind: kind}
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			ae.retryAfter = upstreamRetryAfter(resp.Header)
+		}
+		return nil, ae
 	}
 }
 
