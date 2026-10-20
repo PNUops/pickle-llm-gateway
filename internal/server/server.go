@@ -136,6 +136,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/images/generations", s.handlePassthrough(routeImageGenerations))
 	mux.HandleFunc("/v1/images/models", s.handlePassthrough(routeImageModels))
 	mux.HandleFunc("/v1/embeddings", s.handlePassthrough(routeEmbeddings))
+	mux.HandleFunc("/v1/rerank", s.handlePassthrough(routeRerank))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound)
 	})

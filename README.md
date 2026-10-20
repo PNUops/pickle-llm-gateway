@@ -21,7 +21,7 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 학생 코드에는 공개 모델명만 보입니다. 실제 모델과 업스트림 주소는 게이트웨이 설정에만
 있으므로, 업스트림을 교체해도 학생 코드는 바뀌지 않습니다.
 
-아래 넷은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
+아래 다섯은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
 돌려줍니다. 전부 유료 모델이므로 비용은 그 Key에 부여된 금액 한도에서 나갑니다. Key마다
 허용된 경로만 열리고 기본값은 전부 닫힘입니다.
 
@@ -31,6 +31,14 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 | `POST /v1/images/generations` | 이미지 생성 (`images`) |
 | `GET /v1/images/models` | 이미지 생성 (`images`) |
 | `POST /v1/embeddings` | 임베딩 (`embeddings`) |
+| `POST /v1/rerank` | 리랭크 (`rerank`) |
+
+`POST /v1/rerank`는 OpenAI나 Anthropic이 아니라 Cohere, Voyage 같은 API의 리랭크 호출입니다. 질의와 문서 목록을 받아
+관련도 순서를 돌려줍니다. 사용량은 응답의 `usage`에서 읽되 업스트림 문서상 선택 필드이고, 모델에 따라 토큰 수
+(`total_tokens`)와 금액이 오거나 토큰 없이 검색 단위(`search_units`)와 금액만 옵니다. 토큰이 없으면 0으로 기록하고 본문
+크기로 추정하지 않습니다. 금액이 없으면 응답 본문의 `id`로 생성 기록을 조회해 채웁니다(이 경로는 `X-Generation-Id` 헤더가
+없습니다). 응답의 `model`은 서빙 공급자의 원래 이름(예: `rerank-v3.5`)이라 요청한 이름과 비교하지 않고, 기록의 모델 이름은
+요청한 이름입니다.
 
 `/v1/chat/completions`도 기능 권한 `chat`이 있는 Key에만 열립니다. 자체 서빙 모델과 유료 모델
 모두에 적용되고, 채팅 없이 다른 기능만 쓰는 Key가 있기 때문에 기본으로 부여하지 않습니다.
@@ -423,6 +431,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
+| `rerank` | `POST /v1/rerank` |
 | `containers` | 유료 모델 채팅의 샌드박스 명령과 코드 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`, `local_shell`), `openrouter:bash` 도구와 날짜 없는 `bash`, `code_interpreter`. **아직 부여하지 않습니다** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은
