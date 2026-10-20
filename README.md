@@ -10,7 +10,8 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 ```
 학생 코드 (OpenAI SDK + API Key)
     │  POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
-    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
+    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank
+    │  POST /v1/audio/speech
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
     │
