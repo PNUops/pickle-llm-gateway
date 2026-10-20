@@ -48,6 +48,10 @@ type Server struct {
 	// from; see catalog.go.
 	catalog *catalogState
 	now     func() time.Time
+	// writeBudget is how long an answer of n bytes may take to reach the
+	// client (see largeWriteBudget). A field so tests can fix it rather than
+	// race a machine-speed-dependent deadline.
+	writeBudget func(n int) time.Duration
 }
 
 // New wires a Server. The shared HTTP client waits bounded time for upstream
@@ -86,6 +90,7 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 		costs:            newGenerationCosts(),
 		catalog:          newCatalogState(),
 		now:              time.Now,
+		writeBudget:      largeWriteBudget,
 	}
 }
 

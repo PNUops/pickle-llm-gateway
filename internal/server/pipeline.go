@@ -711,7 +711,7 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	var werr error
 	if large {
-		writeUnderDeadline(w, len(out), func() { _, werr = w.Write(out) })
+		s.writeUnderDeadline(w, len(out), func() { _, werr = w.Write(out) })
 	} else {
 		_, werr = w.Write(out)
 	}

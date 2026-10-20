@@ -79,9 +79,9 @@ func largeWriteBudget(n int) time.Duration {
 // writeUnderDeadline runs write with the deadline for an n-byte answer and
 // clears it afterwards, so the rest of a stream is not held to it. A writer
 // that cannot take a deadline writes without one.
-func writeUnderDeadline(w http.ResponseWriter, n int, write func()) {
+func (s *Server) writeUnderDeadline(w http.ResponseWriter, n int, write func()) {
 	rc := http.NewResponseController(w)
-	if rc.SetWriteDeadline(time.Now().Add(largeWriteBudget(n))) != nil {
+	if rc.SetWriteDeadline(time.Now().Add(s.writeBudget(n))) != nil {
 		write()
 		return
 	}

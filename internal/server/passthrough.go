@@ -669,7 +669,7 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// a caller that reads its answer a byte at a time: upCtx covers the
 	// upstream call, and the server sets no write timeout.
 	var werr error
-	writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	s.writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
 	if werr != nil {
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
