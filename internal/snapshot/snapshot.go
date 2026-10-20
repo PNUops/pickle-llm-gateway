@@ -89,6 +89,9 @@ const (
 	EndpointEmbeddings = "embeddings"
 	EndpointRerank     = "rerank"
 	EndpointSpeech     = "speech"
+	// EndpointTranscriptions is speech to text, a grant apart from speech
+	// because the two are used, and costed, by different exercises.
+	EndpointTranscriptions = "transcriptions"
 	// EndpointChat governs every completion surface, on both axes.
 	EndpointChat = "chat"
 	// The two below are parts of chat that cost money per use. They are

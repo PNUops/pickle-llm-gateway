@@ -343,6 +343,9 @@ type attemptSpec struct {
 	// headers are the client headers an allowlist chose to forward. The
 	// gateway's own Content-Type and Authorization are set after these and win.
 	headers http.Header
+	// contentType is the body's media type when it is not JSON: a multipart
+	// form the gateway assembled, whose boundary only it knows.
+	contentType string
 	// upstreamModel and publicModel let a relayed rejection name the model the
 	// way the caller does. The swap has to happen on the raw message, before
 	// it is cleaned and cut: a cut through the id leaves a fragment no later
@@ -415,7 +418,11 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		req.Header[name] = values
 	}
 	if spec.body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		ct := spec.contentType
+		if ct == "" {
+			ct = "application/json"
+		}
+		req.Header.Set("Content-Type", ct)
 	}
 	if spec.cred != "" {
 		req.Header.Set("Authorization", "Bearer "+spec.cred)

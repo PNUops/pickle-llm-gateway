@@ -270,19 +270,15 @@ func wholeNumber(f float64) int64 {
 // kinds is listed when any one of them is granted: a text-and-image model is
 // usable as a chat model by a key holding chat alone.
 //
-// The transcription grant is not routed by this build yet. It is named here
-// already because the control plane's vocabulary has it, and a key cannot
-// hold it until its route exists, so until then those models stay hidden,
-// which is what they are: uncallable. An output this table does not know
-// (video, the vendor's routing "decisions") is never listed, for the same
-// reason.
+// An output this table does not know (video, the vendor's routing
+// "decisions") is never listed: no route this build serves can call it.
 var outputCapability = map[string]string{
 	"text":          snapshot.EndpointChat,
 	"image":         snapshot.EndpointImages,
 	"embeddings":    snapshot.EndpointEmbeddings,
 	"rerank":        snapshot.EndpointRerank,
 	"speech":        snapshot.EndpointSpeech,
-	"transcription": "transcriptions",
+	"transcription": snapshot.EndpointTranscriptions,
 }
 
 // freeVariantSuffix marks the vendor's no-cost variants. They are refused for
