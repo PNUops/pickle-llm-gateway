@@ -10,7 +10,8 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 ```
 학생 코드 (OpenAI SDK + API Key)
     │  POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
-    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
+    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank
+    │  POST /v1/audio/speech
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
     │
@@ -21,7 +22,7 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 학생 코드에는 공개 모델명만 보입니다. 실제 모델과 업스트림 주소는 게이트웨이 설정에만
 있으므로, 업스트림을 교체해도 학생 코드는 바뀌지 않습니다.
 
-아래 다섯은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
+아래 여섯은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
 돌려줍니다. 전부 유료 모델이므로 비용은 그 Key에 부여된 금액 한도에서 나갑니다. Key마다
 허용된 경로만 열리고 기본값은 전부 닫힘입니다.
 
@@ -32,6 +33,7 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 | `GET /v1/images/models` | 이미지 생성 (`images`) |
 | `POST /v1/embeddings` | 임베딩 (`embeddings`) |
 | `POST /v1/rerank` | 리랭크 (`rerank`) |
+| `POST /v1/audio/speech` | TTS (`speech`) |
 
 `POST /v1/rerank`는 OpenAI나 Anthropic이 아니라 Cohere, Voyage 같은 API의 리랭크 호출입니다. 질의와 문서 목록을 받아
 관련도 순서를 돌려줍니다. 사용량은 응답의 `usage`에서 읽되 업스트림 문서상 선택 필드이고, 모델에 따라 토큰 수
@@ -39,6 +41,13 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 크기로 추정하지 않습니다. 금액이 없으면 응답 본문의 `id`로 생성 기록을 조회해 채웁니다(이 경로는 `X-Generation-Id` 헤더가
 없습니다). 응답의 `model`은 서빙 공급자의 원래 이름(예: `rerank-v3.5`)이라 요청한 이름과 비교하지 않고, 기록의 모델 이름은
 요청한 이름입니다.
+
+`POST /v1/audio/speech`는 OpenAI SDK의 `audio.speech.create()`가 부르는 음성 합성 경로입니다. 응답은 JSON이 아니라
+음성 파일이고, 공급자의 미디어 타입(`audio/mpeg`, `audio/pcm;rate=24000;channels=1` 등)을 해석해 다시 적은 값으로
+그대로 돌려줍니다. 오디오가 아닌 응답은 502 `upstream_error`입니다. 공급자는 mp3와 pcm만 만들고 `response_format`을 빼면
+pcm(헤더 없는 원시 PCM)을 돌려주므로, `response_format`이 그 둘이 아니면 400으로 이유와 함께 거절합니다.
+`stream_format`은 `audio`만 받고(공급자는 늘 파일 하나로 답합니다) 참조 음성으로 목소리를 만드는 `input_references`는
+거절합니다. 응답에 사용량이 없으므로 토큰 0으로 기록하고 금액은 `X-Generation-Id`로 생성 기록을 조회해 채웁니다.
 
 `/v1/chat/completions`도 기능 권한 `chat`이 있는 Key에만 열립니다. 자체 서빙 모델과 유료 모델
 모두에 적용되고, 채팅 없이 다른 기능만 쓰는 Key가 있기 때문에 기본으로 부여하지 않습니다.
@@ -442,6 +451,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
 | `rerank` | `POST /v1/rerank` |
+| `speech` | `POST /v1/audio/speech`, 그리고 유료 모델 채팅의 음성 출력(`modalities`에 `audio`). 음성 입력은 판정하지 않습니다 |
 | `containers` | 유료 모델 채팅의 샌드박스 명령과 코드 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`, `local_shell`), `openrouter:bash` 도구와 날짜 없는 `bash`, `code_interpreter`. **아직 부여하지 않습니다** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은

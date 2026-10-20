@@ -100,7 +100,7 @@ func TestPassthroughRefusalIsNamedNotHidden(t *testing.T) {
 	}
 	// The path a key was never granted is a different answer from one this
 	// service does not serve at all.
-	status, body = h.passthrough(t, http.MethodPost, "/v1/audio/speech", testToken, imageBody)
+	status, body = h.passthrough(t, http.MethodPost, "/v1/audio/translations", testToken, imageBody)
 	if status != http.StatusNotFound || errCode(t, body) != "unknown_endpoint" {
 		t.Fatalf("out-of-scope path: %d %s", status, body)
 	}

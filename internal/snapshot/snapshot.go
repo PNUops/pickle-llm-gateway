@@ -88,6 +88,7 @@ const (
 	EndpointImages     = "images"
 	EndpointEmbeddings = "embeddings"
 	EndpointRerank     = "rerank"
+	EndpointSpeech     = "speech"
 	// EndpointChat governs every completion surface, on both axes.
 	EndpointChat = "chat"
 	// The two below are parts of chat that cost money per use. They are

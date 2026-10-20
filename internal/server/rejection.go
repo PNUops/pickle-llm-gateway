@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"path"
 	"regexp"
 	"strconv"
@@ -97,7 +98,34 @@ func rejectionMessage(detail []byte) string {
 			msg = nested.Message
 		}
 	}
-	return msg
+	return firstValidationIssue(msg)
+}
+
+// firstValidationIssue reduces a validation report to its first issue. Some
+// vendor routes put a whole schema validator's output, a JSON list of issues
+// with their paths, where the message belongs; relayed as it is, a student
+// reads a block of escaped JSON. The first issue, named by its path, says the
+// same thing in one line. A message that is not such a list is unchanged.
+func firstValidationIssue(msg string) string {
+	trimmed := strings.TrimSpace(msg)
+	if !strings.HasPrefix(trimmed, "[") {
+		return msg
+	}
+	var issues []struct {
+		Message string `json:"message"`
+		Path    []any  `json:"path"`
+	}
+	if json.Unmarshal([]byte(trimmed), &issues) != nil || len(issues) == 0 || issues[0].Message == "" {
+		return msg
+	}
+	parts := make([]string, 0, len(issues[0].Path))
+	for _, p := range issues[0].Path {
+		parts = append(parts, fmt.Sprint(p))
+	}
+	if len(parts) == 0 {
+		return issues[0].Message
+	}
+	return strings.Join(parts, ".") + ": " + issues[0].Message
 }
 
 // cleanRejection makes a raw message safe to relay. The order matters: the
