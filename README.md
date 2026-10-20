@@ -36,6 +36,37 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 모두에 적용되고, 채팅 없이 다른 기능만 쓰는 Key가 있기 때문에 기본으로 부여하지 않습니다.
 `GET /v1/models`는 비용이 없으므로 기능 권한 없이 열립니다.
 
+`GET /v1/models` 목록에는 자체 서빙 모델과 스냅샷 카탈로그 모델 뒤에, 그 Key로 실제로 부를 수 있는
+유료 모델이 이름 순으로 붙습니다. 유료 모델은 게이트웨이가 패스스루 업스트림의 공개 카탈로그
+`GET {BaseURL}/models?output_modalities=all`를 인증 없이 30분마다 읽어 둔 사본에서 가져옵니다. 읽기에
+실패하면 1분부터 두 배씩 늘려 다시 읽고(최대 30분), 그동안은 마지막으로 읽은 사본을 그대로 씁니다.
+한 번도 읽지 못했으면 목록에는 스냅샷 모델만 나옵니다. 스냅샷이 패스스루 업스트림을 바꾸면 옛
+사본은 쓰지 않고 1분 안에 새 업스트림의 카탈로그를 읽습니다. 사본 상태는 관리 리스너 `/metrics`의
+`vendorModelCatalog`에서 볼 수 있습니다(모델 수, 연속 실패 수, 사본이 있으면 경과 초).
+
+유료 모델은 아래 조건을 모두 만족할 때 목록에 나옵니다.
+
+- 단건 조회 `GET /v1/models/{id}`와 같은 판정을 통과한다. Key에 패스스루 업스트림 자격증명이 있고,
+  모델 허용 목록과 금액 축 허용·차단 목록이 그 이름을 막지 않아야 합니다.
+- 모델이 내는 출력 중 하나에 필요한 기능 권한이 Key에 있다. 텍스트는 `chat`, 이미지는 `images`,
+  임베딩은 `embeddings`, rerank는 `rerank`, 음성 합성은 `speech`, 음성 인식은 `transcriptions`가
+  필요합니다. 영상처럼 이 표에 없는 출력만 내는 모델은 나오지 않습니다.
+- 라우터 이름(`openrouter/*`)과 `:free` 변형이 아니다.
+
+항목은 표준 필드에 컨텍스트 길이만 더합니다. OpenAI 모양은 `context_length`, Anthropic 모양은
+`max_input_tokens`와 `max_tokens`입니다. 카탈로그에 값이 없거나 0인 필드는 생략합니다. 가격, 모달리티, 지원
+파라미터는 공급자 확장이라 싣지 않습니다. 자체 서빙 모델 항목은 표준 필드만 그대로 둡니다.
+
+```json
+{"id":"openai/gpt-4o-mini","object":"model","created":1721260800,"owned_by":"openai","context_length":128000}
+```
+
+단건 조회는 목록보다 넓습니다. 카탈로그에 없는 이름이나 위 기능 권한이 없는 모델도 판정을 통과하면
+지금처럼 답합니다. 직접 호출은 어차피 공급자까지 가서 그쪽에서 판정되기 때문입니다. 카탈로그에 있는
+이름이면 목록과 같은 항목으로 답합니다. 공급자 전용 조회 경로 `/v1/models/{author}/{slug}/endpoints`,
+`/v1/embeddings/models`, `/v1/tools`는 지원하지 않으며 인증 전에 404 `unknown_endpoint`로 답합니다.
+`/endpoints` 경로는 끝의 `/`와 대소문자가 달라도 같이 막습니다.
+
 `POST /v1/responses`는 OpenAI Responses API 경로입니다. Codex와 OpenAI SDK의 `responses.create()`가
 이 경로를 부릅니다. 기능 권한은 `/v1/chat/completions`와 같은 `chat`이고 **유료 모델만** 받습니다.
 자체 서빙 모델 이름은 400 `model_not_available_on_route`로 거절합니다. 요청과 응답은 번역하지 않고
