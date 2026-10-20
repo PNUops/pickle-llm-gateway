@@ -71,6 +71,11 @@ type passthroughRoute struct {
 	// refuseOpenAIImageFields), because the vendor would drop them without a
 	// word and the caller would get something other than what they asked for.
 	openAIImages bool
+	// lookupCost marks the routes whose usage the vendor does not always
+	// report: every answer that ends without a price has it read from the
+	// generation record. On the other routes only an answer that failed
+	// after the vendor billed it is looked up (see handlePassthrough).
+	lookupCost bool
 }
 
 var (
@@ -160,8 +165,19 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			Endpoint:    route.name,
 		}
 		w.Header().Set("X-Request-Id", ev.EventUUID)
+		// Latency is fixed when the answer ends. An answer whose cost is read
+		// afterwards stops the clock first, as a stream's does, so the wait
+		// for the vendor's record is not counted as the request's own time.
+		latency := time.Duration(-1)
+		stopClock := func() {
+			if latency < 0 {
+				latency = time.Since(start)
+			}
+		}
+		path := r.URL.Path
 		record := func() {
-			ev.LatencyMs = time.Since(start).Milliseconds()
+			stopClock()
+			ev.LatencyMs = latency.Milliseconds()
 			s.metrics.observe(ev)
 			// Same rule as chat: an attempt that never resolved to a key has
 			// nobody to account to, and the spool is a small disk anyone on
@@ -173,7 +189,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				s.metrics.spoolWriteFailures.Add(1)
 				s.log.Error("usage spool write failed", "error", err)
 			}
-			s.log.Info("passthrough request", "keyId", ev.KeyID, "path", r.URL.Path,
+			s.log.Info("passthrough request", "keyId", ev.KeyID, "path", path,
 				"model", ev.PublicModelName, "status", ev.Status, "errorType", ev.ErrorType,
 				"inputTokens", ev.InputTokens, "outputTokens", ev.OutputTokens,
 				"latencyMs", ev.LatencyMs)
@@ -495,7 +511,31 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// `choices[0].message.content` out — and neither has a counterpart in
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
-		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, record)
+		//
+		// From here on the vendor has answered 200 and has billed, so an
+		// answer this gateway then failed to hand over (refused for its size
+		// or shape, cut off while being read, or not taken by the client) has
+		// its price read from the generation record (generation_cost.go) if
+		// it ended without one. A route whose usage is optional has every
+		// unpriced answer looked up. A successful answer on the other routes
+		// is not: those report their usage on every call, so a success
+		// without a price is not something a lookup per call should paper
+		// over, and doing it for every embedding call would put a vendor read
+		// behind each one. A catalogue read is not billed and is not looked
+		// up.
+		finish := record
+		if route.readsBody {
+			lookup := s.withGenerationCost(resp.Header.Get(generationIDHeader), up, key.CredentialFor(ref),
+				&ev, stopClock, record, &s.costs.passthrough)
+			finish = func() {
+				if route.lookupCost || ev.Status != spool.StatusOK {
+					lookup()
+					return
+				}
+				record()
+			}
+		}
+		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, finish)
 	}
 }
 
@@ -669,7 +709,7 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// a caller that reads its answer a byte at a time: upCtx covers the
 	// upstream call, and the server sets no write timeout.
 	var werr error
-	writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	s.writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
 	if werr != nil {
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
@@ -711,9 +751,16 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 // It reads both field namings because this surface does not control which one
 // the vendor uses per route, and a struct that quietly fills with zeros would
 // record a metered request as costing nothing while leaving `estimated` false
-// — a wrong number that says it is exact. A usage object that yields nothing
-// on either naming is therefore reported as absent, which sends the event down
-// the estimate path where the flag says so.
+// — a wrong number that says it is exact. A usage object that yields neither a
+// count on either naming nor a price is therefore reported as absent, which
+// sends the event down the estimate path where the flag says so.
+//
+// A price with no count is reported as usage, with zero tokens. Some calls are
+// not billed by the token at all — a transcription billed by the second, a
+// rerank by the search unit — and the vendor reports their usage as a price
+// and a unit this event has no field for. The price is the figure that
+// matters, and it is exact; inventing tokens from the body size beside it
+// would put a count on the record that no one metered.
 func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 	var envelope struct {
 		Model string `json:"model"`
@@ -756,10 +803,12 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 	}
 	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 		if u.TotalTokens == 0 {
-			// The price is dropped along with the counts. A charge recorded
-			// beside zero tokens would be read as an unmetered request that
-			// still cost money, which is a different and more alarming claim
-			// than the estimate this actually falls back to.
+			if spool.CostLiteral(u.Cost) != "" {
+				// Priced but not counted: the call is billed in a unit
+				// other than tokens. Recorded as zero tokens and the price,
+				// with Estimated false, because neither figure is a guess.
+				return envelope.Model, usage{Cost: u.Cost}, len(envelope.Data), true, true
+			}
 			return envelope.Model, usage{}, len(envelope.Data), false, true
 		}
 		// A total with no split. The event has no field for a total, and

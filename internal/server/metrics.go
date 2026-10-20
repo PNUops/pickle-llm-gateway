@@ -25,6 +25,9 @@ type counters struct {
 	// those whose lookup found none and were recorded without one.
 	streamCostFilled  atomic.Int64
 	streamCostMissing atomic.Int64
+	// The same two for passthrough answers that ended without a cost.
+	passthroughCostFilled  atomic.Int64
+	passthroughCostMissing atomic.Int64
 }
 
 func (c *counters) observe(ev spool.Event) {
@@ -79,6 +82,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"streamCostFilled":       s.metrics.streamCostFilled.Load(),
 		"streamCostMissing":      s.metrics.streamCostMissing.Load(),
 		"vendorModelCatalog":     s.catalogGauges(),
+		"passthroughCostFilled":  s.metrics.passthroughCostFilled.Load(),
+		"passthroughCostMissing": s.metrics.passthroughCostMissing.Load(),
 	})
 }
 

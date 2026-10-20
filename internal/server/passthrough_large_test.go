@@ -93,6 +93,11 @@ func TestSmallPassthroughAnswersToTheGatewayCap(t *testing.T) {
 // An answer past the relay bound takes a slot and holds it until the client
 // has read it; one under it does not. Both a declared length and an
 // undeclared one, which crosses the bound while being read.
+//
+// The write deadline is fixed far out: the production budget (largeWriteBudget)
+// depends on how fast this machine moves 32 MiB through a loopback socket, and
+// on a loaded host it ran out mid-read. What the deadline does is pinned by
+// TestLargePassthroughAnswerSlowReader instead.
 func TestLargePassthroughAnswerTakesASlot(t *testing.T) {
 	const size = 32 << 20
 	big := embeddingAnswer(size)
@@ -101,6 +106,7 @@ func TestLargePassthroughAnswerTakesASlot(t *testing.T) {
 			c.PassthroughResponseMaxBytes = 48 << 20
 			c.PassthroughMaxInFlight = 1
 		})
+		h.srv.writeBudget = func(int) time.Duration { return time.Hour }
 		h.srv.passthroughClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			length := int64(-1)
 			if declared {
@@ -136,6 +142,49 @@ func TestLargePassthroughAnswerTakesASlot(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+// A client that never reads a large answer is cut off at the write deadline,
+// which gives the slot back and records the request as gone. The deadline is
+// injected short, so the outcome does not depend on how long the production
+// budget is or how fast this machine is.
+func TestLargePassthroughAnswerSlowReader(t *testing.T) {
+	big := embeddingAnswer(32 << 20)
+	h := newHarness(t, passthroughDoc(snapshot.EndpointEmbeddings), func(c *config.Config) {
+		c.PassthroughResponseMaxBytes = 48 << 20
+		c.PassthroughMaxInFlight = 1
+	})
+	h.srv.writeBudget = func(int) time.Duration { return 200 * time.Millisecond }
+	h.srv.passthroughClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Request: r,
+			ContentLength: int64(len(big)), Body: io.NopCloser(strings.NewReader(big))}, nil
+	})}
+	req, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/embeddings", strings.NewReader(embeddingBody))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// The body is never read. The slot has to come back on its own.
+	deadline := time.Now().Add(30 * time.Second)
+	for h.srv.PassthroughInFlight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a reader that never read held the slot past the write deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var evs []spool.Event
+	for time.Now().Before(deadline) {
+		if evs = h.spoolEvents(t); len(evs) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(evs) != 1 || evs[0].Status != spool.StatusCanceled || evs[0].ErrorType != "client_disconnected" {
+		t.Fatalf("events %+v", evs)
 	}
 }
 
