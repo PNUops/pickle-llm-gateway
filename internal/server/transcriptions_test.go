@@ -214,9 +214,26 @@ func TestTranscriptionsFormRefusals(t *testing.T) {
 			t.Fatalf("%s: %d %s", tc.name, status, out)
 		}
 	}
-	// A body that says it is a form but is not one.
-	if status, out := postTranscription(t, h, "multipart/form-data; boundary=x", []byte("not a form")); status != 400 {
-		t.Fatalf("broken form: %d %s", status, out)
+	// A body that is not a form of named parts is refused by its shape.
+	ct, whole := form(t, file, model)
+	for name, tc := range map[string]struct {
+		ct   string
+		body []byte
+	}{
+		"no boundary":         {"multipart/form-data", whole},
+		"cut before the end":  {ct, whole[:len(whole)-10]},
+		"a part with no name": {ct, bytes.Replace(whole, []byte(`name="model"`), []byte(`x="model"`), 1)},
+	} {
+		status, out := postTranscription(t, h, tc.ct, tc.body)
+		if status != http.StatusBadRequest || errCode(t, out) != "invalid_multipart_form" {
+			t.Fatalf("%s: %d %s", name, status, out)
+		}
+	}
+	// A text field that is not valid UTF-8 would be judged as one name and
+	// sent as another.
+	ct, bad := form(t, file, formPart{name: "model", value: "openai/whisper-\xff"})
+	if status, out := postTranscription(t, h, ct, bad); status != http.StatusBadRequest || errCode(t, out) != "invalid_parameter_value" {
+		t.Fatalf("invalid utf-8: %d %s", status, out)
 	}
 	if v.calls != 0 {
 		t.Fatal("a refused request reached the vendor")

@@ -270,9 +270,8 @@ func wholeNumber(f float64) int64 {
 // kinds is listed when any one of them is granted: a text-and-image model is
 // usable as a chat model by a key holding chat alone.
 //
-// An output this table does not know
-// (video, the vendor's routing "decisions") is never listed, for the same
-// reason.
+// An output this table does not know (video, the vendor's routing
+// "decisions") is never listed: no route this build serves can call it.
 var outputCapability = map[string]string{
 	"text":          snapshot.EndpointChat,
 	"image":         snapshot.EndpointImages,

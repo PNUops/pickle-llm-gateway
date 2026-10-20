@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // transcriptionFormFields are the multipart fields the route forwards, each
@@ -68,9 +69,13 @@ func readTranscriptionForm(raw []byte, contentType string) (map[string]json.RawM
 		e := errInvalidParamValue(name)
 		return nil, nil, "", &e
 	}
+	malformed := func() (map[string]json.RawMessage, []byte, string, *apiError) {
+		e := errMalformedForm
+		return nil, nil, "", &e
+	}
 	_, mtParams, err := mime.ParseMediaType(contentType)
 	if err != nil || mtParams["boundary"] == "" {
-		return invalid("file")
+		return malformed()
 	}
 	type filePart struct {
 		filename, contentType string
@@ -85,7 +90,7 @@ func readTranscriptionForm(raw []byte, contentType string) (map[string]json.RawM
 			break
 		}
 		if err != nil || parts >= transcriptionFormMaxParts {
-			return invalid("file")
+			return malformed()
 		}
 		name := part.FormName()
 		switch repeats, known := transcriptionFormFields[name]; {
@@ -95,11 +100,11 @@ func readTranscriptionForm(raw []byte, contentType string) (map[string]json.RawM
 			}
 			data, err := io.ReadAll(part)
 			if err != nil {
-				return invalid(name)
+				return malformed()
 			}
 			file = &filePart{filename: part.FileName(), contentType: part.Header.Get("Content-Type"), data: data}
 		case name == "":
-			return invalid("file")
+			return malformed()
 		case !known:
 			e := errUnsupportedParam(name)
 			return nil, nil, "", &e
@@ -108,7 +113,13 @@ func readTranscriptionForm(raw []byte, contentType string) (map[string]json.RawM
 				return invalid(name)
 			}
 			value, err := io.ReadAll(io.LimitReader(part, transcriptionFieldMaxBytes+1))
-			if err != nil || len(value) > transcriptionFieldMaxBytes {
+			// Valid UTF-8 only: the fences judge the value decoded as JSON,
+			// where invalid bytes become U+FFFD, while the form would carry the
+			// raw bytes on, so the name judged and the name sent would differ.
+			if err != nil {
+				return malformed()
+			}
+			if len(value) > transcriptionFieldMaxBytes || !utf8.Valid(value) {
 				return invalid(name)
 			}
 			fields[name] = append(fields[name], string(value))

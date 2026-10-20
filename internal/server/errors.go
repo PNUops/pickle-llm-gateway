@@ -337,6 +337,12 @@ func errUnsupportedValue(name, advice string) apiError {
 		"지원하지 않는 파라미터입니다: " + name + ". " + advice}
 }
 
+// errMalformedForm answers a multipart body that cannot be read as a form of
+// named parts. It names the shape rather than a field, because no field is at
+// fault: the caller's client sent something that is not a form.
+var errMalformedForm = apiError{http.StatusBadRequest, "invalid_request_error", "invalid_multipart_form",
+	"multipart 본문을 읽을 수 없습니다. 음성 파일은 file 파트 하나로, 나머지 값은 이름이 있는 텍스트 파트로 보내주세요."}
+
 func errInvalidParamValue(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
 		"파라미터 값이 올바르지 않습니다: " + name}

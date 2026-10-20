@@ -53,8 +53,11 @@ pcm(헤더 없는 원시 PCM)을 돌려주므로, `response_format`이 그 둘�
 `POST /v1/audio/transcriptions`는 음성 인식 경로입니다. 공급자 형식의 JSON 본문(`input_audio`에 base64 `data`나
 `url`)과, OpenAI SDK의 `audio.transcriptions.create()`가 보내는 multipart 업로드(`file` 파트)를 모두 받습니다.
 multipart는 그대로 넘기지 않고 해석한 뒤 아는 필드(`model`, `language`, `prompt`, `response_format`, `temperature`,
-`timestamp_granularities[]`, `keyterms[]`, `diarize`, `provider`, `source_url`, `stream`)와 파일 하나로 다시 조립해 보냅니다.
-모르는 필드는 400 `unsupported_parameter`, 반복될 수 없는 필드가 반복되면 400 `invalid_parameter_value`입니다.
+`timestamp_granularities[]`, `keyterms[]`, `diarize`, `provider`, `source_url`)와 파일 하나로 다시 조립해 보냅니다.
+`stream`은 읽어서 `true`면 다른 패스스루 경로처럼 거절합니다. 모르는 필드는 400 `unsupported_parameter`, 반복될 수 없는
+필드가 반복되거나 UTF-8이 아닌 값은 400 `invalid_parameter_value`, 이름 있는 파트로 읽을 수 없는 본문은 400
+`invalid_multipart_form`입니다. 2 MiB가 넘는 업로드(128kbps mp3로 약 2분 넘는 음성)는 이미지 편집처럼 패스스루 큰 본문
+슬롯(기본 2개)을 호출이 끝날 때까지 잡으므로, 수업에서 동시에 많이 쓰면 `LLMGW_PASSTHROUGH_MAX_IN_FLIGHT`를 함께 정합니다.
 공급자는 `json`과 `verbose_json`만 돌려주므로 `response_format`이 그 둘이 아니면 400으로 이유와 함께 거절하고,
 공급자가 받지 않는 `chunking_strategy`와 `include`도 거절합니다. 사용량은 시간 과금 모델이면 `seconds`와 `cost`만 와서
 토큰 0과 금액으로, 토큰 과금 모델이면 `input_tokens`, `output_tokens`와 `cost`로 기록합니다. 금액이 없으면
