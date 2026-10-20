@@ -155,3 +155,17 @@ func TestRerankFences(t *testing.T) {
 		t.Fatalf("GET: %d %s", status, body)
 	}
 }
+
+// An id that is not a string is ignored rather than failing the answer: the
+// vendor has already billed it, and the id only serves the cost lookup.
+func TestPassthroughOddIDIsIgnored(t *testing.T) {
+	for _, id := range []string{`42`, `{"x":1}`, `null`} {
+		h := newHarness(t, passthroughDoc(snapshot.EndpointEmbeddings), nil)
+		h.mock.set(func(o *mockOpts) {
+			o.rawResp = `{"id":` + id + `,"data":[],"usage":{"prompt_tokens":3,"total_tokens":3,"cost":0.1}}`
+		})
+		if status, body := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody); status != 200 {
+			t.Fatalf("id %s: %d %s", id, status, body)
+		}
+	}
+}

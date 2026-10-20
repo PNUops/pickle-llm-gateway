@@ -799,8 +799,9 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 
 // passthroughUsage lifts the token counts, the vendor's price and the image
 // count out of a response. The returns are, in order: the model the vendor
-// named, the usage, how many images came back, whether usage was reported at
-// all, and whether the body parsed as JSON at all.
+// named, the generation id the body names (empty when it names none or not as
+// a string), the usage, how many images came back, whether usage was reported
+// at all, and whether the body parsed as JSON at all.
 //
 // It reads both field namings because this surface does not control which one
 // the vendor uses per route, and a struct that quietly fills with zeros would
@@ -819,7 +820,9 @@ func passthroughUsage(body []byte) (string, string, usage, int, bool, bool) {
 	var envelope struct {
 		Model string `json:"model"`
 		// ID is the generation id, on the routes that name it in the body.
-		ID string `json:"id"`
+		// Raw, so that an id of another type is ignored rather than failing
+		// the decode of an answer the vendor has already billed.
+		ID json.RawMessage `json:"id"`
 		// Data is the image list. Counting what came back rather than trusting
 		// the requested n is the honest figure: the vendor may return fewer,
 		// and the billing follows what arrived.
@@ -842,8 +845,10 @@ func passthroughUsage(body []byte) (string, string, usage, int, bool, bool) {
 	if json.Unmarshal(body, &envelope) != nil {
 		return "", "", usage{}, 0, false, false
 	}
+	var id string
+	_ = json.Unmarshal(envelope.ID, &id)
 	if envelope.Usage == nil {
-		return envelope.Model, envelope.ID, usage{}, len(envelope.Data), false, true
+		return envelope.Model, id, usage{}, len(envelope.Data), false, true
 	}
 	u := usage{
 		PromptTokens:            envelope.Usage.PromptTokens,
@@ -863,9 +868,9 @@ func passthroughUsage(body []byte) (string, string, usage, int, bool, bool) {
 				// Priced but not counted: the call is billed in a unit
 				// other than tokens. Recorded as zero tokens and the price,
 				// with Estimated false, because neither figure is a guess.
-				return envelope.Model, envelope.ID, usage{Cost: u.Cost}, len(envelope.Data), true, true
+				return envelope.Model, id, usage{Cost: u.Cost}, len(envelope.Data), true, true
 			}
-			return envelope.Model, envelope.ID, usage{}, len(envelope.Data), false, true
+			return envelope.Model, id, usage{}, len(envelope.Data), false, true
 		}
 		// A total with no split. The event has no field for a total, and
 		// recording the split as two zeros would report a metered request as
@@ -875,7 +880,7 @@ func passthroughUsage(body []byte) (string, string, usage, int, bool, bool) {
 		// split is simply not knowable from what the vendor sent.
 		u.PromptTokens = u.TotalTokens
 	}
-	return envelope.Model, envelope.ID, u, len(envelope.Data), true, true
+	return envelope.Model, id, u, len(envelope.Data), true, true
 }
 
 // passthroughHeaderAllowlist is which client headers reach the upstream. It is
