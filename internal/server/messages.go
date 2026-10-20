@@ -54,6 +54,7 @@ var protoMessages = &protocol{
 		fenceFallbacks,
 		fenceServerToolsStep,
 		fenceDeferredTools,
+		fenceToolChoice,
 		fencePluginsStep,
 		fenceChatCapabilities,
 	},

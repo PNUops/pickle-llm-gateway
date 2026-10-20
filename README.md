@@ -149,16 +149,29 @@ response_format  tools  tool_choice  parallel_tool_calls
 도구는 `images` 기능 권한도 함께 요구합니다** — 전용 경로로 부를 때는 필요하고 채팅으로 부를
 때는 필요 없다면 그것은 권한이 아니기 때문입니다. 웹 검색 도구(`openrouter:web_search`)도 같은
 이유로 `web_search` 기능 권한을 요구합니다. 중첩된 도구 목록 안에 있어도 같습니다.
+`namespace` 도구가 묶은 도구(`tools`)와 `tool_choice`가 `type`으로 지정한 도구(`{"type":"web_search"}`,
+`allowed_tools`의 `tools` 목록)도 같은 규칙으로 판정합니다. 도구를 정의하지 않고 `tool_choice`로만
+불러도 같은 권한이 필요합니다.
 
-**샌드박스에서 명령을 실행하는 서버 도구(`openrouter:shell`, `openrouter:bash`)는 `containers`
-기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 어느 Key에서나 403
+**공급자 전용 서버 도구는 아는 것만 받습니다.** `openrouter:` 접두가 붙은 도구 가운데 이 게이트웨이가
+아는 것(`web_search`, `image_generation`, `advisor`, `fusion`, `subagent`, `web_fetch`, `tool_search`,
+`apply_patch`, `datetime`, `experimental__search_models`, `shell`, `bash`)만 위 규칙으로 판정하고,
+나머지는 400 `unsupported_parameter`로 거절합니다. 이 서비스는 일반적인 LLM API가 제공하는 기능을
+지원하고 공급자 전용 확장까지 맞추지는 않기 때문입니다. `openrouter:files`도 지금은 거절합니다.
+접두가 없는 표준 도구(`function`, `custom`, `mcp`, `file_search`, `computer_use_preview` 등)는 그대로
+통과합니다.
+
+**샌드박스에서 명령이나 코드를 실행하는 서버 도구(`openrouter:shell`, `openrouter:bash`,
+`local_shell`, `code_interpreter`)는 `containers` 기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 어느 Key에서나 403
 `endpoint_not_allowed`로 거절하고, 거절 문구는 신청 대신 도구를 빼고 다시 보내라고 안내합니다.
 공급자의 컨테이너는 Key가 아니라 공급자 계정 단위로 묶이고, 어느 컨테이너를 쓸지는 요청에서
 정해집니다. 호출자가 고른 id(`container_reference`)나 `session_id`, `X-Session-Id` 헤더,
 `prompt_cache_key`에서 유도한 id입니다. 같은 계정 아래의 두 Key가 같은 id에 닿으면 서로의 파일을
 읽고 쓸 수 있으므로, Key마다 컨테이너를 따로 쓰게 될 때까지 도구 쪽을 막아 둡니다. 세션 값과
 `prompt_cache_key`는 그대로 전달합니다. 컨테이너가 없으면 프롬프트 캐시용 공급자 고정에만
-쓰이기 때문입니다. 같은 도구가 지정한 모델도 거절 대상이면 이 거절이 먼저입니다.
+쓰이기 때문입니다. 같은 도구가 지정한 모델도 거절 대상이면 이 거절이 먼저입니다. `local_shell`은
+표준 API에서는 클라이언트가 실행하는 도구지만, 공급자는 자기가 직접 서빙하지 않는 모델에서 이 도구를
+샌드박스로 보낸다고 문서화했습니다. `code_interpreter`는 호스팅 컨테이너에서 코드를 실행합니다.
 
 **공급자는 서버 도구 하나를 여러 `type` 철자로 받습니다.** `openrouter:web_search` 말고도
 `web_search`, `web_search_preview`, `web_search_preview_2025_03_11`, `web_search_2025_08_26`가
@@ -328,15 +341,15 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | 기능 | 여는 것 |
 |---|---|
 | `chat` | `POST /v1/chat/completions`. 자체 서빙과 유료 모델 모두 |
-| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등) |
+| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등), OpenAI 표준 `web_search_options` |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
-| `containers` | 유료 모델 채팅의 샌드박스 명령 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`), `openrouter:bash` 도구와 날짜 없는 `bash`. **아직 부여하지 않습니다** |
+| `containers` | 유료 모델 채팅의 샌드박스 명령과 코드 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`, `local_shell`), `openrouter:bash` 도구와 날짜 없는 `bash`, `code_interpreter`. **아직 부여하지 않습니다** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은
 거절하지 않고, 거절할 때는 요청을 고쳐 넘기지 않고 403으로 답합니다. 그래서 판정하지 않는 것이
-있습니다. OpenAI 호환 `web_search_options`, 모델 스스로 검색하는 모델, 엔진을 지정하지 않은 PDF를
+있습니다. 모델 스스로 검색하는 모델, 엔진을 지정하지 않은 PDF를
 PDF를 직접 읽지 못하는 모델에 보낸 요청(공급자가 유료 엔진을 기본으로 씁니다)입니다. 판정할 수
 없는 값(`modalities`가 목록이 아니거나 `pdf.engine`이 문자열이 아닌 경우)은 400으로 거절합니다.
 모델 거절과 기능 거절이 겹치면 모델 거절이 먼저입니다.

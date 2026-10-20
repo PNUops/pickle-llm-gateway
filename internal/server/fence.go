@@ -175,27 +175,29 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 // place that applies it rather than a second rule to keep in step. A tool that
 // names no model passes untouched.
 //
-// WHAT THIS DELIBERATELY DOES NOT CATCH, so that it does not read as an
-// oversight: a tool of the vendor's that this build does not know, naming its
-// model through a parameter this build does not know, is forwarded unjudged.
-// Refusing unknown tools was considered and declined (operator, 2026-09-06).
-// The money is still bounded either way — the key's own credit limit is what
-// caps it, so nobody can spend past what was approved — and what leaks is only
-// which model that approved amount is spent on. While the deny list is a cost
-// control, that is the caller's own balance draining faster, and a caller who
-// gets this far is doing it on purpose.
+// A tool in the vendor's own namespace ("openrouter:") that this build does
+// not know is refused (operator, 2026-10-20). Those tools are the vendor's
+// alone, and this service supports what the general LLM APIs offer rather
+// than every extension of the vendor it buys them through, so an unknown one
+// is outside what is served; refusing it also closes the gap an unknown tool
+// naming its model through an unknown parameter used to leave. The known ones
+// are knownServerTools. Refusing every unknown tool was declined earlier
+// (operator, 2026-09-06), and that still holds for a spelling outside the
+// vendor's namespace: such a type is a client tool or a standard one, and a
+// list here would refuse every standard tool released after it was written.
 //
-// THE CONDITION THAT REVERSES IT: the moment a deny list carries policy rather
-// than cost — a vendor nobody may use, a model excluded for a reason that is
-// not price — the "their own balance" argument stops holding, because the harm
-// is then no longer the caller's to absorb. Revisit this the first time a deny
-// list is used that way.
+// What that leaves forwarded unjudged is a standard spelling this build does
+// not reduce, naming a model through a parameter this build does not know. The
+// money is still bounded — the key's own credit limit caps it — and what leaks
+// is only which model the approved amount is spent on. That stops being the
+// caller's own loss once a deny list carries policy rather than cost; revisit
+// it the first time one is used that way.
 //
-// The same reasoning does not cover a tool that runs in a container, because
-// what leaks there is not money but another key's files: the vendor shares
-// containers across every key of an account. The two container tools known
-// today are refused below; a container tool the vendor adds later would pass
-// through this gap until it is added to that list.
+// A tool that runs in a container is refused below whatever its spelling,
+// because what leaks there is not money but another key's files: the vendor
+// shares containers across every key of an account. A container tool the
+// vendor adds under a standard spelling would pass until it is added to that
+// list.
 const toolsField = "tools"
 
 // serverToolPrefix marks the vendor's own tools in their canonical spelling. A
@@ -227,11 +229,39 @@ const (
 	bashTool  = "openrouter:bash"
 )
 
+// codeInterpreterTool runs code in a hosted container. It is the standard
+// spelling, not one in the vendor's namespace: the vendor has no tool of its
+// own by that name, so the canonical form is the standard one.
+const codeInterpreterTool = "code_interpreter"
+
 // containerTools are the server tools that create or reach a container. The
-// vendor's container guide names these two and no others. apply_patch is not
-// one: the vendor documents it as a patch proposal that the caller's own
-// application applies, with no backend beyond the inference request.
-var containerTools = map[string]bool{shellTool: true, bashTool: true}
+// vendor's container guide names shell and bash. code_interpreter is the
+// standard API's own container tool, and local_shell (which reduces to shell)
+// is the older standard spelling the vendor documents routing to its sandbox
+// on any model it does not host itself. apply_patch is not one: the vendor
+// documents it as a patch proposal that the caller's own application applies,
+// with no backend beyond the inference request.
+var containerTools = map[string]bool{shellTool: true, bashTool: true, codeInterpreterTool: true}
+
+// knownServerTools are the tools in the vendor's namespace this build knows,
+// each of which is judged by the rules here: the model fields it names, the
+// grant it needs, or nothing because it needs neither. Anything else under the
+// "openrouter:" prefix is refused (see the note above toolsField). files is
+// left out on purpose: it overlaps file handling that is not served yet.
+var knownServerTools = map[string]bool{
+	webSearchTool:                            true,
+	imageGenerationTool:                      true,
+	"openrouter:advisor":                     true,
+	"openrouter:fusion":                      true,
+	"openrouter:subagent":                    true,
+	"openrouter:web_fetch":                   true,
+	"openrouter:tool_search":                 true,
+	"openrouter:apply_patch":                 true,
+	"openrouter:datetime":                    true,
+	"openrouter:experimental__search_models": true,
+	shellTool:                                true,
+	bashTool:                                 true,
+}
 
 // serverToolFamilies is the one list of the vendor's other spellings for its
 // server tools, by the base name a spelling reduces to. The vendor accepts
@@ -246,9 +276,9 @@ var containerTools = map[string]bool{shellTool: true, bashTool: true}
 // is that tool, which also covers a dated spelling the vendor adds later. The
 // families are the tools a fence here acts on, plus the ones it knowingly lets
 // through so that the list says so: web_fetch passes (operator, 2026-10-14),
-// and tool_search and apply_patch take neither a model nor a grant. shell
-// needs the containers grant. code_execution is absent: the vendor refuses it
-// as an unknown shorthand.
+// and tool_search and apply_patch take neither a model nor a grant. shell,
+// local_shell and code_interpreter need the containers grant. code_execution
+// is absent: the vendor refuses it as an unknown shorthand.
 //
 // bash is not a family, because its dated spellings are a different tool. The
 // vendor's bash runs in its sandbox only under its own engine, and documents
@@ -267,6 +297,8 @@ var serverToolFamilies = []struct{ base, tool string }{
 	{"web_fetch", "openrouter:web_fetch"},
 	{"tool_search", "openrouter:tool_search"},
 	{"shell", shellTool},
+	{"local_shell", shellTool},
+	{"code_interpreter", codeInterpreterTool},
 	{"apply_patch", "openrouter:apply_patch"},
 }
 
@@ -380,24 +412,28 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 			e := errInvalidParamValue(toolsField)
 			return &e
 		}
+		// A namespace groups a caller's tools under one name, and its members
+		// sit in its own top-level list rather than in parameters. They are
+		// declared to the model like any other tool, so they are fenced like
+		// one.
+		if strings.EqualFold(strings.TrimSpace(rawType), namespaceToolType) {
+			if members, ok := tool[nestedToolsParam]; ok && string(bytes.TrimSpace(members)) != "null" {
+				if depth >= maxNestedToolDepth {
+					e := errInvalidParamValue(toolsField)
+					return &e
+				}
+				if e := fenceToolList(doc, modelLookup, key, members, depth+1); e != nil {
+					return e
+				}
+			}
+			continue
+		}
 		toolType := canonicalServerTool(rawType)
 		if toolType == "" {
 			continue
 		}
-		if toolType == imageGenerationTool &&
-			!key.AllowsEndpoint(snapshot.EndpointImages) {
-			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
-			return &e
-		}
-		if toolType == webSearchTool &&
-			!key.AllowsEndpoint(snapshot.EndpointWebSearch) {
-			e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
-			return &e
-		}
-		if containerTools[toolType] &&
-			!key.AllowsEndpoint(snapshot.EndpointContainers) {
-			e := errContainerToolNotAllowed(endpointLabel(snapshot.EndpointContainers))
-			return &e
+		if e := toolTypeRefusal(key, toolType); e != nil {
+			return e
 		}
 		// A tool names its model in its parameters on the chat route and at
 		// its own top level on the Messages route (the advisor's model sits
@@ -441,6 +477,85 @@ func fenceToolList(doc *snapshot.Document, modelLookup func(string) *snapshot.Mo
 			if e := fenceToolList(doc, modelLookup, key, nested, depth+1); e != nil {
 				return e
 			}
+		}
+	}
+	return nil
+}
+
+// namespaceToolType is the standard tool type that groups other tools.
+const namespaceToolType = "namespace"
+
+// toolTypeRefusal applies the rules that depend on a server tool's type alone:
+// an unknown tool in the vendor's namespace, and the grants the image, web
+// search and container tools need. toolType is canonical.
+func toolTypeRefusal(key *snapshot.Key, toolType string) *apiError {
+	if strings.HasPrefix(toolType, serverToolPrefix) && !knownServerTools[toolType] {
+		e := errUnsupportedServerTool(toolType)
+		return &e
+	}
+	if toolType == imageGenerationTool &&
+		!key.AllowsEndpoint(snapshot.EndpointImages) {
+		e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointImages))
+		return &e
+	}
+	if toolType == webSearchTool &&
+		!key.AllowsEndpoint(snapshot.EndpointWebSearch) {
+		e := errEndpointNotAllowed(endpointLabel(snapshot.EndpointWebSearch))
+		return &e
+	}
+	if containerTools[toolType] &&
+		!key.AllowsEndpoint(snapshot.EndpointContainers) {
+		e := errContainerToolNotAllowed(endpointLabel(snapshot.EndpointContainers))
+		return &e
+	}
+	return nil
+}
+
+// toolChoiceField can name a tool by its type instead of declaring it. The
+// standard API forces a hosted tool that way ({"type":"web_search"}), and its
+// allowed_tools form carries a list of tool references. A type named there is
+// judged by the same type rules as one in tools, so a grant the tool needs
+// cannot be skipped by asking for the tool here instead.
+const toolChoiceField = "tool_choice"
+
+// allowedToolsChoice is the tool_choice form that carries a tool list.
+const allowedToolsChoice = "allowed_tools"
+
+func fenceToolChoice(_ *Server, doc *snapshot.Document, lookup func(string) *snapshot.Model,
+	key *snapshot.Key, _ *snapshot.Model, params map[string]json.RawMessage) *refusal {
+	raw, present := params[toolChoiceField]
+	if !present || string(bytes.TrimSpace(raw)) == "null" {
+		return nil
+	}
+	// "auto", "none", "required" and the like name no tool.
+	var mode string
+	if json.Unmarshal(raw, &mode) == nil {
+		return nil
+	}
+	var choice map[string]json.RawMessage
+	if json.Unmarshal(raw, &choice) != nil {
+		return &refusal{e: errInvalidParamValue(toolChoiceField)}
+	}
+	var rawType string
+	if v, ok := choice["type"]; ok && json.Unmarshal(v, &rawType) != nil {
+		return &refusal{e: errInvalidParamValue(toolChoiceField)}
+	}
+	if strings.EqualFold(strings.TrimSpace(rawType), allowedToolsChoice) {
+		list, ok := choice[toolsField]
+		if !ok || string(bytes.TrimSpace(list)) == "null" {
+			return nil
+		}
+		if e := fenceToolList(doc, lookup, key, list, 1); e != nil {
+			if e.code == "invalid_parameter_value" {
+				return &refusal{e: errInvalidParamValue(toolChoiceField)}
+			}
+			return &refusal{e: *e, errorType: toolRefusalType(*e)}
+		}
+		return nil
+	}
+	if toolType := canonicalServerTool(rawType); toolType != "" {
+		if e := toolTypeRefusal(key, toolType); e != nil {
+			return &refusal{e: *e, errorType: toolRefusalType(*e)}
 		}
 	}
 	return nil
@@ -647,12 +762,16 @@ func fencePluginsStep(s *Server, doc *snapshot.Document, lookup func(string) *sn
 // may send. The server tools among them are judged in fenceToolList, where
 // nesting is already followed.
 //
-// What is deliberately not judged, so it does not read as a gap: the
-// OpenAI-style web_search_options field (whether the vendor acts on it is
-// unconfirmed), a model that searches on its own without being asked, and a
-// PDF sent with no engine to a model that cannot read PDFs, which the vendor
-// answers with its paid engine. The last needs to know which models read PDFs
-// themselves, and this document does not carry that yet.
+// web_search_options is the standard Chat Completions way to ask for a web
+// search, so it answers to the web search grant like the vendor's own ways do
+// (operator, 2026-10-20). It is judged by being there at all: whether the
+// vendor searches for every value of it is not something this build can know.
+//
+// What is deliberately not judged, so it does not read as a gap: a model that
+// searches on its own without being asked, and a PDF sent with no engine to a
+// model that cannot read PDFs, which the vendor answers with its paid engine.
+// The last needs to know which models read PDFs themselves, and this document
+// does not carry that yet.
 
 // onlineSuffix asks the vendor to add web results to a model's answer.
 const onlineSuffix = ":online"
@@ -670,6 +789,9 @@ const (
 // modalitiesField names the kinds of output asked for; "image" there makes a
 // chat completion an image generation.
 const modalitiesField = "modalities"
+
+// webSearchOptionsField is the standard Chat Completions web search request.
+const webSearchOptionsField = "web_search_options"
 
 func fenceChatCapabilities(_ *Server, _ *snapshot.Document, _ func(string) *snapshot.Model,
 	key *snapshot.Key, model *snapshot.Model, params map[string]json.RawMessage) *refusal {
@@ -691,6 +813,11 @@ func fenceChatCapabilities(_ *Server, _ *snapshot.Document, _ func(string) *snap
 		}
 	}
 	if online {
+		if rf := needs(snapshot.EndpointWebSearch); rf != nil {
+			return rf
+		}
+	}
+	if raw, ok := params[webSearchOptionsField]; ok && string(bytes.TrimSpace(raw)) != "null" {
 		if rf := needs(snapshot.EndpointWebSearch); rf != nil {
 			return rf
 		}
