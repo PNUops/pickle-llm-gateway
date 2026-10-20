@@ -155,6 +155,9 @@ func TestToolChoiceIsFenced(t *testing.T) {
 		{`{"type":"openrouter:files"}`, "unsupported_parameter"},
 		{`{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"f"},{"type":"code_interpreter"}]}`, "endpoint_not_allowed"},
 		{`{"type":"allowed_tools","mode":"auto","tools":"x"}`, "invalid_parameter_value"},
+		{`{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"code_interpreter"}]}}`, "endpoint_not_allowed"},
+		{`{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"web_search"}]}}`, "endpoint_not_allowed"},
+		{`{"type":"allowed_tools","allowed_tools":[1]}`, "invalid_parameter_value"},
 		{`{"type":5}`, "invalid_parameter_value"},
 		{`[1]`, "invalid_parameter_value"},
 	} {
@@ -176,6 +179,7 @@ func TestToolChoiceIsFenced(t *testing.T) {
 		`{"type":"mcp","server_label":"s"}`,
 		`{"type":"file_search"}`,
 		`{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"f"}]}`,
+		`{"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"f"}}]}}`,
 	} {
 		if status, out := h.chat(t, testToken, body(choice)); status != 200 {
 			t.Errorf("%s: %d %s", choice, status, out)
@@ -198,4 +202,24 @@ func TestToolChoiceIsFenced(t *testing.T) {
 	}
 	status, out, _ := sendMessages(t, m, nil, messagesWith(model, "tool_choice", `{"type":"web_search_20250305"}`))
 	expectAnthropicRefusal(t, status, out, 403, "permission_error", "endpoint_not_allowed")
+}
+
+// web_search_options is an object; a scalar there is a malformed value, not a
+// request for a search, and null is the field left out.
+func TestWebSearchOptionsShape(t *testing.T) {
+	h := newHarness(t, creditPassthroughDoc, nil)
+	body := func(v string) string {
+		return `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"web_search_options":` + v + `}`
+	}
+	for _, v := range []string{"false", "0", `"low"`, "[]"} {
+		if status, out := h.chat(t, testToken, body(v)); status != 400 || errCode(t, out) != "invalid_parameter_value" {
+			t.Errorf("%s: %d %s", v, status, out)
+		}
+	}
+	if status, out := h.chat(t, testToken, body("null")); status != 200 {
+		t.Errorf("null: %d %s", status, out)
+	}
+	if status, out := h.chat(t, testToken, body("{}")); status != 403 || errCode(t, out) != "endpoint_not_allowed" {
+		t.Errorf("{}: %d %s", status, out)
+	}
 }

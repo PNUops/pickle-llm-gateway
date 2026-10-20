@@ -309,8 +309,8 @@ var toolVersionSuffix = regexp.MustCompile(`_(\d{8}|\d{4}_\d{2}_\d{2})$`)
 // canonicalServerTool reduces a tool type to the vendor tool it runs, or ""
 // when it is not one of the vendor's server tools (a caller's function tool, a
 // client-side tool). The "openrouter:" spelling is canonical already and kept
-// as written, so a vendor tool this build has no family for is still judged
-// by the model fields it names.
+// as written, so a vendor tool this build has no family for keeps its own
+// name, which toolTypeRefusal then refuses as unknown.
 func canonicalServerTool(rawType string) string {
 	t := strings.ToLower(strings.TrimSpace(rawType))
 	if strings.HasPrefix(t, serverToolPrefix) {
@@ -541,15 +541,27 @@ func fenceToolChoice(_ *Server, doc *snapshot.Document, lookup func(string) *sna
 		return &refusal{e: errInvalidParamValue(toolChoiceField)}
 	}
 	if strings.EqualFold(strings.TrimSpace(rawType), allowedToolsChoice) {
-		list, ok := choice[toolsField]
-		if !ok || string(bytes.TrimSpace(list)) == "null" {
-			return nil
-		}
-		if e := fenceToolList(doc, lookup, key, list, 1); e != nil {
-			if e.code == "invalid_parameter_value" {
+		// The Responses API carries the list beside the type; Chat
+		// Completions nests it under allowed_tools. Both are read, since a
+		// list in either is the same request.
+		lists := []json.RawMessage{choice[toolsField]}
+		if nested, ok := choice[allowedToolsChoice]; ok && string(bytes.TrimSpace(nested)) != "null" {
+			var inner map[string]json.RawMessage
+			if json.Unmarshal(nested, &inner) != nil {
 				return &refusal{e: errInvalidParamValue(toolChoiceField)}
 			}
-			return &refusal{e: *e, errorType: toolRefusalType(*e)}
+			lists = append(lists, inner[toolsField])
+		}
+		for _, list := range lists {
+			if len(list) == 0 || string(bytes.TrimSpace(list)) == "null" {
+				continue
+			}
+			if e := fenceToolList(doc, lookup, key, list, 1); e != nil {
+				if e.code == "invalid_parameter_value" {
+					return &refusal{e: errInvalidParamValue(toolChoiceField)}
+				}
+				return &refusal{e: *e, errorType: toolRefusalType(*e)}
+			}
 		}
 		return nil
 	}
@@ -617,8 +629,10 @@ func judgeModelValue(doc *snapshot.Document, modelLookup func(string) *snapshot.
 // and it switches itself on for small-context endpoints without the field, so
 // refusing the entry would not close it. It waits on a live call.
 //
-// A plugin this build does not know is forwarded, for the same reason and on
-// the same reversal condition as an unknown server tool (see above).
+// A plugin this build does not know is forwarded. The money it can steer is
+// still bounded by the key's own credit limit, and what leaks is only which
+// model that approved amount is spent on, the reasoning and the reversal
+// condition recorded above for a tool outside the vendor's namespace.
 const pluginsField = "plugins"
 
 const fusionPluginID = "fusion"
@@ -818,6 +832,12 @@ func fenceChatCapabilities(_ *Server, _ *snapshot.Document, _ func(string) *snap
 		}
 	}
 	if raw, ok := params[webSearchOptionsField]; ok && string(bytes.TrimSpace(raw)) != "null" {
+		var opts map[string]json.RawMessage
+		if json.Unmarshal(raw, &opts) != nil {
+			// The field is an object; anything else asks for nothing this
+			// build can name, so it is a malformed value rather than a search.
+			return &refusal{e: errInvalidParamValue(webSearchOptionsField)}
+		}
 		if rf := needs(snapshot.EndpointWebSearch); rf != nil {
 			return rf
 		}

@@ -352,7 +352,7 @@ func errUnsupportedServerTool(toolType string) apiError {
 		msg += ": " + toolType
 	}
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
-		msg + ". 이 서비스는 일반적인 LLM API가 제공하는 도구만 지원합니다. 요청의 tools에서 이 도구를 빼고 다시 보내주세요."}
+		msg + ". 이 서비스는 일반적인 LLM API가 제공하는 도구만 지원합니다. 요청에서 이 도구를 빼고 다시 보내주세요."}
 }
 
 func errMissingParam(name string) apiError {
