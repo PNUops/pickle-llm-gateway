@@ -107,6 +107,7 @@ const (
 	EndpointRerank      = "rerank"
 	EndpointMessages    = "messages"
 	EndpointResponses   = "responses"
+	EndpointCompletions = "completions"
 )
 
 // costLiteralMax bounds the marshaled price. A real one is a handful of

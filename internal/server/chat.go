@@ -302,6 +302,9 @@ type chatStream struct {
 	// sawDone is the upstream's own terminator. A stream that ends without it
 	// ended early, however cleanly the connection closed.
 	sawDone bool
+	// legacyText reads the legacy completions shape, where a choice carries
+	// its text in `text` rather than in `delta.content`.
+	legacyText bool
 }
 
 // An assembled payload that does not parse is dropped, not forwarded: a
@@ -312,7 +315,7 @@ func (c *chatStream) event(e sseEvent) []byte {
 		c.sawDone = true
 		return []byte("data: [DONE]\n\n")
 	}
-	ck, ok := rewriteChunk(payload, c.a.publicName)
+	ck, ok := rewriteChunk(payload, c.a.publicName, c.legacyText)
 	if !ok {
 		// Not valid JSON. A payload that does not even open an object is a
 		// heartbeat/keepalive (`ping`) with nothing structured to leak —
@@ -426,8 +429,9 @@ func (c *chunk) stripUsage() []byte {
 
 // rewriteChunk swaps the model name in one SSE data payload and pulls token
 // usage out of the chunk that carries it. ok=false means the payload did not
-// parse as JSON.
-func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
+// parse as JSON. legacyText reads a legacy completion's `text` instead of a
+// chat delta's content.
+func rewriteChunk(payload []byte, publicName string, legacyText bool) (chunk, bool) {
 	var m map[string]any
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
@@ -450,11 +454,15 @@ func rewriteChunk(payload []byte, publicName string) (chunk, bool) {
 	if choices, _ := m["choices"].([]any); len(choices) > 0 {
 		c.choicesEmpty = false
 		if first, _ := choices[0].(map[string]any); first != nil {
-			if delta, _ := first["delta"].(map[string]any); delta != nil {
-				if content, _ := delta["content"].(string); content != "" {
-					c.content = content
-					c.contentChars = len(content)
-				}
+			var content string
+			if legacyText {
+				content, _ = first["text"].(string)
+			} else if delta, _ := first["delta"].(map[string]any); delta != nil {
+				content, _ = delta["content"].(string)
+			}
+			if content != "" {
+				c.content = content
+				c.contentChars = len(content)
 			}
 		}
 	}
