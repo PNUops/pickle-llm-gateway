@@ -711,9 +711,16 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 // It reads both field namings because this surface does not control which one
 // the vendor uses per route, and a struct that quietly fills with zeros would
 // record a metered request as costing nothing while leaving `estimated` false
-// — a wrong number that says it is exact. A usage object that yields nothing
-// on either naming is therefore reported as absent, which sends the event down
-// the estimate path where the flag says so.
+// — a wrong number that says it is exact. A usage object that yields neither a
+// count on either naming nor a price is therefore reported as absent, which
+// sends the event down the estimate path where the flag says so.
+//
+// A price with no count is reported as usage, with zero tokens. Some calls are
+// not billed by the token at all — a transcription billed by the second, a
+// rerank by the search unit — and the vendor reports their usage as a price
+// and a unit this event has no field for. The price is the figure that
+// matters, and it is exact; inventing tokens from the body size beside it
+// would put a count on the record that no one metered.
 func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 	var envelope struct {
 		Model string `json:"model"`
@@ -756,10 +763,12 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 	}
 	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 		if u.TotalTokens == 0 {
-			// The price is dropped along with the counts. A charge recorded
-			// beside zero tokens would be read as an unmetered request that
-			// still cost money, which is a different and more alarming claim
-			// than the estimate this actually falls back to.
+			if spool.CostLiteral(u.Cost) != "" {
+				// Priced but not counted: the call is billed in a unit
+				// other than tokens. Recorded as zero tokens and the price,
+				// with Estimated false, because neither figure is a guess.
+				return envelope.Model, usage{Cost: u.Cost}, len(envelope.Data), true, true
+			}
 			return envelope.Model, usage{}, len(envelope.Data), false, true
 		}
 		// A total with no split. The event has no field for a total, and
