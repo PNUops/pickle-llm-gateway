@@ -90,8 +90,9 @@ type passthroughRoute struct {
 	nativeModelName bool
 	// audioAnswer marks the routes that answer with audio rather than JSON.
 	// The answer is relayed as it came, under its own media type, and carries
-	// no usage at all: such a route also sets noEstimate and lookupCost, so
-	// its price comes from the generation record.
+	// no usage at all, so nothing is estimated (relayAudio never reads a
+	// count) and such a route also sets lookupCost, so its price comes from
+	// the generation record.
 	audioAnswer bool
 	// openAISpeech marks the speech route, whose OpenAI request fields the
 	// vendor cannot all honour (see refuseOpenAISpeechFields).
@@ -167,7 +168,6 @@ var (
 		method:       http.MethodPost,
 		upstreamPath: "/audio/speech",
 		readsBody:    true,
-		noEstimate:   true,
 		lookupCost:   true,
 		audioAnswer:  true,
 		openAISpeech: true,
