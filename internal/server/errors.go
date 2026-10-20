@@ -55,6 +55,8 @@ var (
 	// act on that by naming a paid model or using the chat route.
 	errModelNotOnMessages = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
 		"자체 서빙 모델은 아직 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+	errModelNotOnResponses = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
+		"자체 서빙 모델은 아직 /v1/responses에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
 		"요청한 모델이 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
 	// Two fences answer with this code, and they need different advice, so the
@@ -115,7 +117,7 @@ var (
 		"upstream_response_too_large",
 		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
-		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/messages, " +
+		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/messages, POST /v1/responses, " +
 			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
@@ -338,8 +340,21 @@ func errEndpointNotAllowed(label string) apiError {
 func errContainerToolNotAllowed(label string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
 		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
-			"모델이 샌드박스에서 명령을 실행하는 서버 도구(shell, bash)는 아직 신청할 수 없는 기능입니다. " +
+			"모델이 샌드박스에서 명령이나 코드를 실행하는 서버 도구(shell, bash, local_shell, code_interpreter)는 아직 신청할 수 없는 기능입니다. " +
 			"요청에서 이 도구를 빼고 다시 보내주세요."}
+}
+
+// errUnsupportedServerTool refuses a tool in the vendor's own namespace that
+// this service does not serve. Same public code as an unknown field, since to
+// an SDK the fact is the same. The canonical name is echoed only when it is
+// short enough to be a real tool name; it is client input.
+func errUnsupportedServerTool(toolType string) apiError {
+	msg := "지원하지 않는 서버 도구입니다"
+	if len(toolType) <= maxPassthroughNameBytes {
+		msg += ": " + toolType
+	}
+	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
+		msg + ". 이 서비스는 일반적인 LLM API가 제공하는 도구만 지원합니다. 요청에서 이 도구를 빼고 다시 보내주세요."}
 }
 
 func errMissingParam(name string) apiError {

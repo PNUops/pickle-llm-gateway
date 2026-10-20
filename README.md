@@ -9,7 +9,7 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 
 ```
 학생 코드 (OpenAI SDK + API Key)
-    │  POST /v1/chat/completions, GET /v1/models
+    │  POST /v1/chat/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
     │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
@@ -35,6 +35,43 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 `/v1/chat/completions`도 기능 권한 `chat`이 있는 Key에만 열립니다. 자체 서빙 모델과 유료 모델
 모두에 적용되고, 채팅 없이 다른 기능만 쓰는 Key가 있기 때문에 기본으로 부여하지 않습니다.
 `GET /v1/models`는 비용이 없으므로 기능 권한 없이 열립니다.
+
+`POST /v1/responses`는 OpenAI Responses API 경로입니다. Codex와 OpenAI SDK의 `responses.create()`가
+이 경로를 부릅니다. 기능 권한은 `/v1/chat/completions`와 같은 `chat`이고 **유료 모델만** 받습니다.
+자체 서빙 모델 이름은 400 `model_not_available_on_route`로 거절합니다. 요청과 응답은 번역하지 않고
+모델 이름만 바꿔 공급자의 `/responses`로 그대로 전달합니다.
+
+- **응답을 저장하지 않습니다.** 공급자가 상태 없는 API만 제공하기 때문입니다. 저장이나 이전 응답
+  참조가 필요한 요청(`store: true`, `previous_response_id`, `conversation`, `background: true`)은
+  필드를 지우지 않고 400 `unsupported_parameter`로 이유와 함께 거절합니다. 지우고 보내면 저장된
+  줄 알고 다음 요청에서 그 id를 쓰다가 엉뚱한 곳에서 실패합니다. 이전 대화는 `input`에 모두 담아
+  보냅니다. `store: false`와 `null`은 통과합니다. Codex는 `store: false`를 보내므로 걸리지 않습니다.
+- **하위 경로는 없습니다.** `/v1/responses/{id}`, `cancel`, `input_items`, `compact`는 저장된 응답을
+  읽는 경로라 인증 전에 404 `unknown_endpoint`로 답하고 기록하지 않습니다.
+- **필수 필드**는 `model`과 `input`이고, 출력 상한 필드는 `max_output_tokens`입니다.
+- **펜스**는 Chat과 같은 자리(`models`, `tools`, `tool_choice`, `plugins`, `preset`, `:online`)에
+  더해 `deferred_tools`와 `input` 항목 안의 `tools` 목록을 봅니다. 문자열도 목록도 아닌 `input`은
+  판정할 수 없어 400 `invalid_parameter_value`로 거절합니다. Codex는 도구 목록을
+  `additional_tools` 입력 항목에 실어 보내고, 클라이언트가 실행한 도구 검색은 찾은 도구를
+  `tool_search_output` 항목으로 돌려주기 때문입니다. Codex가 기본으로 넣는 `web_search` 도구는
+  `web_search` 권한이 없는 Key에서 403 `endpoint_not_allowed`입니다. Codex 설정에서
+  `web_search = "disabled"`로 끄면 빠집니다.
+- **요청 헤더**는 Chat과 같은 셋만 전달합니다. Codex가 붙이는 자기 세션과 턴 헤더는 전달하지
+  않습니다. 응답에는 `X-Generation-Id`를 중계합니다.
+- **스트림**은 `data:` 줄만 쓰고 이벤트 종류는 데이터의 `type`으로 구분합니다. 업스트림이 `event:`
+  줄을 보내도 데이터의 `type`으로 읽습니다. 모델 이름은 응답 객체 안이든 이벤트 최상위든 있는
+  자리에서 바꾸고, 모든 이벤트는 받은 바이트가 아니라 해석한 값을 다시 직렬화해 보냅니다. 객체
+  뒤에 붙은 바이트나 이벤트 안의 줄바꿈이 클라이언트에 그대로 닿지 않게 하기 위해서입니다.
+  `type` 없이 `error` 객체만 담긴 이벤트도 공급자 오류로 보고 끝냅니다. `response.completed`, `response.incomplete`,
+  `response.failed`, `error` 가운데 하나가 오면 응답이 끝난 것으로 보고, 업스트림이 `[DONE]`을
+  보냈든 안 보냈든 그 뒤에 `data: [DONE]` 하나를 붙입니다. 게이트웨이가 스트림 도중에 끊을 때는
+  `{"type":"error","code":...,"message":...}` 이벤트 뒤에 `[DONE]`을 씁니다.
+- **사용량**은 `response.completed`(비스트림은 응답 객체)의 `usage`에서 읽습니다. `input_tokens`는
+  캐시 입력을 포함한 값이고 `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`,
+  `cost`를 함께 기록합니다. `response.incomplete`(출력 상한에 걸려 끊긴 응답)는 사용량이 있으면
+  정상 종료로 기록하고, `response.failed`와 스트림 안의 `error`는 업스트림 오류로 기록합니다.
+  사용량이 없는 응답은 추정하지 않고 그대로 돌려준 뒤 `upstream_usage_missing`으로 기록합니다.
+  본문 보관은 이 경로에서 하지 않습니다.
 
 허용되지 않은 경로는 403 `endpoint_not_allowed`로 답합니다. 경로가 없는 것과 Key에 허용되지
 않은 것은 다른 상태이므로 404로 감추지 않습니다. 거절 문구는 경로가 아니라 기능 이름으로
@@ -149,16 +186,29 @@ response_format  tools  tool_choice  parallel_tool_calls
 도구는 `images` 기능 권한도 함께 요구합니다** — 전용 경로로 부를 때는 필요하고 채팅으로 부를
 때는 필요 없다면 그것은 권한이 아니기 때문입니다. 웹 검색 도구(`openrouter:web_search`)도 같은
 이유로 `web_search` 기능 권한을 요구합니다. 중첩된 도구 목록 안에 있어도 같습니다.
+`namespace` 도구가 묶은 도구(`tools`)와 `tool_choice`가 `type`으로 지정한 도구(`{"type":"web_search"}`,
+`allowed_tools`의 `tools` 목록)도 같은 규칙으로 판정합니다. 도구를 정의하지 않고 `tool_choice`로만
+불러도 같은 권한이 필요합니다.
 
-**샌드박스에서 명령을 실행하는 서버 도구(`openrouter:shell`, `openrouter:bash`)는 `containers`
-기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 어느 Key에서나 403
+**공급자 전용 서버 도구는 아는 것만 받습니다.** `openrouter:` 접두가 붙은 도구 가운데 이 게이트웨이가
+아는 것(`web_search`, `image_generation`, `advisor`, `fusion`, `subagent`, `web_fetch`, `tool_search`,
+`apply_patch`, `datetime`, `experimental__search_models`, `shell`, `bash`)만 위 규칙으로 판정하고,
+나머지는 400 `unsupported_parameter`로 거절합니다. 이 서비스는 일반적인 LLM API가 제공하는 기능을
+지원하고 공급자 전용 확장까지 맞추지는 않기 때문입니다. `openrouter:files`도 지금은 거절합니다.
+접두가 없는 표준 도구(`function`, `custom`, `mcp`, `file_search`, `computer_use_preview` 등)는 그대로
+통과합니다.
+
+**샌드박스에서 명령이나 코드를 실행하는 서버 도구(`openrouter:shell`, `openrouter:bash`,
+`local_shell`, `code_interpreter`)는 `containers` 기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 어느 Key에서나 403
 `endpoint_not_allowed`로 거절하고, 거절 문구는 신청 대신 도구를 빼고 다시 보내라고 안내합니다.
 공급자의 컨테이너는 Key가 아니라 공급자 계정 단위로 묶이고, 어느 컨테이너를 쓸지는 요청에서
 정해집니다. 호출자가 고른 id(`container_reference`)나 `session_id`, `X-Session-Id` 헤더,
 `prompt_cache_key`에서 유도한 id입니다. 같은 계정 아래의 두 Key가 같은 id에 닿으면 서로의 파일을
 읽고 쓸 수 있으므로, Key마다 컨테이너를 따로 쓰게 될 때까지 도구 쪽을 막아 둡니다. 세션 값과
 `prompt_cache_key`는 그대로 전달합니다. 컨테이너가 없으면 프롬프트 캐시용 공급자 고정에만
-쓰이기 때문입니다. 같은 도구가 지정한 모델도 거절 대상이면 이 거절이 먼저입니다.
+쓰이기 때문입니다. 같은 도구가 지정한 모델도 거절 대상이면 이 거절이 먼저입니다. `local_shell`은
+표준 API에서는 클라이언트가 실행하는 도구지만, 공급자는 자기가 직접 서빙하지 않는 모델에서 이 도구를
+샌드박스로 보낸다고 문서화했습니다. `code_interpreter`는 호스팅 컨테이너에서 코드를 실행합니다.
 
 **공급자는 서버 도구 하나를 여러 `type` 철자로 받습니다.** `openrouter:web_search` 말고도
 `web_search`, `web_search_preview`, `web_search_preview_2025_03_11`, `web_search_2025_08_26`가
@@ -328,15 +378,15 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 | 기능 | 여는 것 |
 |---|---|
 | `chat` | `POST /v1/chat/completions`. 자체 서빙과 유료 모델 모두 |
-| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등) |
+| `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등), OpenAI 표준 `web_search_options` |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
-| `containers` | 유료 모델 채팅의 샌드박스 명령 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`), `openrouter:bash` 도구와 날짜 없는 `bash`. **아직 부여하지 않습니다** |
+| `containers` | 유료 모델 채팅의 샌드박스 명령과 코드 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`, `local_shell`), `openrouter:bash` 도구와 날짜 없는 `bash`, `code_interpreter`. **아직 부여하지 않습니다** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은
 거절하지 않고, 거절할 때는 요청을 고쳐 넘기지 않고 403으로 답합니다. 그래서 판정하지 않는 것이
-있습니다. OpenAI 호환 `web_search_options`, 모델 스스로 검색하는 모델, 엔진을 지정하지 않은 PDF를
+있습니다. 모델 스스로 검색하는 모델, 엔진을 지정하지 않은 PDF를
 PDF를 직접 읽지 못하는 모델에 보낸 요청(공급자가 유료 엔진을 기본으로 씁니다)입니다. 판정할 수
 없는 값(`modalities`가 목록이 아니거나 `pdf.engine`이 문자열이 아닌 경우)은 400으로 거절합니다.
 모델 거절과 기능 거절이 겹치면 모델 거절이 먼저입니다.
@@ -422,7 +472,7 @@ HTTP 200으로 시작한 스트림에서도 최상위의 null이 아닌 `error`�
 (`imageCount`), 캐시에서 나온 입력 토큰과 사고에 쓰인 출력 토큰(`cachedInputTokens`,
 `reasoningTokens`), 스트리밍 여부(`streamed`)입니다.
 
-정상으로 끝난 스트림은 Chat, Messages 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
+정상으로 끝난 스트림은 Chat, Messages, Responses 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
 없이 끝나면(클라이언트 연결 끊김, 이벤트 상한 초과, 업스트림 끊김 등) 게이트웨이가 응답을 닫은 뒤
 업스트림의 생성 기록(`GET /generation?id=<X-Generation-Id>`)을 그 Key의 자격증명으로 조회해
 `total_cost`를 `costUsd`에 채우고 나서 항목을 씁니다. 토큰 수는 덮어쓰지 않습니다. 기록은

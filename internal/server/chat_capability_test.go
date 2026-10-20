@@ -97,7 +97,7 @@ func TestChatSubCapabilities(t *testing.T) {
 		{"paid pdf engine", `{"model":"vendor-model",` + messages + `,"plugins":[{"id":"file-parser","pdf":{"engine":"mistral-ocr"}}]}`, snapshot.EndpointPdfOcr},
 		{"image output", `{"model":"vendor-model",` + messages + `,"modalities":["text","image"]}`, snapshot.EndpointImages},
 		{"image generation tool", `{"model":"vendor-model",` + messages + `,"tools":[{"type":"openrouter:image_generation"}]}`, snapshot.EndpointImages},
-		{"web search options", `{"model":"vendor-model",` + messages + `,"web_search_options":{"search_context_size":"low"}}`, ""},
+		{"web search options", `{"model":"vendor-model",` + messages + `,"web_search_options":{"search_context_size":"low"}}`, snapshot.EndpointWebSearch},
 		{"free pdf engine", `{"model":"vendor-model",` + messages + `,"plugins":[{"id":"file-parser","pdf":{"engine":"cloudflare-ai"}}]}`, ""},
 		{"pdf engine left to the vendor", `{"model":"vendor-model",` + messages + `,"plugins":[{"id":"file-parser"}]}`, ""},
 		{"text output", `{"model":"vendor-model",` + messages + `,"modalities":["text"]}`, ""},
