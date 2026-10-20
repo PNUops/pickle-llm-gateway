@@ -114,6 +114,10 @@ func (s *Server) Handler() http.Handler {
 	// surface's own envelope so an Anthropic client can read the refusal.
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 	mux.HandleFunc("/v1/messages/", s.handleMessagesUnknown)
+	// The OpenAI Responses surface. Every subpath reads a stored response,
+	// and nothing is stored, so all of them are answered as unknown.
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+	mux.HandleFunc("/v1/responses/", s.handleResponsesUnknown)
 	// The passthrough surface. Every pattern here is exact, so none of them
 	// competes with the "/v1/models/" subtree above: a request for
 	// /v1/models/{id} still matches the more specific subtree pattern, and
