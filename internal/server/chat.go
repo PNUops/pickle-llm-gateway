@@ -136,6 +136,7 @@ var protoChat = &protocol{
 		fencePresetField,
 		fenceCandidates,
 		fenceServerToolsStep,
+		fenceToolChoice,
 		fencePluginsStep,
 		fenceChatCapabilities,
 	},
