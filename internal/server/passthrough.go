@@ -346,7 +346,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 
 			// The model fence, unchanged and not rebuilt. passthroughModel
 			// synthesizes the CREDIT-axis model this name would resolve to and
-			// AllowsCreditModel compares lower-cased strings without consulting
+			// ServesCreditModel compares lower-cased strings without consulting
 			// the catalogue, so a name no catalogue lists is fenced exactly as
 			// it is on chat.
 			// See chat.go: a preset name resolves to nothing and must not come

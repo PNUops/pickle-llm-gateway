@@ -407,12 +407,32 @@ func TestRouterModelRefusedOnUnfencedKey(t *testing.T) {
 	if status != http.StatusBadRequest || errCode(t, body) != "router_not_supported" {
 		t.Fatalf("responses: %d %s", status, body)
 	}
-	// A router named as a fallback candidate is refused too, by that field's
-	// own refusal.
-	h = newHarness(t, creditPassthroughDoc, nil)
-	status, body = h.chat(t, testToken, `{"model":"vendor-model","messages":[],"models":["vendor-model","openrouter/auto"]}`)
-	if status != http.StatusForbidden || errCode(t, body) != "model_not_allowed" {
-		t.Fatalf("candidate: %d %s", status, body)
+	// A router named anywhere else a model can be named is refused by that
+	// field's own refusal, which says where it was and gives the router's
+	// advice rather than sending the caller to a key setting.
+	for _, tc := range []struct{ name, body, field string }{
+		{"candidate", `{"model":"vendor-model","messages":[],"models":["vendor-model","openrouter/auto"]}`, "models"},
+		{"server tool", `{"model":"vendor-model","messages":[],"tools":[{"type":"openrouter:advisor","parameters":{"model":"openrouter/auto"}}]}`, "tools"},
+		{"nested tool", `{"model":"vendor-model","messages":[],"tools":[{"type":"openrouter:fusion","parameters":{"tools":[{"type":"openrouter:advisor","parameters":{"model":"~openrouter/free"}}]}}]}`, "tools"},
+		{"fusion plugin", `{"model":"vendor-model","messages":[],"plugins":[{"id":"fusion","model":"openai/gpt-5","analysis_models":["openrouter/auto"]}]}`, "plugins"},
+	} {
+		h = newHarness(t, creditPassthroughDoc, nil)
+		status, body = h.chat(t, testToken, tc.body)
+		msg := errMessage(t, body)
+		if status != http.StatusForbidden || errCode(t, body) != "model_not_allowed" ||
+			!strings.Contains(msg, tc.field) || !strings.Contains(msg, "일반적인 LLM API") {
+			t.Fatalf("%s: %d %s", tc.name, status, body)
+		}
+		if h.mock.callCount() != 0 {
+			t.Fatalf("%s reached the upstream", tc.name)
+		}
+	}
+	h, _ = messagesHarness(t, nil)
+	status, body, _ = sendMessages(t, h, nil,
+		messagesWith("anthropic/claude-sonnet-4.5", "fallbacks", `[{"model":"openrouter/auto"}]`))
+	if status != http.StatusForbidden || json.Unmarshal(body, &e) != nil || e.Error.Code != "model_not_allowed" ||
+		!strings.Contains(string(body), "fallbacks") {
+		t.Fatalf("messages fallbacks: %d %s", status, body)
 	}
 }
 

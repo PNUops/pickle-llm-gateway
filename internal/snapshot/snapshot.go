@@ -512,11 +512,11 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	// string, so it is the caller's, and passthrough is what opens that surface.
 	name := strings.ToLower(strings.TrimSpace(m.PublicName))
 	// A router name sidesteps both lists: whichever model it resolves to is
-	// what gets billed, and that model is chosen after this fence has run. A
-	// key carrying no fence loses nothing by being refused one — its money is
-	// the only bound it ever had — but a key carrying one has had a decision
-	// made about which models it may reach, and the name that can walk around
-	// that decision is exactly the one that must not be the exception.
+	// what gets billed, and that model is chosen after this fence has run, so
+	// a key carrying a fence refuses it here. This is the list policy the api
+	// and the console mirror, and on an unfenced key it still admits a router;
+	// the gateway refuses routers on every key through ServesCreditModel, which
+	// is the question it actually asks.
 	//
 	// This lives inside the fence rather than at its call sites so that no
 	// caller can consult the lists without it. The call sites read the same

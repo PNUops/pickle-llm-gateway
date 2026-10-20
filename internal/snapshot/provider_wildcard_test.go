@@ -131,3 +131,30 @@ func TestProviderWildcardDoesNotGovernTokenAxis(t *testing.T) {
 		t.Fatal("paid model lists refused a self-serving model")
 	}
 }
+
+// ServesCreditModel adds the router refusal to the shared policy without
+// changing it: AllowsCreditModel still admits a router on an unfenced key, as
+// the policy cases the other clients mirror say, and only the gateway's
+// question refuses it. A self-served model is never a router.
+func TestServesCreditModelRefusesRoutersOnly(t *testing.T) {
+	var unfenced Key
+	for _, name := range []string{"openrouter/auto", "~openrouter/free", " OpenRouter/Auto:nitro"} {
+		m := creditModel(name)
+		if !unfenced.AllowsCreditModel(m) {
+			t.Fatalf("policy changed for %q", name)
+		}
+		if unfenced.ServesCreditModel(m) {
+			t.Fatalf("router %q served", name)
+		}
+	}
+	if !unfenced.ServesCreditModel(creditModel("openai/gpt-4o")) {
+		t.Fatal("an ordinary model refused")
+	}
+	if !unfenced.ServesCreditModel(&Model{PublicName: "openrouter/campus", BudgetAxis: AxisToken}) {
+		t.Fatal("a self-served model refused for its name")
+	}
+	fenced := Key{CreditDeniedModels: []string{"openai/*"}}
+	if fenced.ServesCreditModel(creditModel("openai/gpt-4o")) {
+		t.Fatal("the policy no longer applies")
+	}
+}

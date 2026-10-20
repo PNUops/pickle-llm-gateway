@@ -11,6 +11,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 )
 
 type apiError struct {
@@ -175,6 +177,9 @@ func errParamNeedsCreditModel(name string) apiError {
 // different field — but the advice has to say where the name was, because the
 // caller did not put it in `model` and would not find it by looking there.
 func errToolModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("tools가 지정한 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 tools가 지정한 모델을 사용할 수 없습니다. " +
@@ -198,6 +203,9 @@ func errToolModelRequired(toolType, param string) apiError {
 // A model named by a `plugins` entry. Same rule and code as the tools refusal;
 // the advice says where the name was for the same reason.
 func errPluginModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("plugins가 지정한 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 plugins가 지정한 모델을 사용할 수 없습니다. " +
@@ -258,12 +266,28 @@ func errRouterModelNotSupported(name string) apiError {
 			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해주세요."}
 }
 
+// routerInField is a field refusal for a router name. It keeps the field's
+// code, and the field's name, so the caller still learns where the name was,
+// but the advice is the router's: there is no key setting to look up, since
+// no key may use a router.
+func routerInField(field, name string) (apiError, bool) {
+	if name == "" || len(name) > maxPassthroughNameBytes || !snapshot.IsRouterModelName(name) {
+		return apiError{}, false
+	}
+	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
+		field + "자동 선택 모델(" + name + ")은 지원하지 않습니다. " +
+			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해주세요."}, true
+}
+
 // A fallback candidate the key may not be billed for. It names the entry
 // because the caller sent a list and cannot otherwise tell which one is the
 // problem, and the name is echoed back only when it is short enough to be a
 // real model name — the field is client input, and a refusal is no place to
 // reflect a kilobyte of it.
 func errCandidateModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("대체 모델 목록(models)의 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 대체 모델 목록(models)에 적힌 모델을 사용할 수 없습니다. " +
@@ -277,6 +301,9 @@ func errCandidateModelNotAllowed(name string) apiError {
 // The same refusal for the Messages surface's own fallback list, named the
 // way the caller wrote it.
 func errFallbackModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("대체 모델 목록(fallbacks)의 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 대체 모델 목록(fallbacks)에 적힌 모델을 사용할 수 없습니다. " +
