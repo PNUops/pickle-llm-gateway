@@ -62,7 +62,7 @@ func TestProviderWildcardKeepsRouterNamesFenced(t *testing.T) {
 	h := newHarness(t, passthroughAllowlistDoc("*/*"), nil)
 	for _, name := range []string{"openrouter/auto", "~openrouter/free", "~~openrouter/auto:nitro"} {
 		status, body := h.chat(t, testToken, chatFor(name))
-		if status != http.StatusForbidden || errCode(t, body) != "model_not_allowed" {
+		if status != http.StatusBadRequest || errCode(t, body) != "router_not_supported" {
 			t.Fatalf("router %q: got %d %s", name, status, body)
 		}
 	}

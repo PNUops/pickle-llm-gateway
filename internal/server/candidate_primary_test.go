@@ -122,7 +122,7 @@ func TestModelsFirstEntryNamingRules(t *testing.T) {
 		code         string
 	}{
 		{"preset", `["@preset/mine"]`, 400, "preset_not_supported"},
-		{"router under a fence", `["openrouter/auto"]`, 403, "model_not_allowed"},
+		{"router", `["openrouter/auto"]`, 400, "router_not_supported"},
 		{"reserved self-serve name", `["pickle-generall"]`, 404, "model_not_found"},
 		{"self-served model as a candidate", `["pickle-general"]`, 400, "unsupported_parameter"},
 		{"empty first entry", `["","openai/gpt-4o-mini"]`, 400, "invalid_parameter_value"},

@@ -302,7 +302,7 @@ func servableModel(doc *snapshot.Document, key *snapshot.Key, modelLookup func(s
 			m = p
 		}
 	}
-	if m == nil || !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
+	if m == nil || !key.AllowsModel(m) || !key.ServesCreditModel(m) {
 		return nil
 	}
 	return m
@@ -399,7 +399,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	var models []*snapshot.Model
 	for i := range doc.Models {
 		m := &doc.Models[i]
-		if !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
+		if !key.AllowsModel(m) || !key.ServesCreditModel(m) {
 			continue
 		}
 		models = append(models, m)
