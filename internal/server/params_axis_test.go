@@ -324,11 +324,9 @@ func TestSelfHostedRefusesCandidateModels(t *testing.T) {
 // A router name is not a model: the vendor resolves it at request time and
 // bills whatever it picked, so no list here can bound it. A key that carries a
 // fence has had a decision made about which models it may reach, and this name
-// walks around that decision.
-//
-// The reachable shape is the usual one: the allow list left open and the
-// expensive names denied. An empty allow list admits the router, and the deny
-// list never matches it.
+// walks around that decision. It is refused on every key now (see the
+// unfenced test below); the fenced shapes stay because they are where the
+// router was first closed.
 func TestRouterModelRefusedOnFencedKey(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -344,7 +342,7 @@ func TestRouterModelRefusedOnFencedKey(t *testing.T) {
 			}, nil)
 			body := `{"model":"openrouter/auto","messages":[{"role":"user","content":"hi"}]}`
 			status, resp := h.chat(t, testToken, body)
-			if status != http.StatusForbidden || errCode(t, resp) != "model_not_allowed" {
+			if status != http.StatusBadRequest || errCode(t, resp) != "router_not_supported" {
 				t.Fatalf("%d %s", status, resp)
 			}
 			// The advice differs from the ordinary fence refusal: the remedy is
@@ -356,19 +354,77 @@ func TestRouterModelRefusedOnFencedKey(t *testing.T) {
 				t.Fatal("a router name reached the upstream on a fenced key")
 			}
 			evs := h.spoolEvents(t)
-			if len(evs) != 1 || evs[0].ErrorType != "router_model_not_allowed" {
+			if len(evs) != 1 || evs[0].ErrorType != "router_model_not_supported" {
 				t.Fatalf("spooled %+v", evs)
 			}
 		})
 	}
 }
 
-// A key with no fence at all is bounded only by the money it was granted, so
-// the router takes nothing away from it and stays available.
-func TestRouterModelAllowedOnUnfencedKey(t *testing.T) {
-	h := newHarness(t, creditPassthroughDoc, nil)
-	body := `{"model":"openrouter/auto","messages":[{"role":"user","content":"hi"}]}`
-	if status, resp := h.chat(t, testToken, body); status != 200 {
+// A key with no fence used to keep the router, on the reasoning that its money
+// was its only bound and the router took nothing away from it. That reversed
+// on 2026-10-21: the vendor's routers are its own feature rather than part of
+// the general model APIs this service covers, and no request on record had
+// used one. So an unfenced key is refused like any other, on every surface a
+// model can be named: chat, Messages, Responses, the passthrough routes and
+// the single-model retrieve.
+func TestRouterModelRefusedOnUnfencedKey(t *testing.T) {
+	for _, name := range []string{"openrouter/auto", "~openrouter/free", "OpenRouter/Auto:nitro"} {
+		h := newHarness(t, func(d *snapshot.Document) {
+			creditPassthroughDoc(d)
+			d.Keys[0].PassthroughEndpoints = append(d.Keys[0].PassthroughEndpoints, snapshot.EndpointEmbeddings)
+		}, nil)
+		status, resp := h.chat(t, testToken, chatFor(name))
+		if status != http.StatusBadRequest || errCode(t, resp) != "router_not_supported" {
+			t.Fatalf("chat %q: %d %s", name, status, resp)
+		}
+		if msg := errMessage(t, resp); !strings.Contains(msg, "일반적인 LLM API") {
+			t.Fatalf("message does not say what to use instead: %s", msg)
+		}
+		if h.mock.callCount() != 0 {
+			t.Fatalf("%q reached the upstream", name)
+		}
+		if status, _ := getModels(t, h, "/v1/models/"+name, testToken, false); status != http.StatusNotFound {
+			t.Fatalf("retrieve %q: %d", name, status)
+		}
+		status, resp = h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken,
+			`{"model":"`+name+`","input":"hi"}`)
+		if status != http.StatusBadRequest || errCode(t, resp) != "router_not_supported" {
+			t.Fatalf("passthrough %q: %d %s", name, status, resp)
+		}
+	}
+
+	h, _ := messagesHarness(t, nil)
+	status, body, _ := sendMessages(t, h, nil, messagesFor("openrouter/auto"))
+	var e struct {
+		Error struct{ Type, Code string } `json:"error"`
+	}
+	if status != http.StatusBadRequest || json.Unmarshal(body, &e) != nil || e.Error.Code != "router_not_supported" {
+		t.Fatalf("messages: %d %s", status, body)
+	}
+	h, _ = responsesHarness(t, nil)
+	status, body, _ = sendResponses(t, h, nil, responsesFor("openrouter/auto"))
+	if status != http.StatusBadRequest || errCode(t, body) != "router_not_supported" {
+		t.Fatalf("responses: %d %s", status, body)
+	}
+	// A router named as a fallback candidate is refused too, by that field's
+	// own refusal.
+	h = newHarness(t, creditPassthroughDoc, nil)
+	status, body = h.chat(t, testToken, `{"model":"vendor-model","messages":[],"models":["vendor-model","openrouter/auto"]}`)
+	if status != http.StatusForbidden || errCode(t, body) != "model_not_allowed" {
+		t.Fatalf("candidate: %d %s", status, body)
+	}
+}
+
+// A catalogued self-served model is not a router whatever it is called: the
+// rule is about what the vendor resolves, and the TOKEN axis never reaches it.
+func TestRouterRuleSparesTokenAxisCatalogue(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		creditPassthroughDoc(d)
+		d.Models = append(d.Models, snapshot.Model{PublicName: "openrouter/campus", UpstreamRef: "mock",
+			UpstreamModel: upstreamModel, BudgetAxis: snapshot.AxisToken})
+	}, nil)
+	if status, resp := h.chat(t, testToken, chatFor("openrouter/campus")); status != 200 {
 		t.Fatalf("%d %s", status, resp)
 	}
 }

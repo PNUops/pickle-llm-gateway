@@ -2024,7 +2024,7 @@ func allAPIErrors() map[string]apiError {
 		"errContainerToolNotAllowed(x)":  errContainerToolNotAllowed("x"),
 		"errCandidateModelNotAllowed(x)": errCandidateModelNotAllowed("x"),
 		"errToolModelNotAllowed(x)":      errToolModelNotAllowed("x"),
-		"errRouterModelNotAllowed(x)":    errRouterModelNotAllowed("x"),
+		"errRouterModelNotSupported(x)":  errRouterModelNotSupported("x"),
 		"errCreditModelNotAllowed":       errCreditModelNotAllowed,
 		"errParamNeedsCreditModel(x)":    errParamNeedsCreditModel("x"),
 	}

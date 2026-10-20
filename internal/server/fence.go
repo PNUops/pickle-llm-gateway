@@ -150,7 +150,7 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 	if !m.CreditAxis() {
 		return false
 	}
-	return key.AllowsModel(m) && key.AllowsCreditModel(m)
+	return key.AllowsModel(m) && key.ServesCreditModel(m)
 }
 
 // The vendor's server tools are the sixth channel, and they arrive inside

@@ -367,12 +367,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// and the guard is what bounds it — assigning any earlier would
 			// let a refused request write kilobytes of junk to both.
 			ev.PublicModelName = model.PublicName
-			if !key.AllowsCreditModel(model) {
+			if !key.ServesCreditModel(model) {
 				// See chat.go: the two predicates are re-read only to pick the
 				// message, never to decide.
-				if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
-					refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
-						"router_model_not_allowed")
+				if snapshot.IsRouterModelName(publicModel) {
+					refuseAs(errRouterModelNotSupported(publicModel), spool.StatusBadRequest,
+						"router_model_not_supported")
 					return
 				}
 				refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,

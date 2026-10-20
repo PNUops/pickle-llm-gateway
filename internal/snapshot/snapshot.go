@@ -474,6 +474,26 @@ func (k *Key) HasCreditFence() bool {
 	return len(k.CreditAllowedModels) > 0 || len(k.CreditDeniedModels) > 0
 }
 
+// ServesCreditModel is the question the gateway asks before it spends money on
+// a model: AllowsCreditModel, and the model is not one of the vendor's
+// routers. The router rule is the gateway's own and lives here rather than in
+// AllowsCreditModel because that function is the money-list policy the api and
+// the console mirror case for case (testdata/credit_model_policy_cases.json):
+// the lists still mean what they meant, and the gateway no longer serves a
+// router to any key, fenced or not.
+//
+// The vendor's routers are its own feature rather than part of the general
+// model APIs this service covers, and whichever model one resolves to is
+// billed after every fence has run. They used to be refused only on a key
+// carrying a fence, on the reasoning that an unfenced key's money was its only
+// bound; all keys refuse them since 2026-10-21, with no router use on record.
+func (k *Key) ServesCreditModel(m *Model) bool {
+	if m.CreditAxis() && IsRouterModelName(m.PublicName) {
+		return false
+	}
+	return k.AllowsCreditModel(m)
+}
+
 func (k *Key) AllowsCreditModel(m *Model) bool {
 	if !m.CreditAxis() {
 		return true
