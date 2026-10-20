@@ -254,3 +254,21 @@ func TestCompletionsChunkText(t *testing.T) {
 		t.Fatalf("answer %q", res.answer)
 	}
 }
+
+// A vendor router is refused on this route for every key, a key with no money
+// fence included, as on chat: it would pick and bill a model nobody judged.
+func TestCompletionsRefusesRouterModels(t *testing.T) {
+	h, v := completionsHarness(t, nil)
+	for _, name := range []string{"openrouter/auto", "~openrouter/free"} {
+		status, body, _ := sendTo(t, h, "/v1/completions", nil, completionsFor(name))
+		if status != 400 || errCode(t, body) != "router_not_supported" {
+			t.Fatalf("%s: %d %s", name, status, body)
+		}
+	}
+	if v.callCount() != 0 {
+		t.Fatal("a router request reached the vendor")
+	}
+	if ev := lastEvent(t, h); ev.ErrorType != "router_model_not_supported" {
+		t.Fatalf("record: %+v", ev)
+	}
+}
