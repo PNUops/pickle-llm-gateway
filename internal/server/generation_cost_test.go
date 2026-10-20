@@ -90,7 +90,8 @@ func generationHarnessFor(t *testing.T, doc func(*snapshot.Document), cfg func(*
 		}
 	})
 	g.setInner(h.mock.handler)
-	h.srv.costs.delays = delays
+	h.srv.costs.stream.delays = delays
+	h.srv.costs.passthrough.delays = delays
 	return h, g
 }
 
@@ -241,7 +242,7 @@ func TestGenerationCostSurvivesDroppedEstimate(t *testing.T) {
 // nothing more is admitted.
 func TestGenerationLookupsDoNotBlockAndAreBounded(t *testing.T) {
 	h, g := generationHarness(t, []time.Duration{time.Hour}, generationAnswer{200, generationRecordOK})
-	h.srv.costs.slots = make(chan struct{}, 1)
+	h.srv.costs.stream.slots = make(chan struct{}, 1)
 
 	start := time.Now()
 	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
@@ -287,7 +288,7 @@ func TestGenerationLookupsDoNotBlockAndAreBounded(t *testing.T) {
 func TestGenerationLookupStopsAtTheDeadline(t *testing.T) {
 	h, g := generationHarness(t, []time.Duration{time.Millisecond, time.Hour},
 		generationAnswer{404, `{"error":{"code":404}}`})
-	h.srv.costs.deadline = 200 * time.Millisecond
+	h.srv.costs.stream.deadline = 200 * time.Millisecond
 	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
 		t.Fatalf("%d %s", status, body)
 	}
@@ -306,9 +307,35 @@ func TestGenerationLookupStopsAtTheDeadline(t *testing.T) {
 	}
 }
 
-// A passthrough answer that ends without a price has it read from the
-// generation record, as a stream's does, with the passthrough credential and
-// on the passthrough surface's own counters. The wait is not latency.
+// lookupRouteServer serves the embedding route as a route whose usage is
+// optional, so every unpriced answer on it is looked up.
+func lookupRouteServer(t *testing.T, h *harness) string {
+	t.Helper()
+	route := routeEmbeddings
+	route.lookupCost = true
+	srv := httptest.NewServer(h.srv.handlePassthrough(route))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func postEmbedding(t *testing.T, url string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(embeddingBody))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// On a route whose usage is optional, an answer that ends without a price has
+// it read from the generation record, as a stream's does, with the
+// passthrough credential, on the passthrough pool and counters. The wait is
+// not latency.
 func TestPassthroughWithoutCostReadsTheGenerationRecord(t *testing.T) {
 	h, g := generationHarnessFor(t, passthroughDoc(snapshot.EndpointEmbeddings), nil,
 		[]time.Duration{300 * time.Millisecond, 10 * time.Millisecond},
@@ -317,8 +344,7 @@ func TestPassthroughWithoutCostReadsTheGenerationRecord(t *testing.T) {
 	h.mock.set(func(o *mockOpts) {
 		o.rawResp = `{"data":[],"usage":{"prompt_tokens":3,"total_tokens":3}}`
 	})
-	status, body := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody)
-	if status != 200 {
+	if status, body := postEmbedding(t, lookupRouteServer(t, h)); status != 200 {
 		t.Fatalf("%d %s", status, body)
 	}
 	h.srv.DrainCostLookups(context.Background())
@@ -338,6 +364,39 @@ func TestPassthroughWithoutCostReadsTheGenerationRecord(t *testing.T) {
 	if h.srv.metrics.passthroughCostFilled.Load() != 1 || h.srv.metrics.streamCostFilled.Load() != 0 {
 		t.Fatalf("counters: passthrough %d, stream %d", h.srv.metrics.passthroughCostFilled.Load(),
 			h.srv.metrics.streamCostFilled.Load())
+	}
+}
+
+// A price of zero is the vendor's figure like any other, and is not looked up
+// even where every unpriced answer is: a tiny rerank and a cache hit both
+// really cost nothing.
+func TestPassthroughZeroCostIsNotLookedUp(t *testing.T) {
+	h, g := generationHarnessFor(t, passthroughDoc(snapshot.EndpointEmbeddings), nil,
+		[]time.Duration{10 * time.Millisecond}, generationAnswer{200, generationRecordOK})
+	h.mock.set(func(o *mockOpts) { o.rawResp = `{"data":[],"usage":{"total_tokens":0,"cost":0}}` })
+	if status, body := postEmbedding(t, lookupRouteServer(t, h)); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	h.srv.DrainCostLookups(context.Background())
+	if ev := lastEvent(t, h); ev.CostUsd != "0" || ev.InputTokens != 0 || ev.Estimated || g.readCount() != 0 {
+		t.Fatalf("record %+v after %d reads", ev, g.readCount())
+	}
+}
+
+// On a route that reports usage on every call, a successful answer without a
+// price is written as it came, without a vendor read per call.
+func TestPassthroughSuccessWithoutCostIsNotLookedUp(t *testing.T) {
+	h, g := generationHarnessFor(t, passthroughDoc(snapshot.EndpointEmbeddings), nil,
+		[]time.Duration{10 * time.Millisecond}, generationAnswer{200, generationRecordOK})
+	h.mock.set(func(o *mockOpts) {
+		o.rawResp = `{"data":[],"usage":{"prompt_tokens":3,"total_tokens":3}}`
+	})
+	if status, body := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody); status != 200 {
+		t.Fatalf("%d %s", status, body)
+	}
+	h.srv.DrainCostLookups(context.Background())
+	if ev := lastEvent(t, h); ev.Status != spool.StatusOK || ev.CostUsd != "" || ev.InputTokens != 3 || g.readCount() != 0 {
+		t.Fatalf("record %+v after %d reads", ev, g.readCount())
 	}
 }
 
@@ -407,22 +466,62 @@ func TestPassthroughTooLargeStillReadsTheCost(t *testing.T) {
 	}
 }
 
-// A record that never appears leaves the event without a price, counted as
-// missing, and the event is still written.
+// An answer refused because it is not JSON was still billed, so its price is
+// looked up; a record that never appears leaves the event without one,
+// counted as missing, and the event is still written.
 func TestPassthroughCostLookupGivesUp(t *testing.T) {
-	h, _ := generationHarnessFor(t, passthroughDoc(snapshot.EndpointEmbeddings), nil,
-		[]time.Duration{5 * time.Millisecond, 5 * time.Millisecond},
-		generationAnswer{404, `{"error":{"message":"Generation not found","code":404}}`})
-	h.mock.set(func(o *mockOpts) { o.rawResp = `{"data":[]}` })
-	if status, body := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody); status != 200 {
+	for _, tc := range []struct {
+		name    string
+		answers []generationAnswer
+		cost    string
+	}{
+		{"found", []generationAnswer{{200, generationRecordOK}}, "0.000023"},
+		{"never published", []generationAnswer{{404, `{"error":{"message":"Generation not found","code":404}}`}}, ""},
+	} {
+		h, _ := generationHarnessFor(t, passthroughDoc(snapshot.EndpointEmbeddings), nil,
+			[]time.Duration{5 * time.Millisecond, 5 * time.Millisecond}, tc.answers...)
+		h.mock.set(func(o *mockOpts) { o.rawResp = `{"data":` })
+		status, body := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody)
+		if status != http.StatusBadGateway {
+			t.Fatalf("%s: %d %s", tc.name, status, body)
+		}
+		h.srv.DrainCostLookups(context.Background())
+		ev := lastEvent(t, h)
+		if ev.Status != spool.StatusUpstreamErr || ev.ErrorType != "upstream_invalid_response" || string(ev.CostUsd) != tc.cost {
+			t.Fatalf("%s: record: %+v", tc.name, ev)
+		}
+		filled, missing := h.srv.metrics.passthroughCostFilled.Load(), h.srv.metrics.passthroughCostMissing.Load()
+		if (tc.cost != "") != (filled == 1) || (tc.cost == "") != (missing == 1) {
+			t.Fatalf("%s: filled %d missing %d", tc.name, filled, missing)
+		}
+	}
+}
+
+// The passthrough pool is its own: with it full, a passthrough answer is
+// written without a price at once, and a broken-off stream still gets its
+// lookup.
+func TestPassthroughPoolDoesNotStarveStreams(t *testing.T) {
+	h, g := generationHarnessFor(t, func(d *snapshot.Document) {
+		creditDoc(d)
+		passthroughDoc(snapshot.EndpointEmbeddings)(d)
+		d.Keys[0].UpstreamCredentials = map[string]string{"mock": keyCred}
+	}, nil, []time.Duration{10 * time.Millisecond}, generationAnswer{200, generationRecordOK})
+	h.srv.costs.passthrough.slots = make(chan struct{}, 1)
+	h.srv.costs.passthrough.slots <- struct{}{}
+	h.mock.set(func(o *mockOpts) { o.rawResp = `{"data":` })
+	if status, _ := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody); status != http.StatusBadGateway {
+		t.Fatalf("status %d", status)
+	}
+	if ev := lastEvent(t, h); ev.CostUsd != "" || h.srv.metrics.passthroughCostMissing.Load() != 1 {
+		t.Fatalf("full pool: %+v", ev)
+	}
+	h.mock.set(func(o *mockOpts) { o.rawResp = "" })
+	if status, body := h.chat(t, testToken, creditStreamBody); status != 200 {
 		t.Fatalf("%d %s", status, body)
 	}
 	h.srv.DrainCostLookups(context.Background())
-	ev := lastEvent(t, h)
-	if ev.Status != spool.StatusOK || ev.CostUsd != "" || !ev.Estimated {
-		t.Fatalf("record: %+v", ev)
+	if ev := lastEvent(t, h); ev.CostUsd != "0.000023" || g.readCount() != 1 {
+		t.Fatalf("stream: %+v after %d reads", ev, g.readCount())
 	}
-	if h.srv.metrics.passthroughCostMissing.Load() != 1 {
-		t.Fatalf("missing %d", h.srv.metrics.passthroughCostMissing.Load())
-	}
+	<-h.srv.costs.passthrough.slots
 }

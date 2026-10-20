@@ -80,8 +80,12 @@ func largeWriteBudget(n int) time.Duration {
 // clears it afterwards, so the rest of a stream is not held to it. A writer
 // that cannot take a deadline writes without one.
 func (s *Server) writeUnderDeadline(w http.ResponseWriter, n int, write func()) {
+	budget := s.writeBudget
+	if budget == nil {
+		budget = largeWriteBudget
+	}
 	rc := http.NewResponseController(w)
-	if rc.SetWriteDeadline(time.Now().Add(s.writeBudget(n))) != nil {
+	if rc.SetWriteDeadline(time.Now().Add(budget(n))) != nil {
 		write()
 		return
 	}

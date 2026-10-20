@@ -71,6 +71,11 @@ type passthroughRoute struct {
 	// refuseOpenAIImageFields), because the vendor would drop them without a
 	// word and the caller would get something other than what they asked for.
 	openAIImages bool
+	// lookupCost marks the routes whose usage the vendor does not always
+	// report: every answer that ends without a price has it read from the
+	// generation record. On the other routes only an answer that failed
+	// after the vendor billed it is looked up (see handlePassthrough).
+	lookupCost bool
 }
 
 var (
@@ -507,15 +512,28 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
 		//
-		// From here on the vendor has answered 2xx and may have billed, so an
-		// event that ends without a price — usage absent or unpriced, or an
-		// answer refused for size or shape — has it read from the generation
-		// record (generation_cost.go). A catalogue read is not billed and is
-		// not looked up.
+		// From here on the vendor has answered 200 and has billed, so an
+		// answer this gateway then failed to hand over (refused for its size
+		// or shape, cut off while being read, or not taken by the client) has
+		// its price read from the generation record (generation_cost.go) if
+		// it ended without one. A route whose usage is optional has every
+		// unpriced answer looked up. A successful answer on the other routes
+		// is not: those report their usage on every call, so a success
+		// without a price is not something a lookup per call should paper
+		// over, and doing it for every embedding call would put a vendor read
+		// behind each one. A catalogue read is not billed and is not looked
+		// up.
 		finish := record
 		if route.readsBody {
-			finish = s.withGenerationCost(resp.Header, up, key.CredentialFor(ref), &ev, stopClock, record,
-				&s.metrics.passthroughCostFilled, &s.metrics.passthroughCostMissing)
+			lookup := s.withGenerationCost(resp.Header.Get(generationIDHeader), up, key.CredentialFor(ref),
+				&ev, stopClock, record, &s.costs.passthrough)
+			finish = func() {
+				if route.lookupCost || ev.Status != spool.StatusOK {
+					lookup()
+					return
+				}
+				record()
+			}
 		}
 		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, finish)
 	}
