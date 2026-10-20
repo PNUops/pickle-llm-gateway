@@ -100,15 +100,16 @@ type Event struct {
 // Route names. An open vocabulary: the control plane stores one it does not
 // recognise rather than refusing the event.
 const (
-	EndpointChat        = "chat"
-	EndpointImages      = "images"
-	EndpointImageModels = "images_models"
-	EndpointEmbeddings  = "embeddings"
-	EndpointRerank      = "rerank"
-	EndpointSpeech      = "audio_speech"
-	EndpointMessages    = "messages"
-	EndpointResponses   = "responses"
-	EndpointCompletions = "completions"
+	EndpointChat           = "chat"
+	EndpointImages         = "images"
+	EndpointImageModels    = "images_models"
+	EndpointEmbeddings     = "embeddings"
+	EndpointRerank         = "rerank"
+	EndpointSpeech         = "audio_speech"
+	EndpointTranscriptions = "audio_transcriptions"
+	EndpointMessages       = "messages"
+	EndpointResponses      = "responses"
+	EndpointCompletions    = "completions"
 )
 
 // costLiteralMax bounds the marshaled price. A real one is a handful of

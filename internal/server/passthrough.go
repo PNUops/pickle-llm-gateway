@@ -97,6 +97,14 @@ type passthroughRoute struct {
 	// openAISpeech marks the speech route, whose OpenAI request fields the
 	// vendor cannot all honour (see refuseOpenAISpeechFields).
 	openAISpeech bool
+	// multipartForm marks the routes that also take an OpenAI-style multipart
+	// upload (see readTranscriptionForm). A JSON body is read as on every
+	// other route.
+	multipartForm bool
+	// openAITranscriptions marks the transcription route, whose OpenAI
+	// request fields the vendor cannot all honour (see
+	// refuseOpenAITranscriptionFields).
+	openAITranscriptions bool
 	// generationIDInBody marks the routes whose answer names its generation
 	// in the body's `id` rather than in the X-Generation-Id header. The body
 	// id is used for the cost lookup only when the header is absent.
@@ -172,6 +180,22 @@ var (
 		audioAnswer:  true,
 		openAISpeech: true,
 	}
+	// The OpenAI SDK's speech-to-text path. The vendor takes the audio either
+	// as base64 or a URL in a JSON body, or as a multipart upload, which is
+	// the only shape the OpenAI SDK sends. Usage is a price with the seconds
+	// for a model billed by time, and token counts with the price for one
+	// billed by token.
+	routeTranscriptions = passthroughRoute{
+		capability:           snapshot.EndpointTranscriptions,
+		name:                 spool.EndpointTranscriptions,
+		method:               http.MethodPost,
+		upstreamPath:         "/audio/transcriptions",
+		readsBody:            true,
+		noEstimate:           true,
+		lookupCost:           true,
+		multipartForm:        true,
+		openAITranscriptions: true,
+	}
 )
 
 // endpointNames are the words a refusal uses for a capability. The token is
@@ -184,14 +208,15 @@ var (
 // covers (editing and the catalogue read travel with it), and matching the
 // screen still wins over being more precise here than the screen is.
 var endpointNames = map[string]string{
-	snapshot.EndpointChat:       "Chat",
-	snapshot.EndpointWebSearch:  "웹 검색",
-	snapshot.EndpointPdfOcr:     "PDF OCR",
-	snapshot.EndpointImages:     "이미지 생성",
-	snapshot.EndpointEmbeddings: "임베딩",
-	snapshot.EndpointRerank:     "리랭크",
-	snapshot.EndpointSpeech:     "TTS",
-	snapshot.EndpointContainers: "코드 실행",
+	snapshot.EndpointChat:           "Chat",
+	snapshot.EndpointWebSearch:      "웹 검색",
+	snapshot.EndpointPdfOcr:         "PDF OCR",
+	snapshot.EndpointImages:         "이미지 생성",
+	snapshot.EndpointEmbeddings:     "임베딩",
+	snapshot.EndpointRerank:         "리랭크",
+	snapshot.EndpointSpeech:         "TTS",
+	snapshot.EndpointTranscriptions: "STT",
+	snapshot.EndpointContainers:     "코드 실행",
 }
 
 // endpointLabel renders one capability for a message. A token with no name
@@ -331,6 +356,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		defer large.done()
 
 		var body []byte
+		var bodyType string
 		inputBytes := 0
 		if route.readsBody {
 			// Two tiers, as on chat. A body up to the ordinary bound takes no
@@ -383,7 +409,19 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// decoder, so it changes what the bytes look like and not what
 			// they mean.
 			var params map[string]json.RawMessage
-			if json.Unmarshal(raw, &params) != nil {
+			// A multipart upload is parsed and assembled again rather than
+			// forwarded, for the reason the JSON body is re-serialized: the
+			// vendor must not see a part this file did not resolve.
+			var form []byte
+			var formType string
+			if route.multipartForm && isMultipartForm(r.Header.Get("Content-Type")) {
+				var e *apiError
+				params, form, formType, e = readTranscriptionForm(raw, r.Header.Get("Content-Type"))
+				if e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
+			} else if json.Unmarshal(raw, &params) != nil {
 				refuse(errBadJSON, spool.StatusBadRequest)
 				return
 			}
@@ -402,6 +440,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			}
 			if route.openAISpeech {
 				if e := refuseOpenAISpeechFields(params); e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
+			}
+			if route.openAITranscriptions {
+				if e := refuseOpenAITranscriptionFields(params); e != nil {
 					refuse(*e, spool.StatusBadRequest)
 					return
 				}
@@ -495,12 +539,16 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 					return
 				}
 			}
-			forward, err := json.Marshal(params)
-			if err != nil {
-				refuse(errBadJSON, spool.StatusBadRequest)
-				return
+			if form != nil {
+				body, bodyType = form, formType
+			} else {
+				forward, err := json.Marshal(params)
+				if err != nil {
+					refuse(errBadJSON, spool.StatusBadRequest)
+					return
+				}
+				body = forward
 			}
-			body = forward
 		}
 
 		upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
@@ -535,6 +583,8 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			cred:       key.CredentialFor(ref),
 			creditAxis: true,
 			headers:    passthroughForwardedHeaders(r.Header),
+			// Empty for a JSON body.
+			contentType: bodyType,
 		})
 		if ae != nil {
 			s.health.recordPassiveFailure(ref, ae.kind)
