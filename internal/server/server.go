@@ -118,6 +118,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/models/", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	// The legacy completions surface (completions.go). Nothing is served
+	// under it.
+	mux.HandleFunc("/v1/completions", s.handleCompletions)
 	// The Anthropic Messages surface. Nothing under it is served beyond the
 	// route itself: the token-counting route has nothing upstream to forward
 	// to, and it and every other subpath are answered as unknown, in this

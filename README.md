@@ -9,7 +9,7 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 
 ```
 학생 코드 (OpenAI SDK + API Key)
-    │  POST /v1/chat/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
+    │  POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
     │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
@@ -111,6 +111,16 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
   정상 종료로 기록하고, `response.failed`와 스트림 안의 `error`는 업스트림 오류로 기록합니다.
   사용량이 없는 응답은 추정하지 않고 그대로 돌려준 뒤 `upstream_usage_missing`으로 기록합니다.
   본문 보관은 이 경로에서 하지 않습니다.
+
+`POST /v1/completions`는 OpenAI의 레거시 텍스트 완성 경로입니다(OpenAI SDK의 `completions.create()`).
+기능 권한은 `chat`이고 **유료 모델만** 받으며, 자체 서빙 모델 이름은 400 `model_not_available_on_route`로
+거절합니다. 필수 필드는 `model`과 `prompt`, 출력 상한 필드는 `max_tokens`입니다. 요청과 응답은 모델 이름만
+바꿔 공급자의 `/completions`로 전달하고, 펜스와 요청 헤더, 사용량(`usage`의 토큰과 `cost`, 스트림은 마지막
+청크), 스트림의 `[DONE]` 처리는 Chat과 같습니다. 공급자는 사용량 청크에도 선택지(`choices`)를 실어 보내므로,
+`stream_options.include_usage`를 요청하지 않은 클라이언트에는 그 청크를 `usage`만 빼고 전달합니다. 공급자가
+`prompt`를 채팅 메시지로 바꿔 채팅 모델에 보내므로 원문을 그대로 이어 쓰는 동작은 보장되지 않고, 사고하는
+모델은 출력이 `reasoning`으로 가고 `text`가 빌 수 있습니다. 사용량이 없는 응답은 추정하지 않고
+`upstream_usage_missing`으로 기록하며 본문 보관은 하지 않습니다.
 
 허용되지 않은 경로는 403 `endpoint_not_allowed`로 답합니다. 경로가 없는 것과 Key에 허용되지
 않은 것은 다른 상태이므로 404로 감추지 않습니다. 거절 문구는 경로가 아니라 기능 이름으로
@@ -426,7 +436,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 
 | 기능 | 여는 것 |
 |---|---|
-| `chat` | `POST /v1/chat/completions`. 자체 서빙과 유료 모델 모두 |
+| `chat` | `POST /v1/chat/completions`(자체 서빙과 유료 모델 모두), `POST /v1/messages`, `POST /v1/responses`, `POST /v1/completions`(유료 모델만) |
 | `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등), OpenAI 표준 `web_search_options` |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
