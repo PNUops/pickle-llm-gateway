@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -87,6 +88,14 @@ type passthroughRoute struct {
 	// "cohere/rerank-v3.5"). That name can never equal the one requested, so
 	// comparing them would flag every answer as served by another model.
 	nativeModelName bool
+	// audioAnswer marks the routes that answer with audio rather than JSON.
+	// The answer is relayed as it came, under its own media type, and carries
+	// no usage at all: such a route also sets noEstimate and lookupCost, so
+	// its price comes from the generation record.
+	audioAnswer bool
+	// openAISpeech marks the speech route, whose OpenAI request fields the
+	// vendor cannot all honour (see refuseOpenAISpeechFields).
+	openAISpeech bool
 	// generationIDInBody marks the routes whose answer names its generation
 	// in the body's `id` rather than in the X-Generation-Id header. The body
 	// id is used for the cost lookup only when the header is absent.
@@ -150,6 +159,19 @@ var (
 		nativeModelName:    true,
 		generationIDInBody: true,
 	}
+	// The OpenAI SDK's text-to-speech path. The answer is audio, mp3 or raw
+	// PCM, and the vendor reports no usage on it.
+	routeSpeech = passthroughRoute{
+		capability:   snapshot.EndpointSpeech,
+		name:         spool.EndpointSpeech,
+		method:       http.MethodPost,
+		upstreamPath: "/audio/speech",
+		readsBody:    true,
+		noEstimate:   true,
+		lookupCost:   true,
+		audioAnswer:  true,
+		openAISpeech: true,
+	}
 )
 
 // endpointNames are the words a refusal uses for a capability. The token is
@@ -168,6 +190,7 @@ var endpointNames = map[string]string{
 	snapshot.EndpointImages:     "이미지 생성",
 	snapshot.EndpointEmbeddings: "임베딩",
 	snapshot.EndpointRerank:     "리랭크",
+	snapshot.EndpointSpeech:     "TTS",
 	snapshot.EndpointContainers: "코드 실행",
 }
 
@@ -373,6 +396,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// chat, so a malformed request answers 400 rather than 403.
 			if route.openAIImages {
 				if e := refuseOpenAIImageFields(params); e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
+			}
+			if route.openAISpeech {
+				if e := refuseOpenAISpeechFields(params); e != nil {
 					refuse(*e, spool.StatusBadRequest)
 					return
 				}
@@ -722,6 +751,10 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		record()
 		return
 	}
+	if route.audioAnswer {
+		s.relayAudio(w, resp, body, ev, record)
+		return
+	}
 	// A response that does not parse as JSON is not something the gateway can
 	// vouch for, and forwarding it verbatim could hand back whatever the
 	// upstream put in it. Same answer chat gives.
@@ -974,6 +1007,91 @@ func refuseOpenAIImageFields(params map[string]json.RawMessage) *apiError {
 	if _, ok := present("moderation"); ok {
 		e := errUnsupportedValue("moderation",
 			"moderation은 이 위치에서 지원하지 않습니다. OpenAI 모델이면 provider.options.openai.moderation으로 보내주세요.")
+		return &e
+	}
+	return nil
+}
+
+// relayAudio hands back an audio answer under the vendor's media type. Only a
+// media type that parses and is audio is relayed, and it is rendered again
+// from the parse rather than copied, so nothing but a type and its parameters
+// reaches the caller; anything else is refused like an unparseable JSON
+// answer. The vendor reports no usage here, so the record carries no counts
+// and its price comes from the generation record.
+func (s *Server) relayAudio(w http.ResponseWriter, resp *http.Response, body []byte, ev *spool.Event, record func()) {
+	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || !strings.HasPrefix(mediaType, "audio/") {
+		writeAPIError(w, errUpstream)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = "upstream_invalid_response"
+		record()
+		return
+	}
+	contentType := mime.FormatMediaType(mediaType, params)
+	if contentType == "" {
+		contentType = mediaType
+	}
+	relayGenerationID(w, resp.Header)
+	w.Header().Set("Content-Type", contentType)
+	var werr error
+	s.writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	if werr != nil {
+		ev.Status = spool.StatusCanceled
+		ev.ErrorType = "client_disconnected"
+	} else {
+		ev.Status = spool.StatusOK
+	}
+	record()
+}
+
+// speechFormats are the audio formats the vendor produces.
+var speechFormats = map[string]bool{"mp3": true, "pcm": true}
+
+// refuseOpenAISpeechFields refuses the OpenAI speech fields the vendor cannot
+// honour, for the reason refuseOpenAIImageFields gives:
+//
+//   - response_format other than mp3 or pcm: the vendor makes only those two,
+//     and refuses the rest with an error a student cannot read. Omitting it
+//     gets pcm, the vendor's default, which is not OpenAI's.
+//   - stream_format other than "audio": the vendor answers with the whole
+//     file regardless. "audio", which asks for exactly that, passes.
+//   - input_references: voice cloning from reference audio, which is not
+//     offered.
+func refuseOpenAISpeechFields(params map[string]json.RawMessage) *apiError {
+	present := func(name string) (json.RawMessage, bool) {
+		raw, ok := params[name]
+		if !ok || string(bytes.TrimSpace(raw)) == "null" {
+			return nil, false
+		}
+		return raw, true
+	}
+	if raw, ok := present("response_format"); ok {
+		var format string
+		if json.Unmarshal(raw, &format) != nil {
+			e := errInvalidParamValue("response_format")
+			return &e
+		}
+		if !speechFormats[format] {
+			e := errUnsupportedValue("response_format",
+				"이 경로는 mp3와 pcm만 만듭니다. response_format을 mp3나 pcm으로 보내주세요. 빼면 pcm(24kHz 16비트 모노, 헤더 없음)입니다.")
+			return &e
+		}
+	}
+	if raw, ok := present("stream_format"); ok {
+		var format string
+		if json.Unmarshal(raw, &format) != nil {
+			e := errInvalidParamValue("stream_format")
+			return &e
+		}
+		if format != "audio" {
+			e := errUnsupportedValue("stream_format",
+				"이 경로는 음성 파일을 한 번에 돌려주며 스트리밍(sse)은 지원하지 않습니다. stream_format을 빼거나 audio로 보내주세요.")
+			return &e
+		}
+	}
+	if _, ok := present("input_references"); ok {
+		e := errUnsupportedValue("input_references",
+			"참조 음성으로 목소리를 만드는 기능(음성 복제)은 지원하지 않습니다. input_references를 빼고 voice로 목소리를 골라주세요.")
 		return &e
 	}
 	return nil

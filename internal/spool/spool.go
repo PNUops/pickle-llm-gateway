@@ -105,6 +105,7 @@ const (
 	EndpointImageModels = "images_models"
 	EndpointEmbeddings  = "embeddings"
 	EndpointRerank      = "rerank"
+	EndpointSpeech      = "audio_speech"
 	EndpointMessages    = "messages"
 	EndpointResponses   = "responses"
 	EndpointCompletions = "completions"
