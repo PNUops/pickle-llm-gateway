@@ -104,6 +104,7 @@ const (
 	EndpointImages      = "images"
 	EndpointImageModels = "images_models"
 	EndpointEmbeddings  = "embeddings"
+	EndpointRerank      = "rerank"
 	EndpointMessages    = "messages"
 	EndpointResponses   = "responses"
 )

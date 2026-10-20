@@ -30,6 +30,9 @@ type generationVendor struct {
 	answers []generationAnswer
 	reads   int
 	auths   []string
+	// noHeader leaves the generation id off the answer's headers, as the
+	// vendor does on routes that name it only in the body.
+	noHeader bool
 }
 
 type generationAnswer struct {
@@ -51,10 +54,12 @@ func (g *generationVendor) handler(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, a.body)
 		return
 	}
-	w.Header().Set(generationIDHeader, testGenerationID)
 	g.mu.Lock()
-	inner := g.inner
+	inner, noHeader := g.inner, g.noHeader
 	g.mu.Unlock()
+	if !noHeader {
+		w.Header().Set(generationIDHeader, testGenerationID)
+	}
 	inner(w, r)
 }
 

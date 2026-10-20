@@ -76,6 +76,21 @@ type passthroughRoute struct {
 	// generation record. On the other routes only an answer that failed
 	// after the vendor billed it is looked up (see handlePassthrough).
 	lookupCost bool
+	// noEstimate marks the routes whose vendor usage is optional. An answer
+	// that arrives without a count or a price is recorded as a success with
+	// no tokens and Estimated false; an estimate from the body size would be
+	// a count of something the vendor does not bill by. Such a route also
+	// sets lookupCost, so the price comes from the generation record.
+	noEstimate bool
+	// nativeModelName marks the routes whose answer names the model in the
+	// serving provider's own spelling ("rerank-v3.5", not
+	// "cohere/rerank-v3.5"). That name can never equal the one requested, so
+	// comparing them would flag every answer as served by another model.
+	nativeModelName bool
+	// generationIDInBody marks the routes whose answer names its generation
+	// in the body's `id` rather than in the X-Generation-Id header. The body
+	// id is used for the cost lookup only when the header is absent.
+	generationIDInBody bool
 }
 
 var (
@@ -117,6 +132,24 @@ var (
 		upstreamPath: "/embeddings",
 		readsBody:    true,
 	}
+	// Rerank is not an OpenAI or Anthropic route; it is the rerank call
+	// Cohere and Voyage offer, opened because retrieval exercises use it. The
+	// vendor documents its usage object as optional and bills by the search
+	// unit on some models, so an answer may carry a price with no tokens, or
+	// nothing at all. It names the generation only in the body's id, not in
+	// the header the other routes carry, and the answer's model is the
+	// serving provider's own name.
+	routeRerank = passthroughRoute{
+		capability:         snapshot.EndpointRerank,
+		name:               spool.EndpointRerank,
+		method:             http.MethodPost,
+		upstreamPath:       "/rerank",
+		readsBody:          true,
+		noEstimate:         true,
+		lookupCost:         true,
+		nativeModelName:    true,
+		generationIDInBody: true,
+	}
 )
 
 // endpointNames are the words a refusal uses for a capability. The token is
@@ -134,6 +167,7 @@ var endpointNames = map[string]string{
 	snapshot.EndpointPdfOcr:     "PDF OCR",
 	snapshot.EndpointImages:     "이미지 생성",
 	snapshot.EndpointEmbeddings: "임베딩",
+	snapshot.EndpointRerank:     "리랭크",
 	snapshot.EndpointContainers: "코드 실행",
 }
 
@@ -524,19 +558,30 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// behind each one. A catalogue read is not billed and is not looked
 		// up.
 		finish := record
+		var answer passthroughAnswer
 		if route.readsBody {
-			lookup := s.withGenerationCost(resp.Header.Get(generationIDHeader), up, key.CredentialFor(ref),
-				&ev, stopClock, record, &s.costs.passthrough)
 			finish = func() {
-				if route.lookupCost || ev.Status != spool.StatusOK {
-					lookup()
+				if !route.lookupCost && ev.Status == spool.StatusOK {
+					record()
 					return
 				}
-				record()
+				id := resp.Header.Get(generationIDHeader)
+				if id == "" {
+					id = answer.generationID
+				}
+				s.withGenerationCost(id, up, key.CredentialFor(ref), &ev, stopClock, record,
+					&s.costs.passthrough)()
 			}
 		}
-		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, finish)
+		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, &answer, finish)
 	}
+}
+
+// passthroughAnswer carries what finishPassthrough learned from the body that
+// the record wrapper needs: the generation id, on the routes that name it
+// there. It is filled before record runs.
+type passthroughAnswer struct {
+	generationID string
 }
 
 // passthroughLargeHold is one request's claim on the passthrough large-body
@@ -585,7 +630,7 @@ func (h *passthroughLargeHold) done() {
 // moment the bound is crossed. Either way the vendor has billed the answer, so
 // a refusal for want of a slot is named like one for size.
 func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, route passthroughRoute,
-	large *passthroughLargeHold, inputBytes int, ev *spool.Event, record func()) {
+	large *passthroughLargeHold, inputBytes int, ev *spool.Event, answer *passthroughAnswer, record func()) {
 	tooLarge := func() {
 		writeAPIError(w, errPassthroughResponseTooLarge)
 		ev.Status = spool.StatusUpstreamErr
@@ -680,13 +725,16 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// A response that does not parse as JSON is not something the gateway can
 	// vouch for, and forwarding it verbatim could hand back whatever the
 	// upstream put in it. Same answer chat gives.
-	served, u, images, haveUsage, ok := passthroughUsage(body)
+	served, bodyID, u, images, haveUsage, ok := passthroughUsage(body)
 	if !ok {
 		writeAPIError(w, errUpstream)
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_invalid_response"
 		record()
 		return
+	}
+	if route.generationIDInBody {
+		answer.generationID = bodyID
 	}
 
 	// The caller sees the vendor's own model field here, since this surface
@@ -699,7 +747,9 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// the defect this argument list would otherwise reproduce. If this surface
 	// ever maps a name, the right value has to be threaded down here — the
 	// identity is asserted where it is created.
-	s.noteServedModel(ev, ev.PublicModelName, served)
+	if !route.nativeModelName {
+		s.noteServedModel(ev, ev.PublicModelName, served)
+	}
 
 	relayGenerationID(w, resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -723,10 +773,14 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		record()
 		return
 	}
-	// Every route this surface opens returns usage, so the estimate below is
-	// the degraded path and its `estimated` flag is the signal that the
-	// vendor stopped reporting — see settleUsage.
-	s.settleUsage(ev, u, haveUsage, inputBytes, 0)
+	// On the routes whose usage is required, the estimate below is the
+	// degraded path and its `estimated` flag is the signal that the vendor
+	// stopped reporting — see settleUsage. Where usage is optional, an answer
+	// without it is not degraded and is recorded with no counts; its price
+	// comes from the generation record, if the vendor kept one.
+	if haveUsage || !route.noEstimate {
+		s.settleUsage(ev, u, haveUsage, inputBytes, 0)
+	}
 	// Outside settleUsage because the count comes from the response body
 	// rather than the usage object, and it survives the estimate path: how
 	// many images arrived is known even when the vendor priced none of them.
@@ -745,8 +799,9 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 
 // passthroughUsage lifts the token counts, the vendor's price and the image
 // count out of a response. The returns are, in order: the model the vendor
-// named, the usage, how many images came back, whether usage was reported at
-// all, and whether the body parsed as JSON at all.
+// named, the generation id the body names (empty when it names none or not as
+// a string), the usage, how many images came back, whether usage was reported
+// at all, and whether the body parsed as JSON at all.
 //
 // It reads both field namings because this surface does not control which one
 // the vendor uses per route, and a struct that quietly fills with zeros would
@@ -761,9 +816,13 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 // and a unit this event has no field for. The price is the figure that
 // matters, and it is exact; inventing tokens from the body size beside it
 // would put a count on the record that no one metered.
-func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
+func passthroughUsage(body []byte) (string, string, usage, int, bool, bool) {
 	var envelope struct {
 		Model string `json:"model"`
+		// ID is the generation id, on the routes that name it in the body.
+		// Raw, so that an id of another type is ignored rather than failing
+		// the decode of an answer the vendor has already billed.
+		ID json.RawMessage `json:"id"`
 		// Data is the image list. Counting what came back rather than trusting
 		// the requested n is the honest figure: the vendor may return fewer,
 		// and the billing follows what arrived.
@@ -784,10 +843,12 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return "", usage{}, 0, false, false
+		return "", "", usage{}, 0, false, false
 	}
+	var id string
+	_ = json.Unmarshal(envelope.ID, &id)
 	if envelope.Usage == nil {
-		return envelope.Model, usage{}, len(envelope.Data), false, true
+		return envelope.Model, id, usage{}, len(envelope.Data), false, true
 	}
 	u := usage{
 		PromptTokens:            envelope.Usage.PromptTokens,
@@ -807,9 +868,9 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 				// Priced but not counted: the call is billed in a unit
 				// other than tokens. Recorded as zero tokens and the price,
 				// with Estimated false, because neither figure is a guess.
-				return envelope.Model, usage{Cost: u.Cost}, len(envelope.Data), true, true
+				return envelope.Model, id, usage{Cost: u.Cost}, len(envelope.Data), true, true
 			}
-			return envelope.Model, usage{}, len(envelope.Data), false, true
+			return envelope.Model, id, usage{}, len(envelope.Data), false, true
 		}
 		// A total with no split. The event has no field for a total, and
 		// recording the split as two zeros would report a metered request as
@@ -819,7 +880,7 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 		// split is simply not knowable from what the vendor sent.
 		u.PromptTokens = u.TotalTokens
 	}
-	return envelope.Model, u, len(envelope.Data), true, true
+	return envelope.Model, id, u, len(envelope.Data), true, true
 }
 
 // passthroughHeaderAllowlist is which client headers reach the upstream. It is

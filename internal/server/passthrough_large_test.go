@@ -262,7 +262,7 @@ func TestPassthroughWriteDeadline(t *testing.T) {
 	var ev spool.Event
 	start := time.Now()
 	h.srv.finishPassthrough(w, resp, routeEmbeddings, &passthroughLargeHold{pool: newLargeBodySlots(1)},
-		len(embeddingBody), &ev, func() {})
+		len(embeddingBody), &ev, &passthroughAnswer{}, func() {})
 	if ev.Status != spool.StatusOK {
 		t.Fatalf("status %s %s", ev.Status, ev.ErrorType)
 	}
