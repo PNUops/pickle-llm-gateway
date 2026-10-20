@@ -114,7 +114,7 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 
 `POST /v1/completions`는 OpenAI의 레거시 텍스트 완성 경로입니다(OpenAI SDK의 `completions.create()`).
 기능 권한은 `chat`이고 **유료 모델만** 받으며, 자체 서빙 모델 이름은 400 `model_not_available_on_route`로
-거절합니다. 필수 필드는 `model`과 `prompt`, 출력 상한 필드는 `max_tokens`입니다. 요청과 응답은 모델 이름만
+거절합니다. 필수 필드는 `model`과 `prompt`이고, 출력 상한은 `max_tokens`와 `max_completion_tokens`를 읽어 작은 값을 `max_tokens`로 보냅니다. 요청과 응답은 모델 이름만
 바꿔 공급자의 `/completions`로 전달하고, 펜스와 요청 헤더, 사용량(`usage`의 토큰과 `cost`, 스트림은 마지막
 청크), 스트림의 `[DONE]` 처리는 Chat과 같습니다. 공급자는 사용량 청크에도 선택지(`choices`)를 실어 보내므로,
 `stream_options.include_usage`를 요청하지 않은 클라이언트에는 그 청크를 `usage`만 빼고 전달합니다. 공급자가
@@ -436,7 +436,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 
 | 기능 | 여는 것 |
 |---|---|
-| `chat` | `POST /v1/chat/completions`(자체 서빙과 유료 모델 모두), `POST /v1/messages`, `POST /v1/responses`, `POST /v1/completions`(유료 모델만) |
+| `chat` | `POST /v1/chat/completions`(자체 서빙과 유료 모델 모두), `POST /v1/messages`, `POST /v1/responses`, `POST /v1/completions`(이 셋은 유료 모델만) |
 | `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등), OpenAI 표준 `web_search_options` |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
@@ -532,7 +532,7 @@ HTTP 200으로 시작한 스트림에서도 최상위의 null이 아닌 `error`�
 (`imageCount`), 캐시에서 나온 입력 토큰과 사고에 쓰인 출력 토큰(`cachedInputTokens`,
 `reasoningTokens`), 스트리밍 여부(`streamed`)입니다.
 
-정상으로 끝난 스트림은 Chat, Messages, Responses 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
+정상으로 끝난 스트림은 Chat, Completions, Messages, Responses 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
 없이 끝나면(클라이언트 연결 끊김, 이벤트 상한 초과, 업스트림 끊김 등) 게이트웨이가 응답을 닫은 뒤
 업스트림의 생성 기록(`GET /generation?id=<X-Generation-Id>`)을 그 Key의 자격증명으로 조회해
 `total_cost`를 `costUsd`에 채우고 나서 항목을 씁니다. 토큰 수는 덮어쓰지 않습니다. 기록은

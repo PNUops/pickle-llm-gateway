@@ -50,9 +50,12 @@ var protoCompletions = &protocol{
 		fenceChatCapabilities,
 	},
 	requestHeaders: chatForwardedHeaders,
-	capReadFields:  []string{"max_tokens"},
-	capWriteField:  "max_tokens",
-	shape:          shapeChat,
+	// Both output fields are read, as on chat: the vendor serves this route
+	// through its chat models, and a field left unread would be forwarded
+	// past the model's cap.
+	capReadFields: []string{"max_completion_tokens", "max_tokens"},
+	capWriteField: "max_tokens",
+	shape:         shapeChat,
 	// No body capture: the record format holds chat messages, not a prompt.
 	capture:         nil,
 	noUsageEstimate: true,

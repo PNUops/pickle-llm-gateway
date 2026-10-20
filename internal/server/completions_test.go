@@ -164,6 +164,17 @@ func TestCompletionsOutputCap(t *testing.T) {
 		string(v.body["max_tokens"]) != "50" {
 		t.Fatalf("%d %s / %s", status, body, v.body["max_tokens"])
 	}
+	// The other output field is read too, refused past the cap, and folded
+	// into max_tokens rather than forwarded beside it.
+	status, body, _ = sendTo(t, h, "/v1/completions", nil, `{"model":"vendor-model","prompt":"x","max_completion_tokens":100}`)
+	if status != 400 || errCode(t, body) != "output_limit_exceeded" {
+		t.Fatalf("%d %s", status, body)
+	}
+	status, body, _ = sendTo(t, h, "/v1/completions", nil,
+		`{"model":"vendor-model","prompt":"x","max_tokens":10,"max_completion_tokens":20}`)
+	if _, forwarded := v.body["max_completion_tokens"]; status != 200 || forwarded || string(v.body["max_tokens"]) != "10" {
+		t.Fatalf("%d %s / %v", status, body, v.body)
+	}
 }
 
 // A stream is relayed chunk by chunk with the model renamed. The vendor's
