@@ -78,6 +78,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
 		"streamCostFilled":       s.metrics.streamCostFilled.Load(),
 		"streamCostMissing":      s.metrics.streamCostMissing.Load(),
+		"vendorModelCatalog":     s.catalogGauges(),
 	})
 }
 
