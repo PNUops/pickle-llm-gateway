@@ -169,3 +169,17 @@ func TestPassthroughOddIDIsIgnored(t *testing.T) {
 		}
 	}
 }
+
+// A vendor router is refused here for every key, as on every passthrough
+// route: it would pick and bill a model nobody judged.
+func TestRerankRefusesRouterModels(t *testing.T) {
+	h := newHarness(t, passthroughDoc(snapshot.EndpointRerank), nil)
+	status, body := h.passthrough(t, http.MethodPost, "/v1/rerank", testToken,
+		`{"model":"openrouter/auto","query":"q","documents":["a"]}`)
+	if status != http.StatusBadRequest || errCode(t, body) != "router_not_supported" {
+		t.Fatalf("%d %s", status, body)
+	}
+	if h.mock.callCount() != 0 {
+		t.Fatal("a router request reached the vendor")
+	}
+}
