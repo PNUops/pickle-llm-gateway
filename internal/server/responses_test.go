@@ -399,8 +399,8 @@ func TestResponsesStreamRelaysEvents(t *testing.T) {
 		t.Fatalf("status %d %q: %s", status, hdr.Get("Content-Type"), body)
 	}
 	want := ": OPENROUTER PROCESSING\n\n" +
-		dataEvent(renamed(t, respCreated)) + dataEvent(renamed(t, respInProgress)) + dataEvent(respItemAdded) +
-		dataEvent(respDelta1) + dataEvent(respDelta2) + dataEvent(renamed(t, respCompleted)) + "data: [DONE]\n\n"
+		dataEvent(renamed(t, respCreated)) + dataEvent(renamed(t, respInProgress)) + dataEvent(renamed(t, respItemAdded)) +
+		dataEvent(renamed(t, respDelta1)) + dataEvent(renamed(t, respDelta2)) + dataEvent(renamed(t, respCompleted)) + "data: [DONE]\n\n"
 	if string(body) != want {
 		t.Fatalf("relayed stream differs:\n got %q\nwant %q", body, want)
 	}
@@ -430,7 +430,7 @@ func TestResponsesStreamNamedEventsWithoutDone(t *testing.T) {
 	if status != 200 {
 		t.Fatalf("%d %s", status, body)
 	}
-	want := dataEvent(renamed(t, respCreated)) + dataEvent(respDelta1) + dataEvent(renamed(t, respCompleted)) + "data: [DONE]\n\n"
+	want := dataEvent(renamed(t, respCreated)) + dataEvent(renamed(t, respDelta1)) + dataEvent(renamed(t, respCompleted)) + "data: [DONE]\n\n"
 	if string(body) != want {
 		t.Fatalf("relayed stream differs:\n got %q\nwant %q", body, want)
 	}
@@ -462,6 +462,8 @@ func TestResponsesStreamEndings(t *testing.T) {
 			spool.StatusUpstreamErr, "upstream_stream_unterminated", "error"},
 		{"done without an ending", dataEvent(respCreated) + dataEvent(respDelta1) + "data: [DONE]\n\n",
 			spool.StatusUpstreamErr, "upstream_stream_unterminated", "error"},
+		{"chat-style vendor error", dataEvent(respCreated) + dataEvent(`{"error":{"code":502,"message":"boom"}}`) + "data: [DONE]\n\n",
+			spool.StatusUpstreamErr, "upstream_error", ""},
 		{"unparseable event", dataEvent(respCreated) + dataEvent(`{"type":"response.out`) + dataEvent(respCompleted),
 			spool.StatusUpstreamErr, "upstream_chunk_unreadable", "response.completed"},
 	}
@@ -482,7 +484,7 @@ func TestResponsesStreamEndings(t *testing.T) {
 			}
 			var last map[string]any
 			if json.Unmarshal([]byte(strings.TrimPrefix(events[len(events)-2], "data: ")), &last) != nil ||
-				last["type"] != c.tailType {
+				(last["type"] != c.tailType && !(c.tailType == "" && last["type"] == nil)) {
 				t.Fatalf("last event before [DONE]: %q", events[len(events)-2])
 			}
 			ev := lastEvent(t, h)
@@ -554,5 +556,44 @@ func TestResponsesErrorsAreWellFormed(t *testing.T) {
 	}
 	if !strings.Contains(errNotFound.message, "POST /v1/responses") {
 		t.Fatalf("unknown route message does not list the route: %s", errNotFound.message)
+	}
+}
+
+// Each event is re-encoded from what was parsed, so bytes after the object
+// and a line break inside one cannot reach the client.
+func TestResponsesStreamReencodesEvents(t *testing.T) {
+	h, v := responsesHarness(t, nil)
+	v.stream = dataEvent(respCreated) +
+		dataEvent(`{"type":"response.output_text.delta","delta":"a"} trailing `+upstreamModel) +
+		"data: {\"type\":\"response.output_text.delta\",\ndata: \"delta\":\"b\"}\n\n" +
+		dataEvent(respCompleted)
+	status, body, _ := sendResponses(t, h, nil, responsesWith("vendor-model", "stream", "true"))
+	if status != 200 || strings.Contains(string(body), upstreamModel) || strings.Contains(string(body), "trailing") {
+		t.Fatalf("%d %s", status, body)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if line != "" && !strings.HasPrefix(line, "data: ") {
+			t.Fatalf("a line that is not a data line: %q in %q", line, body)
+		}
+	}
+	if !strings.Contains(string(body), `"delta":"b"`) {
+		t.Fatalf("multi-line event lost: %s", body)
+	}
+}
+
+// An input that is neither a string nor a list cannot be fenced and is
+// refused rather than forwarded.
+func TestResponsesUnreadableInput(t *testing.T) {
+	h, v := responsesHarness(t, nil)
+	for _, input := range []string{
+		`{"type":"additional_tools","tools":[{"type":"web_search"}]}`, `5`, `true`,
+	} {
+		status, body, _ := sendResponses(t, h, nil, `{"model":"vendor-model","input":`+input+`}`)
+		if status != 400 || errCode(t, body) != "invalid_parameter_value" || !strings.Contains(errMessage(t, body), "input") {
+			t.Errorf("%s: %d %s", input, status, body)
+		}
+	}
+	if v.callCount() != 0 {
+		t.Fatal("refused request reached the vendor")
 	}
 }

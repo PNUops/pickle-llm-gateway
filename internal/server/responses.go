@@ -147,10 +147,16 @@ func shapeResponses(params map[string]json.RawMessage, _ parsedRequest, model *s
 func fenceResponsesInput(_ *Server, doc *snapshot.Document, lookup func(string) *snapshot.Model,
 	key *snapshot.Key, _ *snapshot.Model, params map[string]json.RawMessage) *refusal {
 	raw := params["input"]
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
 		// A string input carries no items.
 		return nil
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		// Neither shape the API defines: an input this build cannot read is
+		// one it cannot fence.
+		return &refusal{e: errInvalidParamValue("input")}
 	}
 	for _, rawItem := range items {
 		var item map[string]json.RawMessage
@@ -302,8 +308,6 @@ func (x *responsesStream) event(e sseEvent) []byte {
 		return nil
 	}
 	typ, _ := payload["type"].(string)
-	out := e.data
-	renamed := false
 	// The model is renamed wherever it sits: in the response object, and at
 	// the top of an event this relay does not know, which would otherwise
 	// carry the upstream's id verbatim.
@@ -318,15 +322,14 @@ func (x *responsesStream) event(e sseEvent) []byte {
 			x.s.noteServedModel(x.ev, x.a.sentModel, served)
 		}
 		place["model"] = x.a.publicName
-		renamed = true
 	}
-	if renamed {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			x.res.dropped++
-			return nil
-		}
-		out = b
+	// Every event goes out re-encoded from what was parsed, never as the
+	// bytes that arrived: those may carry a second value after the object,
+	// or a line break that would split one event into two on the client.
+	out, err := json.Marshal(payload)
+	if err != nil {
+		x.res.dropped++
+		return nil
 	}
 	if resp := mapOf(payload["response"]); resp != nil && responsesEnds[typ] {
 		if u, ok := decodeResponsesUsage(resp["usage"]); ok {
@@ -336,15 +339,18 @@ func (x *responsesStream) event(e sseEvent) []byte {
 			x.res.upstreamError = true
 		}
 	}
+	// An error object with no error type is the vendor's chat-style error,
+	// which it may send on any route; it ends the answer the same way.
+	vendorError := typ == "error" || (typ == "" && payload["error"] != nil)
 	switch {
-	case typ == "error":
+	case vendorError:
 		x.res.upstreamError = true
 	case typ == "response.output_text.delta":
 		d, _ := payload["delta"].(string)
 		x.res.contentChars += len(d)
 	}
 	frame := append(append([]byte("data: "), out...), '\n', '\n')
-	if responsesEnds[typ] || typ == "error" {
+	if responsesEnds[typ] || vendorError {
 		x.ended = true
 		frame = append(frame, responsesDone...)
 	}

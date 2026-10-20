@@ -49,8 +49,9 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 - **하위 경로는 없습니다.** `/v1/responses/{id}`, `cancel`, `input_items`, `compact`는 저장된 응답을
   읽는 경로라 인증 전에 404 `unknown_endpoint`로 답하고 기록하지 않습니다.
 - **필수 필드**는 `model`과 `input`이고, 출력 상한 필드는 `max_output_tokens`입니다.
-- **펜스**는 Chat과 같은 자리(`models`, `tools`, `deferred_tools`, `tool_choice`, `plugins`,
-  `preset`, `:online`)에 더해 `input` 항목 안의 `tools` 목록을 봅니다. Codex는 도구 목록을
+- **펜스**는 Chat과 같은 자리(`models`, `tools`, `tool_choice`, `plugins`, `preset`, `:online`)에
+  더해 `deferred_tools`와 `input` 항목 안의 `tools` 목록을 봅니다. 문자열도 목록도 아닌 `input`은
+  판정할 수 없어 400 `invalid_parameter_value`로 거절합니다. Codex는 도구 목록을
   `additional_tools` 입력 항목에 실어 보내고, 클라이언트가 실행한 도구 검색은 찾은 도구를
   `tool_search_output` 항목으로 돌려주기 때문입니다. Codex가 기본으로 넣는 `web_search` 도구는
   `web_search` 권한이 없는 Key에서 403 `endpoint_not_allowed`입니다. Codex 설정에서
@@ -58,8 +59,10 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 - **요청 헤더**는 Chat과 같은 셋만 전달합니다. Codex가 붙이는 자기 세션과 턴 헤더는 전달하지
   않습니다. 응답에는 `X-Generation-Id`를 중계합니다.
 - **스트림**은 `data:` 줄만 쓰고 이벤트 종류는 데이터의 `type`으로 구분합니다. 업스트림이 `event:`
-  줄을 보내도 데이터의 `type`으로 읽습니다. `response.created`처럼 응답 객체를 담은 이벤트의
-  모델 이름을 바꾸고 나머지는 그대로 보냅니다. `response.completed`, `response.incomplete`,
+  줄을 보내도 데이터의 `type`으로 읽습니다. 모델 이름은 응답 객체 안이든 이벤트 최상위든 있는
+  자리에서 바꾸고, 모든 이벤트는 받은 바이트가 아니라 해석한 값을 다시 직렬화해 보냅니다. 객체
+  뒤에 붙은 바이트나 이벤트 안의 줄바꿈이 클라이언트에 그대로 닿지 않게 하기 위해서입니다.
+  `type` 없이 `error` 객체만 담긴 이벤트도 공급자 오류로 보고 끝냅니다. `response.completed`, `response.incomplete`,
   `response.failed`, `error` 가운데 하나가 오면 응답이 끝난 것으로 보고, 업스트림이 `[DONE]`을
   보냈든 안 보냈든 그 뒤에 `data: [DONE]` 하나를 붙입니다. 게이트웨이가 스트림 도중에 끊을 때는
   `{"type":"error","code":...,"message":...}` 이벤트 뒤에 `[DONE]`을 씁니다.
