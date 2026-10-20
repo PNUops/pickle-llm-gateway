@@ -9,7 +9,7 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 
 ```
 학생 코드 (OpenAI SDK + API Key)
-    │  POST /v1/chat/completions, GET /v1/models
+    │  POST /v1/chat/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
     │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
@@ -35,6 +35,43 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 `/v1/chat/completions`도 기능 권한 `chat`이 있는 Key에만 열립니다. 자체 서빙 모델과 유료 모델
 모두에 적용되고, 채팅 없이 다른 기능만 쓰는 Key가 있기 때문에 기본으로 부여하지 않습니다.
 `GET /v1/models`는 비용이 없으므로 기능 권한 없이 열립니다.
+
+`POST /v1/responses`는 OpenAI Responses API 경로입니다. Codex와 OpenAI SDK의 `responses.create()`가
+이 경로를 부릅니다. 기능 권한은 `/v1/chat/completions`와 같은 `chat`이고 **유료 모델만** 받습니다.
+자체 서빙 모델 이름은 400 `model_not_available_on_route`로 거절합니다. 요청과 응답은 번역하지 않고
+모델 이름만 바꿔 공급자의 `/responses`로 그대로 전달합니다.
+
+- **응답을 저장하지 않습니다.** 공급자가 상태 없는 API만 제공하기 때문입니다. 저장이나 이전 응답
+  참조가 필요한 요청(`store: true`, `previous_response_id`, `conversation`, `background: true`)은
+  필드를 지우지 않고 400 `unsupported_parameter`로 이유와 함께 거절합니다. 지우고 보내면 저장된
+  줄 알고 다음 요청에서 그 id를 쓰다가 엉뚱한 곳에서 실패합니다. 이전 대화는 `input`에 모두 담아
+  보냅니다. `store: false`와 `null`은 통과합니다. Codex는 `store: false`를 보내므로 걸리지 않습니다.
+- **하위 경로는 없습니다.** `/v1/responses/{id}`, `cancel`, `input_items`, `compact`는 저장된 응답을
+  읽는 경로라 인증 전에 404 `unknown_endpoint`로 답하고 기록하지 않습니다.
+- **필수 필드**는 `model`과 `input`이고, 출력 상한 필드는 `max_output_tokens`입니다.
+- **펜스**는 Chat과 같은 자리(`models`, `tools`, `tool_choice`, `plugins`, `preset`, `:online`)에
+  더해 `deferred_tools`와 `input` 항목 안의 `tools` 목록을 봅니다. 문자열도 목록도 아닌 `input`은
+  판정할 수 없어 400 `invalid_parameter_value`로 거절합니다. Codex는 도구 목록을
+  `additional_tools` 입력 항목에 실어 보내고, 클라이언트가 실행한 도구 검색은 찾은 도구를
+  `tool_search_output` 항목으로 돌려주기 때문입니다. Codex가 기본으로 넣는 `web_search` 도구는
+  `web_search` 권한이 없는 Key에서 403 `endpoint_not_allowed`입니다. Codex 설정에서
+  `web_search = "disabled"`로 끄면 빠집니다.
+- **요청 헤더**는 Chat과 같은 셋만 전달합니다. Codex가 붙이는 자기 세션과 턴 헤더는 전달하지
+  않습니다. 응답에는 `X-Generation-Id`를 중계합니다.
+- **스트림**은 `data:` 줄만 쓰고 이벤트 종류는 데이터의 `type`으로 구분합니다. 업스트림이 `event:`
+  줄을 보내도 데이터의 `type`으로 읽습니다. 모델 이름은 응답 객체 안이든 이벤트 최상위든 있는
+  자리에서 바꾸고, 모든 이벤트는 받은 바이트가 아니라 해석한 값을 다시 직렬화해 보냅니다. 객체
+  뒤에 붙은 바이트나 이벤트 안의 줄바꿈이 클라이언트에 그대로 닿지 않게 하기 위해서입니다.
+  `type` 없이 `error` 객체만 담긴 이벤트도 공급자 오류로 보고 끝냅니다. `response.completed`, `response.incomplete`,
+  `response.failed`, `error` 가운데 하나가 오면 응답이 끝난 것으로 보고, 업스트림이 `[DONE]`을
+  보냈든 안 보냈든 그 뒤에 `data: [DONE]` 하나를 붙입니다. 게이트웨이가 스트림 도중에 끊을 때는
+  `{"type":"error","code":...,"message":...}` 이벤트 뒤에 `[DONE]`을 씁니다.
+- **사용량**은 `response.completed`(비스트림은 응답 객체)의 `usage`에서 읽습니다. `input_tokens`는
+  캐시 입력을 포함한 값이고 `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`,
+  `cost`를 함께 기록합니다. `response.incomplete`(출력 상한에 걸려 끊긴 응답)는 사용량이 있으면
+  정상 종료로 기록하고, `response.failed`와 스트림 안의 `error`는 업스트림 오류로 기록합니다.
+  사용량이 없는 응답은 추정하지 않고 그대로 돌려준 뒤 `upstream_usage_missing`으로 기록합니다.
+  본문 보관은 이 경로에서 하지 않습니다.
 
 허용되지 않은 경로는 403 `endpoint_not_allowed`로 답합니다. 경로가 없는 것과 Key에 허용되지
 않은 것은 다른 상태이므로 404로 감추지 않습니다. 거절 문구는 경로가 아니라 기능 이름으로
@@ -435,7 +472,7 @@ HTTP 200으로 시작한 스트림에서도 최상위의 null이 아닌 `error`�
 (`imageCount`), 캐시에서 나온 입력 토큰과 사고에 쓰인 출력 토큰(`cachedInputTokens`,
 `reasoningTokens`), 스트리밍 여부(`streamed`)입니다.
 
-정상으로 끝난 스트림은 Chat, Messages 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
+정상으로 끝난 스트림은 Chat, Messages, Responses 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
 없이 끝나면(클라이언트 연결 끊김, 이벤트 상한 초과, 업스트림 끊김 등) 게이트웨이가 응답을 닫은 뒤
 업스트림의 생성 기록(`GET /generation?id=<X-Generation-Id>`)을 그 Key의 자격증명으로 조회해
 `total_cost`를 `costUsd`에 채우고 나서 항목을 씁니다. 토큰 수는 덮어쓰지 않습니다. 기록은
