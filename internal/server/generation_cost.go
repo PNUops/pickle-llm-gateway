@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
@@ -19,6 +20,14 @@ import (
 // its cost is read from there before the usage event is written. This is a
 // rule for every stream, not for one route: whichever surface relayed it, a
 // stream that ended without a cost gets one looked up.
+//
+// The passthrough surface follows the same rule for its answers, which are
+// not streamed but may still end without a price: a route whose usage is
+// optional or absent (a rerank, a synthesized voice), an answer the vendor
+// billed but this gateway refused to relay for its size, or one it could not
+// parse. The lookup is the same and so is its schedule; only the counters
+// are kept apart, so a rise in one surface's misses is not read as the
+// other's.
 //
 // The lookup runs after the handler has returned. A streamed response is only
 // complete for the client when its handler returns, so waiting here would hold
@@ -111,8 +120,9 @@ func (s *Server) DrainCostLookups(ctx context.Context) {
 // the request's latency at the end of the stream, so the wait for the record
 // is not counted as the request's own time. It returns record unchanged when
 // there is nothing to look up with: no generation id, or no credential.
+// filled and missing are the counters this surface's outcomes are added to.
 func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cred string,
-	ev *spool.Event, stopClock, record func()) func() {
+	ev *spool.Event, stopClock, record func(), filled, missing *atomic.Int64) func() {
 	id := upstream.Get(generationIDHeader)
 	if !generationIDPattern.MatchString(id) || cred == "" {
 		return record
@@ -124,7 +134,7 @@ func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cr
 		}
 		stopClock()
 		if !s.costs.admit() {
-			s.metrics.streamCostMissing.Add(1)
+			missing.Add(1)
 			s.log.Warn("generation cost lookup skipped", "keyId", ev.KeyID)
 			record()
 			return
@@ -134,9 +144,9 @@ func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cr
 			defer func() { <-s.costs.slots }()
 			if cost := s.lookupGenerationCost(up, cred, id); cost != "" {
 				ev.CostUsd = cost
-				s.metrics.streamCostFilled.Add(1)
+				filled.Add(1)
 			} else {
-				s.metrics.streamCostMissing.Add(1)
+				missing.Add(1)
 				s.log.Warn("generation cost not found", "keyId", ev.KeyID, "generationId", id)
 			}
 			record()

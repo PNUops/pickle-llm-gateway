@@ -559,7 +559,8 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		// the vendor's own figure is what remains: the generation record's cost
 		// is what the vendor billed, not an estimate, so it is kept even on a
 		// record whose token counts were dropped.
-		recordStream = s.withGenerationCost(resp.Header, up, key.CredentialFor(up.Ref), &ev, stopClock, record)
+		recordStream = s.withGenerationCost(resp.Header, up, key.CredentialFor(up.Ref), &ev, stopClock, record,
+			&s.metrics.streamCostFilled, &s.metrics.streamCostMissing)
 	}
 	if p.noUsageEstimate {
 		inner := recordStream

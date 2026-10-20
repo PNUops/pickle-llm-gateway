@@ -160,8 +160,19 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			Endpoint:    route.name,
 		}
 		w.Header().Set("X-Request-Id", ev.EventUUID)
+		// Latency is fixed when the answer ends. An answer whose cost is read
+		// afterwards stops the clock first, as a stream's does, so the wait
+		// for the vendor's record is not counted as the request's own time.
+		latency := time.Duration(-1)
+		stopClock := func() {
+			if latency < 0 {
+				latency = time.Since(start)
+			}
+		}
+		path := r.URL.Path
 		record := func() {
-			ev.LatencyMs = time.Since(start).Milliseconds()
+			stopClock()
+			ev.LatencyMs = latency.Milliseconds()
 			s.metrics.observe(ev)
 			// Same rule as chat: an attempt that never resolved to a key has
 			// nobody to account to, and the spool is a small disk anyone on
@@ -173,7 +184,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				s.metrics.spoolWriteFailures.Add(1)
 				s.log.Error("usage spool write failed", "error", err)
 			}
-			s.log.Info("passthrough request", "keyId", ev.KeyID, "path", r.URL.Path,
+			s.log.Info("passthrough request", "keyId", ev.KeyID, "path", path,
 				"model", ev.PublicModelName, "status", ev.Status, "errorType", ev.ErrorType,
 				"inputTokens", ev.InputTokens, "outputTokens", ev.OutputTokens,
 				"latencyMs", ev.LatencyMs)
@@ -495,7 +506,18 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// `choices[0].message.content` out — and neither has a counterpart in
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
-		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, record)
+		//
+		// From here on the vendor has answered 2xx and may have billed, so an
+		// event that ends without a price — usage absent or unpriced, or an
+		// answer refused for size or shape — has it read from the generation
+		// record (generation_cost.go). A catalogue read is not billed and is
+		// not looked up.
+		finish := record
+		if route.readsBody {
+			finish = s.withGenerationCost(resp.Header, up, key.CredentialFor(ref), &ev, stopClock, record,
+				&s.metrics.passthroughCostFilled, &s.metrics.passthroughCostMissing)
+		}
+		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, finish)
 	}
 }
 
