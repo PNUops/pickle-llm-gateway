@@ -104,17 +104,17 @@ func (c *catalogState) forRef(ref string) *vendorCatalog {
 // RunVendorCatalog starts the catalog loop. It wakes every retry period and
 // reads only when a read is due: there is no copy for the current passthrough
 // upstream, or the copy is an interval old, and no failure backoff is still
-// running. Waking without reading costs nothing, and it is what lets a
-// snapshot that moves passthrough to another upstream get its catalog within
-// a minute rather than at the old copy's next refresh. The first read happens
-// at once, so a restarted gateway lists paid models again within a request or
-// two.
+// running for that upstream. Waking without reading costs nothing, and it is
+// what lets a snapshot that moves passthrough to another upstream get its
+// catalog within a minute rather than at the old copy's next refresh; a
+// backoff earned by the old upstream's failures does not delay the new one.
+// The first read happens at once, so a restarted gateway lists paid models
+// again within a request or two.
 func (s *Server) RunVendorCatalog(ctx context.Context) {
 	go func() {
 		timer := time.NewTimer(0)
 		defer timer.Stop()
-		backoff := s.catalog.retry
-		var notBefore time.Time
+		sched := catalogSchedule{retry: s.catalog.retry, interval: s.catalog.interval}
 		for {
 			select {
 			case <-ctx.Done():
@@ -122,30 +122,60 @@ func (s *Server) RunVendorCatalog(ctx context.Context) {
 			case <-timer.C:
 			}
 			timer.Reset(s.catalog.retry)
+			doc, _, _ := s.store.Current()
+			ref := strings.ToLower(doc.PassthroughRef)
 			now := time.Now()
-			if now.Before(notBefore) || !s.vendorCatalogDue() {
+			if !sched.mayRead(now, ref) || !s.vendorCatalogDue(ref) {
 				continue
 			}
-			switch s.refreshVendorCatalog(ctx) {
-			case catalogRead:
-				backoff = s.catalog.retry
-				notBefore = time.Time{}
-			case catalogFailed:
-				notBefore = now.Add(backoff)
-				backoff = min(backoff*2, s.catalog.interval)
-			}
+			sched.record(s.refreshVendorCatalog(ctx, ref), now)
 		}
 	}()
 }
 
-// vendorCatalogDue reports whether the copy needs reading for the current
-// passthrough upstream.
-func (s *Server) vendorCatalogDue() bool {
-	doc, _, _ := s.store.Current()
-	if doc.PassthroughRef == "" {
+// catalogSchedule is the loop's failure backoff. The backoff belongs to the
+// upstream whose reads failed, so a change of passthrough upstream starts
+// the new one without it. One backoff is kept, for the current upstream: a
+// change back to an earlier one starts that one afresh too.
+type catalogSchedule struct {
+	retry, interval time.Duration
+	backoff         time.Duration
+	notBefore       time.Time
+	ref             string // the upstream the backoff was earned on
+}
+
+func (c *catalogSchedule) mayRead(now time.Time, ref string) bool {
+	if ref != c.ref {
+		c.ref = ref
+		c.backoff = 0
+		c.notBefore = time.Time{}
+	}
+	return !now.Before(c.notBefore)
+}
+
+// record follows mayRead on the same wake, which has already set the upstream.
+func (c *catalogSchedule) record(outcome catalogOutcome, now time.Time) {
+	switch outcome {
+	case catalogRead:
+		c.backoff = 0
+		c.notBefore = time.Time{}
+	case catalogFailed:
+		if c.backoff == 0 {
+			c.backoff = c.retry
+		}
+		c.notBefore = now.Add(c.backoff)
+		c.backoff = min(c.backoff*2, c.interval)
+	}
+}
+
+// vendorCatalogDue reports whether the copy needs reading for the passthrough
+// upstream ref (lower-cased), which the loop resolves once per wake so the
+// read and the backoff it earns are about the same upstream.
+func (s *Server) vendorCatalogDue(ref string) bool {
+	if ref == "" {
 		return false
 	}
-	cat := s.catalog.forRef(doc.PassthroughRef)
+	cat := s.catalog.forRef(ref)
 	return cat == nil || s.now().Sub(cat.fetchedAt) >= s.catalog.interval
 }
 
@@ -160,9 +190,7 @@ const (
 // refreshVendorCatalog makes one read for the current passthrough upstream.
 // With no passthrough upstream there is nothing to read, which is not a
 // failure, and neither is a read cut short by shutdown.
-func (s *Server) refreshVendorCatalog(parent context.Context) catalogOutcome {
-	doc, _, _ := s.store.Current()
-	ref := strings.ToLower(doc.PassthroughRef)
+func (s *Server) refreshVendorCatalog(parent context.Context, ref string) catalogOutcome {
 	if ref == "" {
 		return catalogSkipped
 	}
