@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -71,6 +72,43 @@ type passthroughRoute struct {
 	// refuseOpenAIImageFields), because the vendor would drop them without a
 	// word and the caller would get something other than what they asked for.
 	openAIImages bool
+	// lookupCost marks the routes whose usage the vendor does not always
+	// report: every answer that ends without a price has it read from the
+	// generation record. On the other routes only an answer that failed
+	// after the vendor billed it is looked up (see handlePassthrough).
+	lookupCost bool
+	// noEstimate marks the routes whose vendor usage is optional. An answer
+	// that arrives without a count or a price is recorded as a success with
+	// no tokens and Estimated false; an estimate from the body size would be
+	// a count of something the vendor does not bill by. Such a route also
+	// sets lookupCost, so the price comes from the generation record.
+	noEstimate bool
+	// nativeModelName marks the routes whose answer names the model in the
+	// serving provider's own spelling ("rerank-v3.5", not
+	// "cohere/rerank-v3.5"). That name can never equal the one requested, so
+	// comparing them would flag every answer as served by another model.
+	nativeModelName bool
+	// audioAnswer marks the routes that answer with audio rather than JSON.
+	// The answer is relayed as it came, under its own media type, and carries
+	// no usage at all, so nothing is estimated (relayAudio never reads a
+	// count) and such a route also sets lookupCost, so its price comes from
+	// the generation record.
+	audioAnswer bool
+	// openAISpeech marks the speech route, whose OpenAI request fields the
+	// vendor cannot all honour (see refuseOpenAISpeechFields).
+	openAISpeech bool
+	// multipartForm marks the routes that also take an OpenAI-style multipart
+	// upload (see readTranscriptionForm). A JSON body is read as on every
+	// other route.
+	multipartForm bool
+	// openAITranscriptions marks the transcription route, whose OpenAI
+	// request fields the vendor cannot all honour (see
+	// refuseOpenAITranscriptionFields).
+	openAITranscriptions bool
+	// generationIDInBody marks the routes whose answer names its generation
+	// in the body's `id` rather than in the X-Generation-Id header. The body
+	// id is used for the cost lookup only when the header is absent.
+	generationIDInBody bool
 }
 
 var (
@@ -112,6 +150,52 @@ var (
 		upstreamPath: "/embeddings",
 		readsBody:    true,
 	}
+	// Rerank is not an OpenAI or Anthropic route; it is the rerank call
+	// Cohere and Voyage offer, opened because retrieval exercises use it. The
+	// vendor documents its usage object as optional and bills by the search
+	// unit on some models, so an answer may carry a price with no tokens, or
+	// nothing at all. It names the generation only in the body's id, not in
+	// the header the other routes carry, and the answer's model is the
+	// serving provider's own name.
+	routeRerank = passthroughRoute{
+		capability:         snapshot.EndpointRerank,
+		name:               spool.EndpointRerank,
+		method:             http.MethodPost,
+		upstreamPath:       "/rerank",
+		readsBody:          true,
+		noEstimate:         true,
+		lookupCost:         true,
+		nativeModelName:    true,
+		generationIDInBody: true,
+	}
+	// The OpenAI SDK's text-to-speech path. The answer is audio, mp3 or raw
+	// PCM, and the vendor reports no usage on it.
+	routeSpeech = passthroughRoute{
+		capability:   snapshot.EndpointSpeech,
+		name:         spool.EndpointSpeech,
+		method:       http.MethodPost,
+		upstreamPath: "/audio/speech",
+		readsBody:    true,
+		lookupCost:   true,
+		audioAnswer:  true,
+		openAISpeech: true,
+	}
+	// The OpenAI SDK's speech-to-text path. The vendor takes the audio either
+	// as base64 or a URL in a JSON body, or as a multipart upload, which is
+	// the only shape the OpenAI SDK sends. Usage is a price with the seconds
+	// for a model billed by time, and token counts with the price for one
+	// billed by token.
+	routeTranscriptions = passthroughRoute{
+		capability:           snapshot.EndpointTranscriptions,
+		name:                 spool.EndpointTranscriptions,
+		method:               http.MethodPost,
+		upstreamPath:         "/audio/transcriptions",
+		readsBody:            true,
+		noEstimate:           true,
+		lookupCost:           true,
+		multipartForm:        true,
+		openAITranscriptions: true,
+	}
 )
 
 // endpointNames are the words a refusal uses for a capability. The token is
@@ -124,12 +208,15 @@ var (
 // covers (editing and the catalogue read travel with it), and matching the
 // screen still wins over being more precise here than the screen is.
 var endpointNames = map[string]string{
-	snapshot.EndpointChat:       "Chat",
-	snapshot.EndpointWebSearch:  "웹 검색",
-	snapshot.EndpointPdfOcr:     "PDF OCR",
-	snapshot.EndpointImages:     "이미지 생성",
-	snapshot.EndpointEmbeddings: "임베딩",
-	snapshot.EndpointContainers: "코드 실행",
+	snapshot.EndpointChat:           "Chat",
+	snapshot.EndpointWebSearch:      "웹 검색",
+	snapshot.EndpointPdfOcr:         "PDF OCR",
+	snapshot.EndpointImages:         "이미지 생성",
+	snapshot.EndpointEmbeddings:     "임베딩",
+	snapshot.EndpointRerank:         "리랭크",
+	snapshot.EndpointSpeech:         "TTS",
+	snapshot.EndpointTranscriptions: "STT",
+	snapshot.EndpointContainers:     "코드 실행",
 }
 
 // endpointLabel renders one capability for a message. A token with no name
@@ -160,8 +247,19 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			Endpoint:    route.name,
 		}
 		w.Header().Set("X-Request-Id", ev.EventUUID)
+		// Latency is fixed when the answer ends. An answer whose cost is read
+		// afterwards stops the clock first, as a stream's does, so the wait
+		// for the vendor's record is not counted as the request's own time.
+		latency := time.Duration(-1)
+		stopClock := func() {
+			if latency < 0 {
+				latency = time.Since(start)
+			}
+		}
+		path := r.URL.Path
 		record := func() {
-			ev.LatencyMs = time.Since(start).Milliseconds()
+			stopClock()
+			ev.LatencyMs = latency.Milliseconds()
 			s.metrics.observe(ev)
 			// Same rule as chat: an attempt that never resolved to a key has
 			// nobody to account to, and the spool is a small disk anyone on
@@ -173,7 +271,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 				s.metrics.spoolWriteFailures.Add(1)
 				s.log.Error("usage spool write failed", "error", err)
 			}
-			s.log.Info("passthrough request", "keyId", ev.KeyID, "path", r.URL.Path,
+			s.log.Info("passthrough request", "keyId", ev.KeyID, "path", path,
 				"model", ev.PublicModelName, "status", ev.Status, "errorType", ev.ErrorType,
 				"inputTokens", ev.InputTokens, "outputTokens", ev.OutputTokens,
 				"latencyMs", ev.LatencyMs)
@@ -258,6 +356,7 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		defer large.done()
 
 		var body []byte
+		var bodyType string
 		inputBytes := 0
 		if route.readsBody {
 			// Two tiers, as on chat. A body up to the ordinary bound takes no
@@ -310,7 +409,19 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// decoder, so it changes what the bytes look like and not what
 			// they mean.
 			var params map[string]json.RawMessage
-			if json.Unmarshal(raw, &params) != nil {
+			// A multipart upload is parsed and assembled again rather than
+			// forwarded, for the reason the JSON body is re-serialized: the
+			// vendor must not see a part this file did not resolve.
+			var form []byte
+			var formType string
+			if route.multipartForm && isMultipartForm(r.Header.Get("Content-Type")) {
+				var e *apiError
+				params, form, formType, e = readTranscriptionForm(raw, r.Header.Get("Content-Type"))
+				if e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
+			} else if json.Unmarshal(raw, &params) != nil {
 				refuse(errBadJSON, spool.StatusBadRequest)
 				return
 			}
@@ -327,10 +438,22 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 					return
 				}
 			}
+			if route.openAISpeech {
+				if e := refuseOpenAISpeechFields(params); e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
+			}
+			if route.openAITranscriptions {
+				if e := refuseOpenAITranscriptionFields(params); e != nil {
+					refuse(*e, spool.StatusBadRequest)
+					return
+				}
+			}
 
 			// The model fence, unchanged and not rebuilt. passthroughModel
 			// synthesizes the CREDIT-axis model this name would resolve to and
-			// AllowsCreditModel compares lower-cased strings without consulting
+			// ServesCreditModel compares lower-cased strings without consulting
 			// the catalogue, so a name no catalogue lists is fenced exactly as
 			// it is on chat.
 			// See chat.go: a preset name resolves to nothing and must not come
@@ -351,12 +474,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			// and the guard is what bounds it — assigning any earlier would
 			// let a refused request write kilobytes of junk to both.
 			ev.PublicModelName = model.PublicName
-			if !key.AllowsCreditModel(model) {
+			if !key.ServesCreditModel(model) {
 				// See chat.go: the two predicates are re-read only to pick the
 				// message, never to decide.
-				if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
-					refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
-						"router_model_not_allowed")
+				if snapshot.IsRouterModelName(publicModel) {
+					refuseAs(errRouterModelNotSupported(publicModel), spool.StatusBadRequest,
+						"router_model_not_supported")
 					return
 				}
 				refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
@@ -416,12 +539,16 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 					return
 				}
 			}
-			forward, err := json.Marshal(params)
-			if err != nil {
-				refuse(errBadJSON, spool.StatusBadRequest)
-				return
+			if form != nil {
+				body, bodyType = form, formType
+			} else {
+				forward, err := json.Marshal(params)
+				if err != nil {
+					refuse(errBadJSON, spool.StatusBadRequest)
+					return
+				}
+				body = forward
 			}
-			body = forward
 		}
 
 		upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
@@ -456,6 +583,8 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			cred:       key.CredentialFor(ref),
 			creditAxis: true,
 			headers:    passthroughForwardedHeaders(r.Header),
+			// Empty for a JSON body.
+			contentType: bodyType,
 		})
 		if ae != nil {
 			s.health.recordPassiveFailure(ref, ae.kind)
@@ -495,8 +624,43 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 		// `choices[0].message.content` out — and neither has a counterpart in
 		// an image or an embedding response. Widening them is a body-record
 		// design question, not a routing one.
-		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, record)
+		//
+		// From here on the vendor has answered 200 and has billed, so an
+		// answer this gateway then failed to hand over (refused for its size
+		// or shape, cut off while being read, or not taken by the client) has
+		// its price read from the generation record (generation_cost.go) if
+		// it ended without one. A route whose usage is optional has every
+		// unpriced answer looked up. A successful answer on the other routes
+		// is not: those report their usage on every call, so a success
+		// without a price is not something a lookup per call should paper
+		// over, and doing it for every embedding call would put a vendor read
+		// behind each one. A catalogue read is not billed and is not looked
+		// up.
+		finish := record
+		var answer passthroughAnswer
+		if route.readsBody {
+			finish = func() {
+				if !route.lookupCost && ev.Status == spool.StatusOK {
+					record()
+					return
+				}
+				id := resp.Header.Get(generationIDHeader)
+				if id == "" {
+					id = answer.generationID
+				}
+				s.withGenerationCost(id, up, key.CredentialFor(ref), &ev, stopClock, record,
+					&s.costs.passthrough)()
+			}
+		}
+		s.finishPassthrough(w, resp, route, large, inputBytes, &ev, &answer, finish)
 	}
+}
+
+// passthroughAnswer carries what finishPassthrough learned from the body that
+// the record wrapper needs: the generation id, on the routes that name it
+// there. It is filled before record runs.
+type passthroughAnswer struct {
+	generationID string
 }
 
 // passthroughLargeHold is one request's claim on the passthrough large-body
@@ -545,7 +709,7 @@ func (h *passthroughLargeHold) done() {
 // moment the bound is crossed. Either way the vendor has billed the answer, so
 // a refusal for want of a slot is named like one for size.
 func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, route passthroughRoute,
-	large *passthroughLargeHold, inputBytes int, ev *spool.Event, record func()) {
+	large *passthroughLargeHold, inputBytes int, ev *spool.Event, answer *passthroughAnswer, record func()) {
 	tooLarge := func() {
 		writeAPIError(w, errPassthroughResponseTooLarge)
 		ev.Status = spool.StatusUpstreamErr
@@ -637,16 +801,23 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		record()
 		return
 	}
+	if route.audioAnswer {
+		s.relayAudio(w, resp, body, ev, record)
+		return
+	}
 	// A response that does not parse as JSON is not something the gateway can
 	// vouch for, and forwarding it verbatim could hand back whatever the
 	// upstream put in it. Same answer chat gives.
-	served, u, images, haveUsage, ok := passthroughUsage(body)
+	served, bodyID, u, images, haveUsage, ok := passthroughUsage(body)
 	if !ok {
 		writeAPIError(w, errUpstream)
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_invalid_response"
 		record()
 		return
+	}
+	if route.generationIDInBody {
+		answer.generationID = bodyID
 	}
 
 	// The caller sees the vendor's own model field here, since this surface
@@ -659,7 +830,9 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// the defect this argument list would otherwise reproduce. If this surface
 	// ever maps a name, the right value has to be threaded down here — the
 	// identity is asserted where it is created.
-	s.noteServedModel(ev, ev.PublicModelName, served)
+	if !route.nativeModelName {
+		s.noteServedModel(ev, ev.PublicModelName, served)
+	}
 
 	relayGenerationID(w, resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -669,7 +842,7 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 	// a caller that reads its answer a byte at a time: upCtx covers the
 	// upstream call, and the server sets no write timeout.
 	var werr error
-	writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	s.writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
 	if werr != nil {
 		ev.Status = spool.StatusCanceled
 		ev.ErrorType = "client_disconnected"
@@ -683,10 +856,14 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 		record()
 		return
 	}
-	// Every route this surface opens returns usage, so the estimate below is
-	// the degraded path and its `estimated` flag is the signal that the
-	// vendor stopped reporting — see settleUsage.
-	s.settleUsage(ev, u, haveUsage, inputBytes, 0)
+	// On the routes whose usage is required, the estimate below is the
+	// degraded path and its `estimated` flag is the signal that the vendor
+	// stopped reporting — see settleUsage. Where usage is optional, an answer
+	// without it is not degraded and is recorded with no counts; its price
+	// comes from the generation record, if the vendor kept one.
+	if haveUsage || !route.noEstimate {
+		s.settleUsage(ev, u, haveUsage, inputBytes, 0)
+	}
 	// Outside settleUsage because the count comes from the response body
 	// rather than the usage object, and it survives the estimate path: how
 	// many images arrived is known even when the vendor priced none of them.
@@ -705,18 +882,30 @@ func (s *Server) finishPassthrough(w http.ResponseWriter, resp *http.Response, r
 
 // passthroughUsage lifts the token counts, the vendor's price and the image
 // count out of a response. The returns are, in order: the model the vendor
-// named, the usage, how many images came back, whether usage was reported at
-// all, and whether the body parsed as JSON at all.
+// named, the generation id the body names (empty when it names none or not as
+// a string), the usage, how many images came back, whether usage was reported
+// at all, and whether the body parsed as JSON at all.
 //
 // It reads both field namings because this surface does not control which one
 // the vendor uses per route, and a struct that quietly fills with zeros would
 // record a metered request as costing nothing while leaving `estimated` false
-// — a wrong number that says it is exact. A usage object that yields nothing
-// on either naming is therefore reported as absent, which sends the event down
-// the estimate path where the flag says so.
-func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
+// — a wrong number that says it is exact. A usage object that yields neither a
+// count on either naming nor a price is therefore reported as absent, which
+// sends the event down the estimate path where the flag says so.
+//
+// A price with no count is reported as usage, with zero tokens. Some calls are
+// not billed by the token at all — a transcription billed by the second, a
+// rerank by the search unit — and the vendor reports their usage as a price
+// and a unit this event has no field for. The price is the figure that
+// matters, and it is exact; inventing tokens from the body size beside it
+// would put a count on the record that no one metered.
+func passthroughUsage(body []byte) (string, string, usage, int, bool, bool) {
 	var envelope struct {
 		Model string `json:"model"`
+		// ID is the generation id, on the routes that name it in the body.
+		// Raw, so that an id of another type is ignored rather than failing
+		// the decode of an answer the vendor has already billed.
+		ID json.RawMessage `json:"id"`
 		// Data is the image list. Counting what came back rather than trusting
 		// the requested n is the honest figure: the vendor may return fewer,
 		// and the billing follows what arrived.
@@ -737,10 +926,12 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return "", usage{}, 0, false, false
+		return "", "", usage{}, 0, false, false
 	}
+	var id string
+	_ = json.Unmarshal(envelope.ID, &id)
 	if envelope.Usage == nil {
-		return envelope.Model, usage{}, len(envelope.Data), false, true
+		return envelope.Model, id, usage{}, len(envelope.Data), false, true
 	}
 	u := usage{
 		PromptTokens:            envelope.Usage.PromptTokens,
@@ -756,11 +947,13 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 	}
 	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 		if u.TotalTokens == 0 {
-			// The price is dropped along with the counts. A charge recorded
-			// beside zero tokens would be read as an unmetered request that
-			// still cost money, which is a different and more alarming claim
-			// than the estimate this actually falls back to.
-			return envelope.Model, usage{}, len(envelope.Data), false, true
+			if spool.CostLiteral(u.Cost) != "" {
+				// Priced but not counted: the call is billed in a unit
+				// other than tokens. Recorded as zero tokens and the price,
+				// with Estimated false, because neither figure is a guess.
+				return envelope.Model, id, usage{Cost: u.Cost}, len(envelope.Data), true, true
+			}
+			return envelope.Model, id, usage{}, len(envelope.Data), false, true
 		}
 		// A total with no split. The event has no field for a total, and
 		// recording the split as two zeros would report a metered request as
@@ -770,7 +963,7 @@ func passthroughUsage(body []byte) (string, usage, int, bool, bool) {
 		// split is simply not knowable from what the vendor sent.
 		u.PromptTokens = u.TotalTokens
 	}
-	return envelope.Model, u, len(envelope.Data), true, true
+	return envelope.Model, id, u, len(envelope.Data), true, true
 }
 
 // passthroughHeaderAllowlist is which client headers reach the upstream. It is
@@ -864,6 +1057,91 @@ func refuseOpenAIImageFields(params map[string]json.RawMessage) *apiError {
 	if _, ok := present("moderation"); ok {
 		e := errUnsupportedValue("moderation",
 			"moderation은 이 위치에서 지원하지 않습니다. OpenAI 모델이면 provider.options.openai.moderation으로 보내주세요.")
+		return &e
+	}
+	return nil
+}
+
+// relayAudio hands back an audio answer under the vendor's media type. Only a
+// media type that parses and is audio is relayed, and it is rendered again
+// from the parse rather than copied, so nothing but a type and its parameters
+// reaches the caller; anything else is refused like an unparseable JSON
+// answer. The vendor reports no usage here, so the record carries no counts
+// and its price comes from the generation record.
+func (s *Server) relayAudio(w http.ResponseWriter, resp *http.Response, body []byte, ev *spool.Event, record func()) {
+	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || !strings.HasPrefix(mediaType, "audio/") {
+		writeAPIError(w, errUpstream)
+		ev.Status = spool.StatusUpstreamErr
+		ev.ErrorType = "upstream_invalid_response"
+		record()
+		return
+	}
+	contentType := mime.FormatMediaType(mediaType, params)
+	if contentType == "" {
+		contentType = mediaType
+	}
+	relayGenerationID(w, resp.Header)
+	w.Header().Set("Content-Type", contentType)
+	var werr error
+	s.writeUnderDeadline(w, len(body), func() { _, werr = w.Write(body) })
+	if werr != nil {
+		ev.Status = spool.StatusCanceled
+		ev.ErrorType = "client_disconnected"
+	} else {
+		ev.Status = spool.StatusOK
+	}
+	record()
+}
+
+// speechFormats are the audio formats the vendor produces.
+var speechFormats = map[string]bool{"mp3": true, "pcm": true}
+
+// refuseOpenAISpeechFields refuses the OpenAI speech fields the vendor cannot
+// honour, for the reason refuseOpenAIImageFields gives:
+//
+//   - response_format other than mp3 or pcm: the vendor makes only those two,
+//     and refuses the rest with an error a student cannot read. Omitting it
+//     gets pcm, the vendor's default, which is not OpenAI's.
+//   - stream_format other than "audio": the vendor answers with the whole
+//     file regardless. "audio", which asks for exactly that, passes.
+//   - input_references: voice cloning from reference audio, which is not
+//     offered.
+func refuseOpenAISpeechFields(params map[string]json.RawMessage) *apiError {
+	present := func(name string) (json.RawMessage, bool) {
+		raw, ok := params[name]
+		if !ok || string(bytes.TrimSpace(raw)) == "null" {
+			return nil, false
+		}
+		return raw, true
+	}
+	if raw, ok := present("response_format"); ok {
+		var format string
+		if json.Unmarshal(raw, &format) != nil {
+			e := errInvalidParamValue("response_format")
+			return &e
+		}
+		if !speechFormats[format] {
+			e := errUnsupportedValue("response_format",
+				"이 경로는 mp3와 pcm만 만듭니다. response_format을 mp3나 pcm으로 보내주세요. 빼면 pcm(24kHz 16비트 모노, 헤더 없음)입니다.")
+			return &e
+		}
+	}
+	if raw, ok := present("stream_format"); ok {
+		var format string
+		if json.Unmarshal(raw, &format) != nil {
+			e := errInvalidParamValue("stream_format")
+			return &e
+		}
+		if format != "audio" {
+			e := errUnsupportedValue("stream_format",
+				"이 경로는 음성 파일을 한 번에 돌려주며 스트리밍(sse)은 지원하지 않습니다. stream_format을 빼거나 audio로 보내주세요.")
+			return &e
+		}
+	}
+	if _, ok := present("input_references"); ok {
+		e := errUnsupportedValue("input_references",
+			"참조 음성으로 목소리를 만드는 기능(음성 복제)은 지원하지 않습니다. input_references를 빼고 voice로 목소리를 골라주세요.")
 		return &e
 	}
 	return nil

@@ -9,8 +9,9 @@ OpenAI 호환 요청을 받아 API Key를 검증하고 사용량 한도를 적�
 
 ```
 학생 코드 (OpenAI SDK + API Key)
-    │  POST /v1/chat/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
-    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings
+    │  POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, GET /v1/models
+    │  POST /v1/images(/generations), GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank
+    │  POST /v1/audio/speech, POST /v1/audio/transcriptions
     ▼
 llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 기록
     │
@@ -21,7 +22,7 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 학생 코드에는 공개 모델명만 보입니다. 실제 모델과 업스트림 주소는 게이트웨이 설정에만
 있으므로, 업스트림을 교체해도 학생 코드는 바뀌지 않습니다.
 
-아래 넷은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
+아래 일곱은 패스스루 경로입니다. 요청 본문을 그대로 외부 공급자에게 전달하고 응답을 그대로
 돌려줍니다. 전부 유료 모델이므로 비용은 그 Key에 부여된 금액 한도에서 나갑니다. Key마다
 허용된 경로만 열리고 기본값은 전부 닫힘입니다.
 
@@ -31,10 +32,71 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 | `POST /v1/images/generations` | 이미지 생성 (`images`) |
 | `GET /v1/images/models` | 이미지 생성 (`images`) |
 | `POST /v1/embeddings` | 임베딩 (`embeddings`) |
+| `POST /v1/rerank` | 리랭크 (`rerank`) |
+| `POST /v1/audio/speech` | TTS (`speech`) |
+| `POST /v1/audio/transcriptions` | STT (`transcriptions`) |
+
+`POST /v1/rerank`는 OpenAI나 Anthropic이 아니라 Cohere, Voyage 같은 API의 리랭크 호출입니다. 질의와 문서 목록을 받아
+관련도 순서를 돌려줍니다. 사용량은 응답의 `usage`에서 읽되 업스트림 문서상 선택 필드이고, 모델에 따라 토큰 수
+(`total_tokens`)와 금액이 오거나 토큰 없이 검색 단위(`search_units`)와 금액만 옵니다. 토큰이 없으면 0으로 기록하고 본문
+크기로 추정하지 않습니다. 금액이 없으면 응답 본문의 `id`로 생성 기록을 조회해 채웁니다(이 경로는 `X-Generation-Id` 헤더가
+없습니다). 응답의 `model`은 서빙 공급자의 원래 이름(예: `rerank-v3.5`)이라 요청한 이름과 비교하지 않고, 기록의 모델 이름은
+요청한 이름입니다.
+
+`POST /v1/audio/speech`는 OpenAI SDK의 `audio.speech.create()`가 부르는 음성 합성 경로입니다. 응답은 JSON이 아니라
+음성 파일이고, 공급자의 미디어 타입(`audio/mpeg`, `audio/pcm;rate=24000;channels=1` 등)을 해석해 다시 적은 값으로
+그대로 돌려줍니다. 오디오가 아닌 응답은 502 `upstream_error`입니다. 공급자는 mp3와 pcm만 만들고 `response_format`을 빼면
+pcm(헤더 없는 원시 PCM)을 돌려주므로, `response_format`이 그 둘이 아니면 400으로 이유와 함께 거절합니다.
+`stream_format`은 `audio`만 받고(공급자는 늘 파일 하나로 답합니다) 참조 음성으로 목소리를 만드는 `input_references`는
+거절합니다. 응답에 사용량이 없으므로 토큰 0으로 기록하고 금액은 `X-Generation-Id`로 생성 기록을 조회해 채웁니다.
+
+`POST /v1/audio/transcriptions`는 음성 인식 경로입니다. 공급자 형식의 JSON 본문(`input_audio`에 base64 `data`나
+`url`)과, OpenAI SDK의 `audio.transcriptions.create()`가 보내는 multipart 업로드(`file` 파트)를 모두 받습니다.
+multipart는 그대로 넘기지 않고 해석한 뒤 아는 필드(`model`, `language`, `prompt`, `response_format`, `temperature`,
+`timestamp_granularities[]`, `keyterms[]`, `diarize`, `provider`, `source_url`)와 파일 하나로 다시 조립해 보냅니다.
+`stream`은 읽어서 `true`면 다른 패스스루 경로처럼 거절합니다. 모르는 필드는 400 `unsupported_parameter`, 반복될 수 없는
+필드가 반복되거나 UTF-8이 아닌 값은 400 `invalid_parameter_value`, 이름 있는 파트로 읽을 수 없는 본문은 400
+`invalid_multipart_form`입니다. 2 MiB가 넘는 업로드(128kbps mp3로 약 2분 넘는 음성)는 이미지 편집처럼 패스스루 큰 본문
+슬롯(기본 2개)을 호출이 끝날 때까지 잡으므로, 수업에서 동시에 많이 쓰면 `LLMGW_PASSTHROUGH_MAX_IN_FLIGHT`를 함께 정합니다.
+공급자는 `json`과 `verbose_json`만 돌려주므로 `response_format`이 그 둘이 아니면 400으로 이유와 함께 거절하고,
+공급자가 받지 않는 `chunking_strategy`와 `include`도 거절합니다. 사용량은 시간 과금 모델이면 `seconds`와 `cost`만 와서
+토큰 0과 금액으로, 토큰 과금 모델이면 `input_tokens`, `output_tokens`와 `cost`로 기록합니다. 금액이 없으면
+`X-Generation-Id`로 생성 기록을 조회합니다.
 
 `/v1/chat/completions`도 기능 권한 `chat`이 있는 Key에만 열립니다. 자체 서빙 모델과 유료 모델
 모두에 적용되고, 채팅 없이 다른 기능만 쓰는 Key가 있기 때문에 기본으로 부여하지 않습니다.
 `GET /v1/models`는 비용이 없으므로 기능 권한 없이 열립니다.
+
+`GET /v1/models` 목록에는 자체 서빙 모델과 스냅샷 카탈로그 모델 뒤에, 그 Key로 실제로 부를 수 있는
+유료 모델이 이름 순으로 붙습니다. 유료 모델은 게이트웨이가 패스스루 업스트림의 공개 카탈로그
+`GET {BaseURL}/models?output_modalities=all`를 인증 없이 30분마다 읽어 둔 사본에서 가져옵니다. 읽기에
+실패하면 1분부터 두 배씩 늘려 다시 읽고(최대 30분), 그동안은 마지막으로 읽은 사본을 그대로 씁니다.
+한 번도 읽지 못했으면 목록에는 스냅샷 모델만 나옵니다. 스냅샷이 패스스루 업스트림을 바꾸면 옛
+사본은 쓰지 않고 1분 안에 새 업스트림의 카탈로그를 읽습니다. 사본 상태는 관리 리스너 `/metrics`의
+`vendorModelCatalog`에서 볼 수 있습니다(모델 수, 연속 실패 수, 사본이 있으면 경과 초).
+
+유료 모델은 아래 조건을 모두 만족할 때 목록에 나옵니다.
+
+- 단건 조회 `GET /v1/models/{id}`와 같은 판정을 통과한다. Key에 패스스루 업스트림 자격증명이 있고,
+  모델 허용 목록과 금액 축 허용 목록, 차단 목록이 그 이름을 막지 않아야 합니다.
+- 모델이 내는 출력 중 하나에 필요한 기능 권한이 Key에 있다. 텍스트는 `chat`, 이미지는 `images`,
+  임베딩은 `embeddings`, rerank는 `rerank`, 음성 합성은 `speech`, 음성 인식은 `transcriptions`가
+  필요합니다. 영상처럼 이 표에 없는 출력만 내는 모델은 나오지 않습니다.
+- 라우터 이름(`openrouter/*`)과 `:free` 변형이 아니다.
+
+항목은 표준 필드에 컨텍스트 길이만 더합니다. OpenAI 모양은 `context_length`, Anthropic 모양은
+`max_input_tokens`와 `max_tokens`입니다. 카탈로그에 값이 없거나 0인 필드는 생략합니다. 가격, 모달리티, 지원
+파라미터는 공급자 확장이라 싣지 않습니다. 자체 서빙 모델 항목은 표준 필드만 그대로 둡니다.
+
+```json
+{"id":"openai/gpt-4o-mini","object":"model","created":1721260800,"owned_by":"openai","context_length":128000}
+```
+
+단건 조회는 목록보다 넓습니다. 카탈로그에 없는 이름이나 위 기능 권한이 없는 모델도 판정을 통과하면
+지금처럼 답합니다. 직접 호출은 어차피 공급자까지 가서 그쪽에서 판정되기 때문입니다. 카탈로그에 있는
+이름이면 목록과 같은 항목으로 답합니다. 공급자 전용 조회 경로 `/v1/models/{author}/{slug}/endpoints`,
+`/v1/embeddings/models`, `/v1/tools`는 지원하지 않으며 인증 전에 404 `unknown_endpoint`로 답합니다.
+`/endpoints` 경로는 끝의 `/`와 대소문자가 달라도 같이 막습니다.
 
 `POST /v1/responses`는 OpenAI Responses API 경로입니다. Codex와 OpenAI SDK의 `responses.create()`가
 이 경로를 부릅니다. 기능 권한은 `/v1/chat/completions`와 같은 `chat`이고 **유료 모델만** 받습니다.
@@ -72,6 +134,16 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
   정상 종료로 기록하고, `response.failed`와 스트림 안의 `error`는 업스트림 오류로 기록합니다.
   사용량이 없는 응답은 추정하지 않고 그대로 돌려준 뒤 `upstream_usage_missing`으로 기록합니다.
   본문 보관은 이 경로에서 하지 않습니다.
+
+`POST /v1/completions`는 OpenAI의 레거시 텍스트 완성 경로입니다(OpenAI SDK의 `completions.create()`).
+기능 권한은 `chat`이고 **유료 모델만** 받으며, 자체 서빙 모델 이름은 400 `model_not_available_on_route`로
+거절합니다. 필수 필드는 `model`과 `prompt`이고, 출력 상한은 `max_tokens`와 `max_completion_tokens`를 읽어 작은 값을 `max_tokens`로 보냅니다. 요청과 응답은 모델 이름만
+바꿔 공급자의 `/completions`로 전달하고, 펜스와 요청 헤더, 사용량(`usage`의 토큰과 `cost`, 스트림은 마지막
+청크), 스트림의 `[DONE]` 처리는 Chat과 같습니다. 공급자는 사용량 청크에도 선택지(`choices`)를 실어 보내므로,
+`stream_options.include_usage`를 요청하지 않은 클라이언트에는 그 청크를 `usage`만 빼고 전달합니다. 공급자가
+`prompt`를 채팅 메시지로 바꿔 채팅 모델에 보내므로 원문을 그대로 이어 쓰는 동작은 보장되지 않고, 사고하는
+모델은 출력이 `reasoning`으로 가고 `text`가 빌 수 있습니다. 사용량이 없는 응답은 추정하지 않고
+`upstream_usage_missing`으로 기록하며 본문 보관은 하지 않습니다.
 
 허용되지 않은 경로는 403 `endpoint_not_allowed`로 답합니다. 경로가 없는 것과 Key에 허용되지
 않은 것은 다른 상태이므로 404로 감추지 않습니다. 거절 문구는 경로가 아니라 기능 이름으로
@@ -166,11 +238,20 @@ temperature  top_p  stop  presence_penalty  frequency_penalty  seed  user
 response_format  tools  tool_choice  parallel_tool_calls
 ```
 
-**자동 선택 모델도 예외입니다.** `openrouter/` 아래 이름은 **모델을 고르는 이름**이라 어떤
-모델이 답할지 요청 시점에 정해지지 않고, 외부 공급자는 **고른 모델 기준으로 청구**합니다.
-목록으로 판정할 대상이 없으므로 **모델 제한이 걸린 Key에서는 거절합니다.** 제한이 없는 Key는
-금액 한도만이 경계였으므로 그대로 쓸 수 있습니다. 거절 문구는 목록을 보라고 하지 않고 **모델
-이름을 직접 지정하라**고 알립니다. 판정이 불가능한 것이지 누가 뺀 모델이 아니기 때문입니다.
+**자동 선택 모델은 지원하지 않습니다.** `openrouter/` 아래 이름은 **모델을 고르는 이름**이라 어떤
+모델이 답할지 요청 시점에 정해지지 않고, 외부 공급자는 **고른 모델 기준으로 청구**합니다. 공급자
+전용 기능이고 일반적인 LLM API에는 없으므로 **모든 Key에서 거절합니다.** 예전에는 모델 제한이 걸린
+Key에서만 거절했습니다.
+
+- 요청의 `model`에 적힌 라우터 이름은 400 `router_not_supported`로 거절합니다. Chat, Messages,
+  Responses, 패스스루 경로가 같습니다. 단건 조회는 404로 답하고 목록에는 나오지 않습니다.
+- 폴백 후보, 서버 도구, 플러그인에 적힌 라우터 이름은 그 필드의 거절(403 `model_not_allowed`)로
+  막고, 문구에 필드 이름을 함께 적습니다.
+- Key에 카탈로그 모델 목록(`allowedModels`)이 있으면 유료 모델 이름은 모두 그 목록에서 먼저 막히므로
+  403 `model_not_allowed`가 됩니다.
+- 거절 문구는 목록을 보라고 하지 않고 **일반적인 LLM API가 제공하는 모델 이름을 직접 지정하라**고
+  알립니다.
+- 자체 서빙(TOKEN) 카탈로그 항목은 이름이 같은 접두로 시작해도 라우터가 아니므로 이 규칙과 무관합니다.
 
 이름 목록이 아니라 **벤더 접두사 전체**로 막습니다. 이름으로 적으면 공급자가 하나 추가할 때마다
 새는데, 접두사로 막으면 자동으로 닫히기 때문입니다.
@@ -178,7 +259,7 @@ response_format  tools  tool_choice  parallel_tool_calls
 그 벤더 아래에 **진짜 모델이 있을 수 있습니다.** 활성 카탈로그(431개, 2026-09-05)에 보이는
 여섯은 전부 선택기지만, 공개 기간이 끝나 목록에서 빠진 실제 모델이 둘 있습니다. 그래도 접두사로
 막는 쪽이 맞습니다 — **잃을 것이 없어서가 아니라 잃는 대가가 싸기 때문입니다.** 그런 모델은
-대개 무료 미리보기이고, 거절은 모델 제한이 걸린 Key에서만 일어납니다.
+대개 무료 미리보기입니다.
 
 `tools`가 부르는 모델도 같은 펜스를 지납니다. 공급자의 서버 도구 일부가 본문 안에서 다른 모델을
 부르는데(`parameters.model`, Messages 경로에서는 도구 최상위의 `model`), 두 자리 모두 후보
@@ -233,7 +314,8 @@ Chat에서 같은 유료 검색을 실행하고, Messages에서는 `web_search_2
 판정하고, 공급자 쪽에서 모델 묶음으로 펼쳐지는 `preset`은 모델 제한이 걸린 Key에서 거절합니다.
 라우터 플러그인(`auto-router`, `auto-beta-router`, `pareto-router`, `jev-router`,
 `switchyard-router`)은 모델 제한이 걸린 Key에서 거절합니다. 후보가 와일드카드나 점수라 판정할 수
-없고, 그 설정을 읽는 라우터 모델(`openrouter/*`)은 그 Key에서 이미 쓸 수 없기 때문입니다.
+없기 때문입니다. 그 설정을 읽는 라우터 모델(`openrouter/*`)은 이제 어느 Key에서도 쓸 수 없어서,
+제한이 없는 Key가 보낸 라우터 플러그인은 설정할 대상이 없습니다.
 `context-compression`은 모델 이름을 받지 않고 작은 컨텍스트 모델에서는 지정하지 않아도 켜지므로
 판정 대상에 넣지 않았습니다.
 
@@ -344,7 +426,7 @@ Key에는 CREDIT 축 전용 허용 목록 `creditAllowedModels`가 있습니다.
 없습니다(위의 `allowedModels`는 대소문자를 구분합니다. 그쪽은 카탈로그 이름의 정확
 일치라서 그렇고, 두 목록이 함께 채워지면 더 엄격한 쪽이 답을 정합니다). `*` 하나만 적는
 것은 허용하지 않습니다. 빈 허용 목록은 이름에 제한을 두지 않습니다. `*/*`는 공급자가
-있는 이름만 포함하고, 목록을 지정했으므로 라우터 모델은 차단합니다.
+있는 이름만 포함합니다. 라우터 모델은 목록과 관계없이 모든 Key에서 거절합니다.
 
 벤더가 내놓는 부동 별칭(`~anthropic/claude-sonnet-latest` 처럼 그 계열의 최신 모델로 항상
 따라가는 이름)도 목록에 적을 수 있습니다. 이 이름들은 passthrough 로 그대로 나가므로,
@@ -377,11 +459,14 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 
 | 기능 | 여는 것 |
 |---|---|
-| `chat` | `POST /v1/chat/completions`. 자체 서빙과 유료 모델 모두 |
+| `chat` | `POST /v1/chat/completions`(자체 서빙과 유료 모델 모두), `POST /v1/messages`, `POST /v1/responses`, `POST /v1/completions`(이 셋은 유료 모델만) |
 | `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등), OpenAI 표준 `web_search_options` |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
 | `embeddings` | `POST /v1/embeddings` |
+| `rerank` | `POST /v1/rerank` |
+| `transcriptions` | `POST /v1/audio/transcriptions` |
+| `speech` | `POST /v1/audio/speech`, 그리고 유료 모델 채팅의 음성 출력(`modalities`에 `audio`). 음성 입력은 판정하지 않습니다 |
 | `containers` | 유료 모델 채팅의 샌드박스 명령과 코드 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`, `local_shell`), `openrouter:bash` 도구와 날짜 없는 `bash`, `code_interpreter`. **아직 부여하지 않습니다** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정합니다. 그 기능을 쓸 수도 있었던 요청은
@@ -472,7 +557,7 @@ HTTP 200으로 시작한 스트림에서도 최상위의 null이 아닌 `error`�
 (`imageCount`), 캐시에서 나온 입력 토큰과 사고에 쓰인 출력 토큰(`cachedInputTokens`,
 `reasoningTokens`), 스트리밍 여부(`streamed`)입니다.
 
-정상으로 끝난 스트림은 Chat, Messages, Responses 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
+정상으로 끝난 스트림은 Chat, Completions, Messages, Responses 모두 마지막 usage에 금액이 옵니다. 유료 모델 스트림이 금액
 없이 끝나면(클라이언트 연결 끊김, 이벤트 상한 초과, 업스트림 끊김 등) 게이트웨이가 응답을 닫은 뒤
 업스트림의 생성 기록(`GET /generation?id=<X-Generation-Id>`)을 그 Key의 자격증명으로 조회해
 `total_cost`를 `costUsd`에 채우고 나서 항목을 씁니다. 토큰 수는 덮어쓰지 않습니다. 기록은
@@ -484,6 +569,21 @@ HTTP 200으로 시작한 스트림에서도 최상위의 null이 아닌 `error`�
 끝나면 금액 없이 씁니다. 조회 한도와 유예가 같은 60초라 종료 직전에 끝난 스트림은 대개 금액 없이
 기록되며, 이것이 정상 동작입니다. 관리 리스너의 `/metrics`에서 `streamCostFilled`는 조회로 금액을
 채운 수, `streamCostMissing`은 못 채운 수입니다.
+
+패스스루 경로는 업스트림이 200으로 답해 이미 과금한 뒤 게이트웨이가 응답을 넘기지 못한 요청(응답 상한을 넘어
+`upstream_response_too_large`로 거절, JSON이 아니라 `upstream_invalid_response`로 거절, 응답을 읽다 끊김, 클라이언트에게
+쓰다 끊김)이 금액 없이 끝나면, 응답을 닫은 뒤 그 응답의 `X-Generation-Id`로 생성 기록을 조회해 `costUsd`를 채웁니다.
+이미지와 임베딩처럼 매 호출에 usage를 보고하는 경로의 성공 응답은 금액이 없어도 조회하지 않습니다(호출마다 업스트림
+조회가 하나씩 붙기 때문입니다). usage가 선택인 경로는 금액 없는 응답을 모두 조회합니다. 비채팅 호출의 생성 기록은 더 늦게
+나와서(2026-10-21 실측, 음성 합성과 rerank 모두 15초까지 404, 25초에 200) 15초 뒤에 처음 읽고 25, 35, 50, 70, 100초에 다시
+읽으며 2분이 지나면 금액 없이 씁니다. 대기 자리는 스트림과 따로 256개이고, 넘치면 그 항목은 금액 없이 바로 씁니다. 종료
+유예(60초)보다 기한이 길어서 종료 직전의 조회는 금액 없이 기록됩니다. 큰 본문 슬롯은 조회를 기다리지 않고 응답이 끝나면
+바로 돌려줍니다. 카탈로그 조회(`GET /v1/images/models`)는 과금되지 않으므로 조회하지 않습니다. 지표는
+`passthroughCostFilled`, `passthroughCostMissing`으로 따로 셉니다.
+
+패스스루 응답의 usage에 토큰 수 없이 금액만 오면(초나 검색 단위로 과금되는 호출) 토큰 0과 그 금액을
+`estimated` 없이 기록합니다. 본문 크기로 토큰을 지어내지 않습니다. 금액 0도 업스트림의 값으로 그대로 기록하고 조회하지
+않습니다(아주 짧은 rerank와 캐시 적중은 실제로 0입니다). 토큰도 금액도 없으면 이미지와 임베딩처럼 usage가 필수인 경로는 크기 기반 추정으로 가고, rerank처럼 usage가 선택인 경로는 토큰 0으로 기록합니다.
 
 세 가지는 읽는 쪽이 알아야 합니다. **`costUsd`가 없는 것은 0이 아닙니다** — 업스트림이 가격을
 보고하지 않았다는 뜻이고, 무료 모델이 진짜로 0을 보고하는 것과 다릅니다. **캐시와 사고 토큰은

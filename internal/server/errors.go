@@ -11,6 +11,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+
+	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
 )
 
 type apiError struct {
@@ -57,6 +59,8 @@ var (
 		"자체 서빙 모델은 아직 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotOnResponses = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
 		"자체 서빙 모델은 아직 /v1/responses에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+	errModelNotOnCompletions = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
+		"자체 서빙 모델은 /v1/completions에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
 		"요청한 모델이 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
 	// Two fences answer with this code, and they need different advice, so the
@@ -117,8 +121,8 @@ var (
 		"upstream_response_too_large",
 		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
-		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/messages, POST /v1/responses, " +
-			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings입니다."}
+		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, " +
+			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions입니다."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
 	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",
@@ -175,6 +179,9 @@ func errParamNeedsCreditModel(name string) apiError {
 // different field — but the advice has to say where the name was, because the
 // caller did not put it in `model` and would not find it by looking there.
 func errToolModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("tools가 지정한 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 tools가 지정한 모델을 사용할 수 없습니다. " +
@@ -198,6 +205,9 @@ func errToolModelRequired(toolType, param string) apiError {
 // A model named by a `plugins` entry. Same rule and code as the tools refusal;
 // the advice says where the name was for the same reason.
 func errPluginModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("plugins가 지정한 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 plugins가 지정한 모델을 사용할 수 없습니다. " +
@@ -245,15 +255,30 @@ var errPresetNotAllowed = apiError{http.StatusBadRequest, "invalid_request_error
 	"preset_not_supported",
 	"이 게이트웨이는 preset을 지원하지 않습니다. 모델 이름을 직접 지정해주세요."}
 
-// A router name on a key that carries a model fence. The generic refusal is
+// A router name, refused for every key like a preset: the vendor's routers are
+// its own feature, not one of the general model APIs. The generic refusal is
 // wrong here: the caller did not ask for a model somebody excluded, they asked
 // for a name that picks one later, and the remedy is to name a model rather
-// than to go and read a list.
-func errRouterModelNotAllowed(name string) apiError {
+// than to go and read a list. It answers for the request's own model; a router
+// named in a fallback candidate, a server tool or a plugin gets that field's
+// own refusal, which says where the name was.
+func errRouterModelNotSupported(name string) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "router_not_supported",
+		"자동 선택 모델(" + name + ")은 지원하지 않습니다. " +
+			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해주세요."}
+}
+
+// routerInField is a field refusal for a router name. It keeps the field's
+// code, and the field's name, so the caller still learns where the name was,
+// but the advice is the router's: there is no key setting to look up, since
+// no key may use a router.
+func routerInField(field, name string) (apiError, bool) {
+	if name == "" || len(name) > maxPassthroughNameBytes || !snapshot.IsRouterModelName(name) {
+		return apiError{}, false
+	}
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 자동 선택 모델(" + name + ")을 쓸 수 없습니다. " +
-			"어떤 모델이 답할지 미리 알 수 없어 허용 여부를 판단할 수 없기 때문입니다. " +
-			"모델 이름을 직접 지정해주세요."}
+		field + "자동 선택 모델(" + name + ")은 지원하지 않습니다. " +
+			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해주세요."}, true
 }
 
 // A fallback candidate the key may not be billed for. It names the entry
@@ -262,6 +287,9 @@ func errRouterModelNotAllowed(name string) apiError {
 // real model name — the field is client input, and a refusal is no place to
 // reflect a kilobyte of it.
 func errCandidateModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("대체 모델 목록(models)의 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 대체 모델 목록(models)에 적힌 모델을 사용할 수 없습니다. " +
@@ -275,6 +303,9 @@ func errCandidateModelNotAllowed(name string) apiError {
 // The same refusal for the Messages surface's own fallback list, named the
 // way the caller wrote it.
 func errFallbackModelNotAllowed(name string) apiError {
+	if e, ok := routerInField("대체 모델 목록(fallbacks)의 ", name); ok {
+		return e
+	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
 			"이 API Key로는 대체 모델 목록(fallbacks)에 적힌 모델을 사용할 수 없습니다. " +
@@ -305,6 +336,12 @@ func errUnsupportedValue(name, advice string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
 		"지원하지 않는 파라미터입니다: " + name + ". " + advice}
 }
+
+// errMalformedForm answers a multipart body that cannot be read as a form of
+// named parts. It names the shape rather than a field, because no field is at
+// fault: the caller's client sent something that is not a form.
+var errMalformedForm = apiError{http.StatusBadRequest, "invalid_request_error", "invalid_multipart_form",
+	"multipart 본문을 읽을 수 없습니다. 음성 파일은 file 파트 하나로, 나머지 값은 이름이 있는 텍스트 파트로 보내주세요."}
 
 func errInvalidParamValue(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",

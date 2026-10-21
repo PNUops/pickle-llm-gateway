@@ -849,9 +849,9 @@ func TestHealthzAndUnknownPath(t *testing.T) {
 		t.Fatalf("healthz: %d %s", resp.StatusCode, raw)
 	}
 
-	// Deliberately out of scope, and it has to stay that way: audio has no
-	// usage in its response, so opening it would meter invented numbers.
-	resp2, err := http.Get(h.gw.URL + "/v1/audio/speech")
+	// Out of scope: the vendor has no translation route, so there is nothing
+	// to forward it to.
+	resp2, err := http.Get(h.gw.URL + "/v1/audio/translations")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2024,7 +2024,7 @@ func allAPIErrors() map[string]apiError {
 		"errContainerToolNotAllowed(x)":  errContainerToolNotAllowed("x"),
 		"errCandidateModelNotAllowed(x)": errCandidateModelNotAllowed("x"),
 		"errToolModelNotAllowed(x)":      errToolModelNotAllowed("x"),
-		"errRouterModelNotAllowed(x)":    errRouterModelNotAllowed("x"),
+		"errRouterModelNotSupported(x)":  errRouterModelNotSupported("x"),
 		"errCreditModelNotAllowed":       errCreditModelNotAllowed,
 		"errParamNeedsCreditModel(x)":    errParamNeedsCreditModel("x"),
 	}

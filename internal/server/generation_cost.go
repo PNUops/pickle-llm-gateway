@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
@@ -19,6 +20,15 @@ import (
 // its cost is read from there before the usage event is written. This is a
 // rule for every stream, not for one route: whichever surface relayed it, a
 // stream that ended without a cost gets one looked up.
+//
+// The passthrough surface uses the same lookup for its answers, which are
+// not streamed but may still end without a price: on a route whose usage is
+// optional or absent, and on any route for an answer the vendor billed but
+// this gateway did not hand over (see handlePassthrough for which). Its
+// records are published later, so it has its own schedule, and its own pool
+// and counters, so a route that looks up every call cannot take the room
+// broken-off streams need and a rise in one surface's misses is not read as
+// the other's.
 //
 // The lookup runs after the handler has returned. A streamed response is only
 // complete for the client when its handler returns, so waiting here would hold
@@ -43,42 +53,82 @@ var generationCostDelays = []time.Duration{12 * time.Second, 6 * time.Second, 10
 // the most a lookup holds its slot.
 const generationCostDeadline = 60 * time.Second
 
+// passthroughCostDelays is the passthrough schedule. The records of calls
+// that are not chat completions are published later: measured on
+// 2026-10-21, a synthesized voice's and a rerank's answered 404 for 15
+// seconds and 200 at 25. So the first read waits 15 seconds and the reads run
+// at 15, 25, 35, 50, 70 and 100 seconds.
+var passthroughCostDelays = []time.Duration{15 * time.Second, 10 * time.Second, 10 * time.Second,
+	15 * time.Second, 20 * time.Second, 30 * time.Second}
+
+// passthroughCostDeadline is the passthrough counterpart of
+// generationCostDeadline. It is longer than the drain at shutdown, so a
+// lookup still waiting then is written without a cost.
+const passthroughCostDeadline = 2 * time.Minute
+
 // generationCostReadTimeout bounds one read of the record.
 const generationCostReadTimeout = 5 * time.Second
 
-// generationCostPending bounds the lookups waiting at once. Each holds one
-// usage event in memory; past the bound an event is written without a cost.
-// With a lookup lasting up to the deadline, this is room for about eight
-// cost-less stream endings a second, sustained; ordinary streams carry their
-// cost and never take a slot.
+// generationCostPending bounds the stream lookups waiting at once. Each holds
+// one usage event in memory; past the bound an event is written without a
+// cost. With a lookup lasting up to the deadline, this is room for about
+// eight cost-less stream endings a second, sustained; ordinary streams carry
+// their cost and never take a slot.
 const generationCostPending = 512
+
+// passthroughCostPending bounds the passthrough lookups, in a pool of their
+// own so that a route whose every answer is looked up (a synthesized voice
+// carries no usage at all) cannot use up the room broken-off streams need.
+// At the two-minute deadline it is room for about two lookups a second
+// sustained, and about ten when records appear at the measured 25 seconds.
+const passthroughCostPending = 256
 
 // generationCostReadLimit bounds one generation record. A real one is about
 // a kilobyte and a half.
 const generationCostReadLimit = 64 << 10
+
+// costSchedule is one surface's lookup schedule, its pool of pending slots
+// and the counters its outcomes are added to.
+type costSchedule struct {
+	slots    chan struct{}
+	delays   []time.Duration
+	deadline time.Duration
+	filled   *atomic.Int64
+	missing  *atomic.Int64
+}
 
 type generationCosts struct {
 	wg sync.WaitGroup
 	// mu orders admitting a lookup against the start of a drain: a
 	// WaitGroup must not gain work while something waits on it, so once
 	// draining is set no lookup is admitted.
-	mu       sync.Mutex
-	draining bool
-	slots    chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	delays   []time.Duration
-	deadline time.Duration
+	mu          sync.Mutex
+	draining    bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stream      costSchedule
+	passthrough costSchedule
 }
 
-func newGenerationCosts() *generationCosts {
+func newGenerationCosts(m *counters) *generationCosts {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &generationCosts{
-		slots:    make(chan struct{}, generationCostPending),
-		ctx:      ctx,
-		cancel:   cancel,
-		delays:   generationCostDelays,
-		deadline: generationCostDeadline,
+		ctx:    ctx,
+		cancel: cancel,
+		stream: costSchedule{
+			slots:    make(chan struct{}, generationCostPending),
+			delays:   generationCostDelays,
+			deadline: generationCostDeadline,
+			filled:   &m.streamCostFilled,
+			missing:  &m.streamCostMissing,
+		},
+		passthrough: costSchedule{
+			slots:    make(chan struct{}, passthroughCostPending),
+			delays:   passthroughCostDelays,
+			deadline: passthroughCostDeadline,
+			filled:   &m.passthroughCostFilled,
+			missing:  &m.passthroughCostMissing,
+		},
 	}
 }
 
@@ -110,10 +160,10 @@ func (s *Server) DrainCostLookups(ctx context.Context) {
 // a cost has it read from the vendor's generation record first. stopClock fixes
 // the request's latency at the end of the stream, so the wait for the record
 // is not counted as the request's own time. It returns record unchanged when
-// there is nothing to look up with: no generation id, or no credential.
-func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cred string,
-	ev *spool.Event, stopClock, record func()) func() {
-	id := upstream.Get(generationIDHeader)
+// there is nothing to look up with: no generation id, or no credential. sched
+// is the surface's schedule, pool and counters.
+func (s *Server) withGenerationCost(id string, up config.Upstream, cred string,
+	ev *spool.Event, stopClock, record func(), sched *costSchedule) func() {
 	if !generationIDPattern.MatchString(id) || cred == "" {
 		return record
 	}
@@ -123,20 +173,20 @@ func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cr
 			return
 		}
 		stopClock()
-		if !s.costs.admit() {
-			s.metrics.streamCostMissing.Add(1)
+		if !s.costs.admit(sched) {
+			sched.missing.Add(1)
 			s.log.Warn("generation cost lookup skipped", "keyId", ev.KeyID)
 			record()
 			return
 		}
 		go func() {
 			defer s.costs.wg.Done()
-			defer func() { <-s.costs.slots }()
-			if cost := s.lookupGenerationCost(up, cred, id); cost != "" {
+			defer func() { <-sched.slots }()
+			if cost := s.lookupGenerationCost(sched, up, cred, id); cost != "" {
 				ev.CostUsd = cost
-				s.metrics.streamCostFilled.Add(1)
+				sched.filled.Add(1)
 			} else {
-				s.metrics.streamCostMissing.Add(1)
+				sched.missing.Add(1)
 				s.log.Warn("generation cost not found", "keyId", ev.KeyID, "generationId", id)
 			}
 			record()
@@ -144,17 +194,17 @@ func (s *Server) withGenerationCost(upstream http.Header, up config.Upstream, cr
 	}
 }
 
-// admit takes a pending slot and registers the lookup with the WaitGroup, or
-// reports that the event has to be written now: the pending bound is reached,
-// or the gateway is draining.
-func (c *generationCosts) admit() bool {
+// admit takes a pending slot in sched and registers the lookup with the
+// WaitGroup, or reports that the event has to be written now: the pending
+// bound is reached, or the gateway is draining.
+func (c *generationCosts) admit(sched *costSchedule) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.draining {
 		return false
 	}
 	select {
-	case c.slots <- struct{}{}:
+	case sched.slots <- struct{}{}:
 	default:
 		return false
 	}
@@ -165,11 +215,10 @@ func (c *generationCosts) admit() bool {
 // lookupGenerationCost reads the generation record until it has a usable
 // cost, the schedule runs out, or the gateway is shutting down. It returns ""
 // when no cost was found.
-func (s *Server) lookupGenerationCost(up config.Upstream, cred, id string) json.Number {
-	c := s.costs
-	ctx, cancel := context.WithTimeout(c.ctx, c.deadline)
+func (s *Server) lookupGenerationCost(sched *costSchedule, up config.Upstream, cred, id string) json.Number {
+	ctx, cancel := context.WithTimeout(s.costs.ctx, sched.deadline)
 	defer cancel()
-	for _, wait := range c.delays {
+	for _, wait := range sched.delays {
 		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():

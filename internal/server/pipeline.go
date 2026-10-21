@@ -323,12 +323,12 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		// apply for what they already have. What they actually need is a
 		// different model, or an administrator who widens the fence.
 		//
-		// One call covers both the allow list and the deny list; AllowsCreditModel
-		// is the whole fence, so nothing here has to know which half refused.
+		// One call covers both the allow list and the deny list, and the router
+		// rule; ServesCreditModel is the whole fence, so nothing here has to know which half refused.
 		// The caller is not told either, deliberately: naming the list would
 		// disclose its contents to somebody who is not the approver, and the
 		// two refusals ask the same thing of them anyway.
-		if !key.AllowsCreditModel(model) {
+		if !key.ServesCreditModel(model) {
 			// Same public code as the catalogue fence, different advice (see
 			// errors.go). The spool gets its own error type so the two stay
 			// countable apart — otherwise nobody can tell how many callers hit
@@ -337,9 +337,9 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 			// Re-reading the two predicates here decides only which message to
 			// send; the refusal itself was already decided above, and this
 			// branch cannot admit anything the fence turned away.
-			if key.HasCreditFence() && snapshot.IsRouterModelName(publicModel) {
-				refuseAs(errRouterModelNotAllowed(publicModel), spool.StatusBadRequest,
-					"router_model_not_allowed")
+			if snapshot.IsRouterModelName(publicModel) {
+				refuseAs(errRouterModelNotSupported(publicModel), spool.StatusBadRequest,
+					"router_model_not_supported")
 				return
 			}
 			refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest,
@@ -559,7 +559,8 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		// the vendor's own figure is what remains: the generation record's cost
 		// is what the vendor billed, not an estimate, so it is kept even on a
 		// record whose token counts were dropped.
-		recordStream = s.withGenerationCost(resp.Header, up, key.CredentialFor(up.Ref), &ev, stopClock, record)
+		recordStream = s.withGenerationCost(resp.Header.Get(generationIDHeader), up, key.CredentialFor(up.Ref),
+			&ev, stopClock, record, &s.costs.stream)
 	}
 	if p.noUsageEstimate {
 		inner := recordStream
@@ -711,7 +712,7 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	var werr error
 	if large {
-		writeUnderDeadline(w, len(out), func() { _, werr = w.Write(out) })
+		s.writeUnderDeadline(w, len(out), func() { _, werr = w.Write(out) })
 	} else {
 		_, werr = w.Write(out)
 	}

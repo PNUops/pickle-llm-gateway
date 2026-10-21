@@ -175,7 +175,7 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 			// The slot covers the write too, under a deadline sized to the
 			// event (writeUnderDeadline), so the copy waiting on a slow
 			// reader is inside the pool's arithmetic.
-			writeUnderDeadline(w, len(out), func() { writeRaw(out) })
+			s.writeUnderDeadline(w, len(out), func() { writeRaw(out) })
 		} else {
 			writeRaw(out)
 		}

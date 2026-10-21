@@ -100,7 +100,7 @@ func TestPassthroughRefusalIsNamedNotHidden(t *testing.T) {
 	}
 	// The path a key was never granted is a different answer from one this
 	// service does not serve at all.
-	status, body = h.passthrough(t, http.MethodPost, "/v1/audio/speech", testToken, imageBody)
+	status, body = h.passthrough(t, http.MethodPost, "/v1/audio/translations", testToken, imageBody)
 	if status != http.StatusNotFound || errCode(t, body) != "unknown_endpoint" {
 		t.Fatalf("out-of-scope path: %d %s", status, body)
 	}
@@ -782,6 +782,42 @@ func TestPassthroughUsageWithOnlyATotal(t *testing.T) {
 	}
 	if events[0].Estimated {
 		t.Fatalf("a reported total is not an estimate: %+v", events[0])
+	}
+}
+
+// A price with no token count is recorded as the price and zero tokens, not
+// as an estimate: the call was billed in some other unit, and a count made up
+// from the body size would sit on the record as if someone had metered it. A
+// usage object with neither is still absent, and still estimated.
+func TestPassthroughUsageWithOnlyAPrice(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage, cost string
+		estimated         bool
+	}{
+		{"seconds and cost", `{"seconds":10,"cost":0.0000333}`, "0.0000333", false},
+		{"search units and cost", `{"search_units":1,"cost":0.002}`, "0.002", false},
+		{"zero cost", `{"cost":0}`, "0", false},
+		{"no cost", `{"seconds":10}`, "", true},
+		{"unreadable cost", `{"cost":-1}`, "", true},
+	} {
+		h := newHarness(t, passthroughDoc(snapshot.EndpointEmbeddings), nil)
+		h.mock.set(func(o *mockOpts) {
+			o.rawResp = `{"data":[],"usage":` + tc.usage + `}`
+		})
+		if status, body := h.passthrough(t, http.MethodPost, "/v1/embeddings", testToken, embeddingBody); status != 200 {
+			t.Fatalf("%s: %d %s", tc.name, status, body)
+		}
+		events := h.spoolEvents(t)
+		if len(events) != 1 {
+			t.Fatalf("%s: want 1 event, got %d", tc.name, len(events))
+		}
+		ev := events[0]
+		if ev.Status != spool.StatusOK || string(ev.CostUsd) != tc.cost || ev.Estimated != tc.estimated {
+			t.Fatalf("%s: %+v", tc.name, ev)
+		}
+		if !tc.estimated && ev.InputTokens+ev.OutputTokens != 0 {
+			t.Fatalf("%s: tokens on a call nobody counted: %+v", tc.name, ev)
+		}
 	}
 }
 

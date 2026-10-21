@@ -44,12 +44,20 @@ type Server struct {
 	// costs holds the generation lookups of streams that ended without a
 	// cost; see generation_cost.go.
 	costs *generationCosts
-	now   func() time.Time
+	// catalog is the vendor's model catalog the list shows paid models
+	// from; see catalog.go.
+	catalog *catalogState
+	now     func() time.Time
+	// writeBudget is how long an answer of n bytes may take to reach the
+	// client (see largeWriteBudget). A field so tests can fix it rather than
+	// race a machine-speed-dependent deadline.
+	writeBudget func(n int) time.Duration
 }
 
 // New wires a Server. The shared HTTP client waits bounded time for upstream
 // response headers; total request duration is capped per request via context.
 func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp *spool.Writer, log *slog.Logger) *Server {
+	m := &counters{}
 	return &Server{
 		cfg:     cfg,
 		store:   store,
@@ -79,9 +87,11 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 		passthroughLarge: newLargeBodySlots(cfg.PassthroughMaxInFlight),
 		chatLarge:        newLargeBodySlots(cfg.ChatLargeBodySlots),
 		health:           newUpstreamHealth(nil),
-		metrics:          &counters{},
-		costs:            newGenerationCosts(),
+		metrics:          m,
+		costs:            newGenerationCosts(m),
+		catalog:          newCatalogState(),
 		now:              time.Now,
+		writeBudget:      largeWriteBudget,
 	}
 }
 
@@ -108,6 +118,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/models/", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	// The legacy completions surface (completions.go). Nothing is served
+	// under it.
+	mux.HandleFunc("/v1/completions", s.handleCompletions)
 	// The Anthropic Messages surface. Nothing under it is served beyond the
 	// route itself: the token-counting route has nothing upstream to forward
 	// to, and it and every other subpath are answered as unknown, in this
@@ -126,6 +139,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/images/generations", s.handlePassthrough(routeImageGenerations))
 	mux.HandleFunc("/v1/images/models", s.handlePassthrough(routeImageModels))
 	mux.HandleFunc("/v1/embeddings", s.handlePassthrough(routeEmbeddings))
+	mux.HandleFunc("/v1/rerank", s.handlePassthrough(routeRerank))
+	mux.HandleFunc("/v1/audio/speech", s.handlePassthrough(routeSpeech))
+	mux.HandleFunc("/v1/audio/transcriptions", s.handlePassthrough(routeTranscriptions))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound)
 	})
@@ -222,6 +238,9 @@ type modelEntry struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+	// ContextLength is the one field past the standard four, carried for
+	// paid models only. SDKs that do not know it ignore it.
+	ContextLength int `json:"context_length,omitempty"`
 }
 
 // modelsCreatedEpoch is a stable non-zero `created` value for the models
@@ -233,6 +252,17 @@ func entryFor(m *snapshot.Model) modelEntry {
 	return modelEntry{ID: m.PublicName, Object: "model", Created: modelsCreatedEpoch, OwnedBy: "pnu-cloud"}
 }
 
+// vendorEntryFor is a paid model as the vendor's catalog describes it. The
+// owner is the name's vendor segment, which is what the name already says.
+func vendorEntryFor(v *vendorModel) modelEntry {
+	created := v.Created
+	if created <= 0 {
+		created = modelsCreatedEpoch
+	}
+	owner, _, _ := strings.Cut(strings.TrimLeft(v.ID, "~"), "/")
+	return modelEntry{ID: v.ID, Object: "model", Created: created, OwnedBy: owner, ContextLength: v.ContextLength}
+}
+
 // anthropicModelEntry is one model in the shape Anthropic's models API uses,
 // which its SDKs and agent clients read when they send anthropic-version.
 type anthropicModelEntry struct {
@@ -240,6 +270,10 @@ type anthropicModelEntry struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
 	CreatedAt   string `json:"created_at"`
+	// The two context fields of that shape, carried for paid models only and
+	// left out when the vendor's catalog does not give them.
+	MaxInputTokens int `json:"max_input_tokens,omitempty"`
+	MaxTokens      int `json:"max_tokens,omitempty"`
 }
 
 // modelsCreatedAt is modelsCreatedEpoch in the RFC 3339 form that shape uses.
@@ -248,6 +282,43 @@ var modelsCreatedAt = time.Unix(modelsCreatedEpoch, 0).UTC().Format(time.RFC3339
 func anthropicEntryFor(m *snapshot.Model) anthropicModelEntry {
 	return anthropicModelEntry{Type: "model", ID: m.PublicName, DisplayName: m.PublicName, CreatedAt: modelsCreatedAt}
 }
+
+func anthropicVendorEntryFor(v *vendorModel) anthropicModelEntry {
+	e := vendorEntryFor(v)
+	name := v.Name
+	if name == "" {
+		name = v.ID
+	}
+	return anthropicModelEntry{Type: "model", ID: v.ID, DisplayName: name,
+		CreatedAt:      time.Unix(e.Created, 0).UTC().Format(time.RFC3339),
+		MaxInputTokens: v.ContextLength, MaxTokens: v.MaxOutput}
+}
+
+// servableModel is the one judgement both halves of the models route make:
+// the model a name resolves to for this key, or nil when the key could not
+// call it. It has to agree with chat. A catalogued name is judged by its
+// entry; any other name chat would serve through passthrough exists here too,
+// but only for a key that could actually call it (a credential for the
+// passthrough upstream), and for anyone else it is nil, same as a name that
+// was never real.
+func servableModel(doc *snapshot.Document, key *snapshot.Key, modelLookup func(string) *snapshot.Model, name string) *snapshot.Model {
+	m := modelLookup(name)
+	if m == nil {
+		if p := passthroughModel(doc, name); p != nil && key.CredentialFor(p.UpstreamRef) != "" {
+			m = p
+		}
+	}
+	if m == nil || !key.AllowsModel(m) || !key.ServesCreditModel(m) {
+		return nil
+	}
+	return m
+}
+
+// vendorEndpointsSuffix ends the vendor's per-model provider listing,
+// /models/{author}/{slug}/endpoints. It is the vendor's own surface, not one
+// of the general model APIs, so it is not supported; without this the
+// retrieve would read the whole path as a model name and could answer it.
+const vendorEndpointsSuffix = "/endpoints"
 
 // The models route answers two client families from one path, and the
 // anthropic-version header is what tells them apart: an Anthropic client
@@ -262,6 +333,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeAPIError(w, e)
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	retrieve := id != "" && id != r.URL.Path
+	// Answered before authentication, like every other unsupported path.
+	// A trailing slash and any letter case are the same route to a client.
+	if lower := strings.ToLower(strings.TrimRight(id, "/")); retrieve &&
+		strings.Count(lower, "/") >= 2 && strings.HasSuffix(lower, vendorEndpointsSuffix) {
+		fail(errNotFound)
+		return
 	}
 	if r.Method != http.MethodGet {
 		fail(errMethod)
@@ -288,46 +368,59 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		fail(*authErr)
 		return
 	}
+	catalog := s.catalog.forRef(doc.PassthroughRef)
 
 	// GET /v1/models/{id}: single-model retrieve, which several SDK helpers
 	// call. A missing or not-allowed id is a 404, never a disclosure of a
-	// restricted model's existence.
-	if id := strings.TrimPrefix(r.URL.Path, "/v1/models/"); id != "" && id != r.URL.Path {
-		m := modelLookup(id)
-		// The retrieve surface must agree with chat: a name chat would serve
-		// through passthrough exists here too, but only for a key that could
-		// actually call it (credential for the passthrough upstream) — for
-		// anyone else an arbitrary name is a 404, same as before.
+	// restricted model's existence. The money fence applies here too, and it
+	// answers 404 rather than 403 like chat does: this surface already refuses
+	// to confirm that a model it will not serve exists, and a restricted key
+	// learning which names are real would undo that.
+	if retrieve {
+		m := servableModel(&doc, key, modelLookup, id)
 		if m == nil {
-			if p := passthroughModel(&doc, id); p != nil && key.CredentialFor(p.UpstreamRef) != "" &&
-				key.AllowsCreditModel(p) {
-				m = p
-			}
-		}
-		// The money fence applies here too, and it answers 404 rather than 403
-		// like chat does: this surface already refuses to confirm that a model
-		// it will not serve exists, and a restricted key learning which names
-		// are real would undo that.
-		if m == nil || !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
 			fail(errModelNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		if anthropic {
-			writeJSON(w, anthropicEntryFor(m))
-			return
+		// A passthrough name the catalog knows is described by it; any other
+		// one keeps the plain entry.
+		var v *vendorModel
+		if catalog != nil && modelLookup(id) == nil {
+			v = catalog.byID[id]
 		}
-		writeJSON(w, entryFor(m))
+		switch {
+		case anthropic && v != nil:
+			writeJSON(w, anthropicVendorEntryFor(v))
+		case anthropic:
+			writeJSON(w, anthropicEntryFor(m))
+		case v != nil:
+			writeJSON(w, vendorEntryFor(v))
+		default:
+			writeJSON(w, entryFor(m))
+		}
 		return
 	}
 
 	var models []*snapshot.Model
 	for i := range doc.Models {
 		m := &doc.Models[i]
-		if !key.AllowsModel(m) || !key.AllowsCreditModel(m) {
+		if !key.AllowsModel(m) || !key.ServesCreditModel(m) {
 			continue
 		}
 		models = append(models, m)
+	}
+	// Paid models follow the catalogued ones, in name order. A name the
+	// snapshot catalogues is listed once, by its own entry above.
+	var paid []*vendorModel
+	if catalog != nil {
+		for i := range catalog.models {
+			v := &catalog.models[i]
+			if modelLookup(v.ID) != nil || servableModel(&doc, key, modelLookup, v.ID) == nil || !listableFor(key, v) {
+				continue
+			}
+			paid = append(paid, v)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if anthropic {
@@ -338,9 +431,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			HasMore bool                  `json:"has_more"`
 			FirstID *string               `json:"first_id"`
 			LastID  *string               `json:"last_id"`
-		}{Data: []anthropicModelEntry{}}
+		}{Data: make([]anthropicModelEntry, 0, len(models)+len(paid))}
 		for _, m := range models {
 			page.Data = append(page.Data, anthropicEntryFor(m))
+		}
+		for _, v := range paid {
+			page.Data = append(page.Data, anthropicVendorEntryFor(v))
 		}
 		if n := len(page.Data); n > 0 {
 			page.FirstID, page.LastID = &page.Data[0].ID, &page.Data[n-1].ID
@@ -351,9 +447,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	list := struct {
 		Object string       `json:"object"`
 		Data   []modelEntry `json:"data"`
-	}{Object: "list", Data: []modelEntry{}}
+	}{Object: "list", Data: make([]modelEntry, 0, len(models)+len(paid))}
 	for _, m := range models {
 		list.Data = append(list.Data, entryFor(m))
+	}
+	for _, v := range paid {
+		list.Data = append(list.Data, vendorEntryFor(v))
 	}
 	writeJSON(w, list)
 }

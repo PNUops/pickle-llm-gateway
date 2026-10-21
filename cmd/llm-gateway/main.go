@@ -63,6 +63,7 @@ func main() {
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
 	srv.RunUpstreamProbes(ctx)
+	srv.RunVendorCatalog(ctx)
 
 	// Both channels are constructed before anything reads them. The sync
 	// goroutine's self-report closure captures these variables, and assigning

@@ -87,6 +87,11 @@ const (
 const (
 	EndpointImages     = "images"
 	EndpointEmbeddings = "embeddings"
+	EndpointRerank     = "rerank"
+	EndpointSpeech     = "speech"
+	// EndpointTranscriptions is speech to text, a grant apart from speech
+	// because the two are used, and costed, by different exercises.
+	EndpointTranscriptions = "transcriptions"
 	// EndpointChat governs every completion surface, on both axes.
 	EndpointChat = "chat"
 	// The two below are parts of chat that cost money per use. They are
@@ -474,6 +479,26 @@ func (k *Key) HasCreditFence() bool {
 	return len(k.CreditAllowedModels) > 0 || len(k.CreditDeniedModels) > 0
 }
 
+// ServesCreditModel is the question the gateway asks before it spends money on
+// a model: AllowsCreditModel, and the model is not one of the vendor's
+// routers. The router rule is the gateway's own and lives here rather than in
+// AllowsCreditModel because that function is the money-list policy the api and
+// the console mirror case for case (testdata/credit_model_policy_cases.json):
+// the lists still mean what they meant, and the gateway no longer serves a
+// router to any key, fenced or not.
+//
+// The vendor's routers are its own feature rather than part of the general
+// model APIs this service covers, and whichever model one resolves to is
+// billed after every fence has run. They used to be refused only on a key
+// carrying a fence, on the reasoning that an unfenced key's money was its only
+// bound; all keys refuse them since 2026-10-21, with no router use on record.
+func (k *Key) ServesCreditModel(m *Model) bool {
+	if m.CreditAxis() && IsRouterModelName(m.PublicName) {
+		return false
+	}
+	return k.AllowsCreditModel(m)
+}
+
 func (k *Key) AllowsCreditModel(m *Model) bool {
 	if !m.CreditAxis() {
 		return true
@@ -492,11 +517,11 @@ func (k *Key) AllowsCreditModel(m *Model) bool {
 	// string, so it is the caller's, and passthrough is what opens that surface.
 	name := strings.ToLower(strings.TrimSpace(m.PublicName))
 	// A router name sidesteps both lists: whichever model it resolves to is
-	// what gets billed, and that model is chosen after this fence has run. A
-	// key carrying no fence loses nothing by being refused one — its money is
-	// the only bound it ever had — but a key carrying one has had a decision
-	// made about which models it may reach, and the name that can walk around
-	// that decision is exactly the one that must not be the exception.
+	// what gets billed, and that model is chosen after this fence has run, so
+	// a key carrying a fence refuses it here. This is the list policy the api
+	// and the console mirror, and on an unfenced key it still admits a router;
+	// the gateway refuses routers on every key through ServesCreditModel, which
+	// is the question it actually asks.
 	//
 	// This lives inside the fence rather than at its call sites so that no
 	// caller can consult the lists without it. The call sites read the same

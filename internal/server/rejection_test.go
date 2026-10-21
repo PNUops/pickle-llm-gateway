@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -264,5 +265,24 @@ func TestCleanRejectionStillHidesSecretsAndHosts(t *testing.T) {
 	}
 	if got := cleanRejection("at fd00::12 and 2001:db8::1", "", ""); strings.Contains(got, "fd00") || strings.Contains(got, "2001") {
 		t.Fatalf("IPv6 survived: %q", got)
+	}
+}
+
+// A schema validator's report in the message is cut to its first issue, named
+// by its path; an ordinary message, and one that only looks like a list, stay.
+func TestRejectionFirstValidationIssue(t *testing.T) {
+	zod := `{"success":false,"error":{"name":"ZodError","message":"[\n  {\n    \"code\": \"invalid_value\",\n    \"values\": [\"mp3\", \"pcm\"],\n    \"path\": [\"response_format\"],\n    \"message\": \"Invalid option: expected one of \\\"mp3\\\"|\\\"pcm\\\"\"\n  }\n]"}}`
+	if got := rejectionMessage([]byte(zod)); got != `response_format: Invalid option: expected one of "mp3"|"pcm"` {
+		t.Fatalf("zod: %q", got)
+	}
+	for _, msg := range []string{"plain message", "[not json", "[]", `[{"code":"x"}]`} {
+		body, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg}})
+		if got := rejectionMessage(body); got != msg {
+			t.Fatalf("%q became %q", msg, got)
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"error": map[string]any{"message": `[{"message":"bad","path":["input_audio",0,"format"]}]`}})
+	if got := rejectionMessage(body); got != "input_audio.0.format: bad" {
+		t.Fatalf("nested path: %q", got)
 	}
 }

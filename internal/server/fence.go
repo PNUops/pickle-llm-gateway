@@ -150,7 +150,7 @@ func allowsCandidateModel(doc *snapshot.Document, modelLookup func(string) *snap
 	if !m.CreditAxis() {
 		return false
 	}
-	return key.AllowsModel(m) && key.AllowsCreditModel(m)
+	return key.AllowsModel(m) && key.ServesCreditModel(m)
 }
 
 // The vendor's server tools are the sixth channel, and they arrive inside
@@ -875,8 +875,15 @@ func fenceChatCapabilities(_ *Server, _ *snapshot.Document, _ func(string) *snap
 			return &refusal{e: errInvalidParamValue(modalitiesField)}
 		}
 		for _, kind := range kinds {
-			if strings.EqualFold(strings.TrimSpace(kind), "image") {
+			switch strings.ToLower(strings.TrimSpace(kind)) {
+			case "image":
 				if rf := needs(snapshot.EndpointImages); rf != nil {
+					return rf
+				}
+			case "audio":
+				// Spoken output is the speech grant's, as image output is the
+				// image grant's. Audio input is part of chat and not judged.
+				if rf := needs(snapshot.EndpointSpeech); rf != nil {
 					return rf
 				}
 			}
