@@ -107,6 +107,64 @@ func TestCapFieldParsing(t *testing.T) {
 	}
 }
 
+func TestReasoningParsing(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_A_BASE_URL=https://a.example/v1",
+		"LLMGW_UPSTREAM_B_BASE_URL=https://b.example/v1",
+		"LLMGW_UPSTREAM_B_REASONING=effort",
+		"LLMGW_UPSTREAM_C_BASE_URL=http://127.0.0.1:8000/v1",
+		"LLMGW_UPSTREAM_C_REASONING=template",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	// Unset is closed, which is how every upstream behaved before the setting.
+	if ups["a"].Reasoning != ReasoningClosed {
+		t.Fatalf("default reasoning not applied: %+v", ups["a"])
+	}
+	if ups["b"].Reasoning != ReasoningEffort || ups["c"].Reasoning != ReasoningTemplate {
+		t.Fatalf("explicit reasoning lost: %+v %+v", ups["b"], ups["c"])
+	}
+	ups, errs = upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_E_BASE_URL=https://e.example/v1",
+		"LLMGW_UPSTREAM_E_REASONING=closed",
+	})
+	if len(errs) != 0 || ups["e"].Reasoning != ReasoningClosed {
+		t.Fatalf("explicit closed: %+v %v", ups["e"], errs)
+	}
+	for _, bad := range []string{"on", "Effort", "vllm"} {
+		_, errs = upstreamsFromEnv([]string{
+			"LLMGW_UPSTREAM_D_BASE_URL=https://d.example/v1",
+			"LLMGW_UPSTREAM_D_REASONING=" + bad,
+		})
+		if len(errs) == 0 {
+			t.Fatalf("unknown reasoning setting %q accepted", bad)
+		}
+	}
+}
+
+// Every default is filled on the same copy and written back once. An upstream
+// whose cap field (or reasoning setting) was given explicitly used to skip the
+// write-back and keep a zero probe interval, which probes in a tight loop.
+func TestDefaultsSurviveExplicitSettings(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_CAP_BASE_URL=http://127.0.0.1:8000/v1",
+		"LLMGW_UPSTREAM_CAP_CAP_FIELD=max_tokens",
+		"LLMGW_UPSTREAM_BOTH_BASE_URL=https://both.example/v1",
+		"LLMGW_UPSTREAM_BOTH_CAP_FIELD=max_tokens",
+		"LLMGW_UPSTREAM_BOTH_REASONING=effort",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if got := ups["cap"]; got.ProbeInterval != time.Minute || got.Reasoning != ReasoningClosed {
+		t.Fatalf("explicit cap field lost a default: %+v", got)
+	}
+	if got := ups["both"]; got.ProbeInterval != 5*time.Minute {
+		t.Fatalf("explicit cap field and reasoning lost the probe default: %+v", got)
+	}
+}
+
 func TestProbeIntervalDefaultsAndOverride(t *testing.T) {
 	ups, errs := upstreamsFromEnv([]string{
 		"LLMGW_UPSTREAM_LOCAL_BASE_URL=http://127.0.0.1:8000/v1",
