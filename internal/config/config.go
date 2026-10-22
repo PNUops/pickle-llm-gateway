@@ -561,7 +561,6 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		switch u.CapField {
 		case "":
 			u.CapField = "max_completion_tokens"
-			ups[id] = u
 		case "max_completion_tokens", "max_tokens":
 		default:
 			errs = append(errs, "upstream "+id+" has an unknown cap field "+u.CapField+" (max_completion_tokens or max_tokens)")
@@ -571,13 +570,17 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		switch u.Reasoning {
 		case "":
 			u.Reasoning = ReasoningClosed
-			ups[id] = u
 		case ReasoningClosed, ReasoningEffort, ReasoningTemplate:
 		default:
 			errs = append(errs, "upstream "+id+" has an unknown reasoning setting "+u.Reasoning+
 				" ("+ReasoningClosed+", "+ReasoningEffort+" or "+ReasoningTemplate+")")
 			delete(ups, id)
+			continue
 		}
+		// One write-back for every default filled above. Writing it only where
+		// a default was filled lost the others: an upstream with an explicit
+		// cap field kept a zero probe interval and probed in a tight loop.
+		ups[id] = u
 	}
 	return ups, errs
 }
