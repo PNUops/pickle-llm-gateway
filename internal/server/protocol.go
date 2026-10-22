@@ -123,6 +123,11 @@ type responseResult struct {
 	usage       usage
 	haveUsage   bool
 	answer      string // for the no-usage estimate and capture
+	// reasoningChars is the length of the reasoning text the answer carried
+	// beside its content. It counts toward the no-usage estimate only: that
+	// text is generated and billed like the answer, and it comes first, so
+	// leaving it out would meter a cut-off thinking answer as nearly free.
+	reasoningChars int
 	// upstreamError is the vendor's own error inside a 200 answer. The answer
 	// is still relayed as it came, like the same error inside a stream, but
 	// the request is not recorded as a success.

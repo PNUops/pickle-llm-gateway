@@ -680,7 +680,7 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	s.noteServedModel(ev, sentModel, res.servedModel)
 	contentChars := 0
 	if !res.haveUsage {
-		contentChars = len(res.answer)
+		contentChars = len(res.answer) + res.reasoningChars
 	}
 	if capture != nil {
 		capture.Response, capture.ResponseTruncated = capString(res.answer)

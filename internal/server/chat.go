@@ -266,10 +266,23 @@ func readChatResponse(m map[string]any, publicName string) responseResult {
 		if first, _ := choices[0].(map[string]any); first != nil {
 			if msg, _ := first["message"].(map[string]any); msg != nil {
 				res.answer, _ = msg["content"].(string)
+				res.reasoningChars = len(reasoningText(msg))
 			}
 		}
 	}
 	return res
+}
+
+// reasoningText is the reasoning a chat message or stream delta carries beside
+// its content. Hosted providers name it `reasoning` and a local vLLM
+// `reasoning_content`; some send both with the same text, so one is read, never
+// the sum.
+func reasoningText(msg map[string]any) string {
+	if v, _ := msg["reasoning"].(string); v != "" {
+		return v
+	}
+	v, _ := msg["reasoning_content"].(string)
+	return v
 }
 
 // withIncludeUsage forces stream_options.include_usage on so streamed
@@ -463,6 +476,9 @@ func rewriteChunk(payload []byte, publicName string, legacyText bool) (chunk, bo
 			if content != "" {
 				c.content = content
 				c.contentChars = len(content)
+			}
+			if delta, _ := first["delta"].(map[string]any); delta != nil && !legacyText {
+				c.contentChars += len(reasoningText(delta))
 			}
 		}
 	}
