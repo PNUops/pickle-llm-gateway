@@ -107,6 +107,35 @@ func TestCapFieldParsing(t *testing.T) {
 	}
 }
 
+func TestReasoningParsing(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_A_BASE_URL=https://a.example/v1",
+		"LLMGW_UPSTREAM_B_BASE_URL=https://b.example/v1",
+		"LLMGW_UPSTREAM_B_REASONING=effort",
+		"LLMGW_UPSTREAM_C_BASE_URL=http://127.0.0.1:8000/v1",
+		"LLMGW_UPSTREAM_C_REASONING=template",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	// Unset is closed, which is how every upstream behaved before the setting.
+	if ups["a"].Reasoning != ReasoningClosed {
+		t.Fatalf("default reasoning not applied: %+v", ups["a"])
+	}
+	if ups["b"].Reasoning != ReasoningEffort || ups["c"].Reasoning != ReasoningTemplate {
+		t.Fatalf("explicit reasoning lost: %+v %+v", ups["b"], ups["c"])
+	}
+	for _, bad := range []string{"on", "Effort", "vllm"} {
+		_, errs = upstreamsFromEnv([]string{
+			"LLMGW_UPSTREAM_D_BASE_URL=https://d.example/v1",
+			"LLMGW_UPSTREAM_D_REASONING=" + bad,
+		})
+		if len(errs) == 0 {
+			t.Fatalf("unknown reasoning setting %q accepted", bad)
+		}
+	}
+}
+
 func TestProbeIntervalDefaultsAndOverride(t *testing.T) {
 	ups, errs := upstreamsFromEnv([]string{
 		"LLMGW_UPSTREAM_LOCAL_BASE_URL=http://127.0.0.1:8000/v1",

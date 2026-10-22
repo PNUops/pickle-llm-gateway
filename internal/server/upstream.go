@@ -240,7 +240,11 @@ func (s *Server) callUpstream(ctx context.Context, p *protocol, model *snapshot.
 		if capField == "" {
 			capField = up.CapField
 		}
-		body, err := bodyFor(params, capField, outputCap)
+		attemptParams := params
+		if !model.CreditAxis() {
+			attemptParams = reasoningForAttempt(params, p.reasoningParam, up)
+		}
+		body, err := bodyFor(attemptParams, capField, outputCap)
 		if err != nil {
 			return nil, up, attempts, &attemptError{err: err}
 		}

@@ -15,10 +15,11 @@ import (
 // there the provider defines the fields and the student's own budget pays for
 // them.
 //
-// The self-hosted half is the one that rots dangerously. Thinking is off there
-// by default with no per-request opt-in, and this allowlist is the only thing
-// enforcing it — a field that slips in turns it on silently and bills the
-// shared token allowance for reasoning nobody asked for.
+// The self-hosted half is the one that rots dangerously. On an upstream that
+// keeps reasoning closed this allowlist is what stops a caller from switching
+// it on — a field that slips in turns it on silently and bills the shared token
+// allowance for reasoning nobody asked for. Upstreams that open it are covered
+// in reasoning_test.go.
 
 const (
 	reasoningBody = `{"model":"vendor-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`
@@ -76,8 +77,8 @@ func TestCreditOnlyParamsRefusedOnSelfHostedModel(t *testing.T) {
 	}
 }
 
-// Thinking on the self-hosted side is a server default, not a per-request
-// option, and these are the fields that would override it. Nothing about
+// On an upstream that keeps reasoning closed (the default), thinking is the
+// server's default and these are the fields that would override it. Nothing about
 // opening the money axis may reach them: a field that quietly switches
 // thinking on is the most expensive failure this surface has, because the
 // completion tokens land on the shared allowance and the request still looks

@@ -280,10 +280,10 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// The parameter allowlist governs the TOKEN axis and nothing else.
 	//
 	// One machine used to run on both axes, and running on both hid the fact
-	// that it was doing two different jobs. On the self-hosted side it is the
-	// enforcement point for a service decision — thinking is off by default,
-	// with no per-request opt-in (see tokenAxisParams) — and the serving
-	// capacity it rations is the platform's own. On the money axis it was our
+	// that it was doing two different jobs. On the self-hosted side it decides
+	// what a caller may change about serving capacity that is the platform's
+	// own, reasoning among it, which only an upstream that opens it accepts
+	// (see tokenAxisParams and reasoningOpen). On the money axis it was our
 	// convenience and nothing more: it refused fields the provider defines,
 	// on requests the student's own budget pays for, so every field it turned
 	// away was one the vendor would have served. Where the vendor accepts a
@@ -293,7 +293,15 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// answers 400 rather than 403, and it runs after the model is read because
 	// the axis is a fact about the model the body names.
 	if !model.CreditAxis() {
-		for name := range params {
+		reasoningOK := p.reasoningParam != "" && s.reasoningOpen(model)
+		for name, raw := range params {
+			if reasoningOK && name == p.reasoningParam {
+				if !validReasoningEffort(raw) {
+					refuse(errInvalidParamValue(name), spool.StatusBadRequest)
+					return
+				}
+				continue
+			}
 			if rf := p.tokenAxisParam(name); rf != nil {
 				refuseWith(rf, spool.StatusBadRequest)
 				return

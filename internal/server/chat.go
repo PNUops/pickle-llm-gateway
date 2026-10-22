@@ -56,19 +56,22 @@ func renameFirstCandidate(params map[string]json.RawMessage, upstream string) {
 // forwarded, so replacing the upstream can never silently change what student
 // code is allowed to send.
 //
-// `reasoning_effort` is absent from this list on purpose, and so are
-// `chat_template_kwargs` and `thinking_token_budget`: all three are the
-// enforcement point for one service decision, that thinking is off by default
-// on the self-hosted side with no per-request opt-in. The serving process does
-// not refuse them — measured, same request with and only without the field:
+// `reasoning_effort` is absent from this list on purpose: whether a caller may
+// set it is the upstream's Reasoning setting, judged in the pipeline before
+// this list is consulted (see reasoning.go). `chat_template_kwargs` and
+// `thinking_token_budget` are absent for good. They are one serving process's
+// own switches rather than part of the general API, and an upstream that opens
+// reasoning in that dialect gets the template switch from the gateway, never
+// from the caller. The serving process does not refuse any of the three —
+// measured, same request with and only without the field:
 //
 //	reasoning_effort "low" → 200, content null, reasoning "Here's a thinking process:..."
 //	field absent           → 200, content "Hello! How can I help you today", reasoning null
 //
-// so the field works, moves the answer out of `content`, and this list is the
-// only thing standing between a caller and thinking. Opening it is a service
-// decision, not a consistency fix: completion tokens go up by orders of
-// magnitude when thinking is on, and that lands on the shared token allowance.
+// Closing the field decides only what the caller may change. Whether a model
+// reasons when the field is absent is the upstream's default: a hosted model
+// that reasons by default keeps reasoning behind a closed upstream, and its
+// reasoning tokens land on the token allowance all the same.
 // (The often-quoted ratio from benchmarking is an estimate, not a
 // measurement — its thinking-off side was converted from a different
 // checkpoint. Do not restate it as measured.)
@@ -104,14 +107,11 @@ var tokenAxisParams = map[string]bool{
 //
 // `reasoning_effort` and `verbosity` are documented Chat Completions fields on
 // the commercial side, and agent tools set them on their own from model
-// metadata. They stay closed on the self-hosted side for three reasons, none
-// of which is that the serving process would fail on them. Thinking there is
-// disabled as a server default and re-opening it is a service decision, not a
-// per-request one; a field that changes nothing would still read to the caller
-// as if it had; and a model whose fallback points at a commercial upstream
-// would have that upstream honour the field, putting reasoning tokens on the
-// self-hosted allowance. The axis is a property of the model, not of the
-// upstream that happens to answer.
+// metadata. `verbosity` stays closed on the self-hosted side: a field that
+// changes nothing there would still read to the caller as if it had.
+// `reasoning_effort` is refused through this set only when the model's
+// upstream keeps reasoning closed; an upstream that opens it never gets here
+// for that field.
 var creditOnlyParams = map[string]bool{
 	"reasoning_effort": true,
 	"verbosity":        true,
@@ -132,6 +132,7 @@ var protoChat = &protocol{
 	},
 	parse:          parseChat,
 	tokenAxisParam: chatTokenAxisParam,
+	reasoningParam: "reasoning_effort",
 	fences: []fence{
 		fencePresetField,
 		fenceCandidates,

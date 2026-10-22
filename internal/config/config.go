@@ -30,12 +30,28 @@ type Upstream struct {
 	// (the default); servers that only honor the legacy field are configured
 	// with max_tokens here, otherwise the cap would be silently ignored.
 	CapField string
+	// Reasoning says whether a self-hosted (TOKEN-axis) model served here
+	// accepts the caller's reasoning_effort, and in which dialect it goes out:
+	// ReasoningClosed refuses the field, ReasoningEffort forwards it as is,
+	// ReasoningTemplate turns it into the chat template's thinking switch. It
+	// is a property of the upstream because the serving capacity a reasoning
+	// request spends is the upstream's, so moving a model to another upstream
+	// takes that upstream's decision with it. It does not decide whether the
+	// model reasons when the field is absent: that is the upstream's default.
+	Reasoning string
 	// ProbeInterval controls the read-only GET /models observation loop. A
 	// private or loopback literal defaults to the on-prem cadence; a public
 	// address or hostname defaults to the external cadence. Operators can set
 	// it explicitly when DNS or a proxy hides that topology.
 	ProbeInterval time.Duration
 }
+
+// Reasoning settings for an upstream; see Upstream.Reasoning.
+const (
+	ReasoningClosed   = "closed"
+	ReasoningEffort   = "effort"
+	ReasoningTemplate = "template"
+)
 
 // SnapshotSource names where the authorization document comes from.
 const (
@@ -501,8 +517,10 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			ref, field = strings.TrimSuffix(rest, "_CAP_FIELD"), "cap"
 		case strings.HasSuffix(rest, "_PROBE_INTERVAL"):
 			ref, field = strings.TrimSuffix(rest, "_PROBE_INTERVAL"), "probe"
+		case strings.HasSuffix(rest, "_REASONING"):
+			ref, field = strings.TrimSuffix(rest, "_REASONING"), "reasoning"
 		default:
-			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY, _CAP_FIELD or _PROBE_INTERVAL)")
+			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY, _CAP_FIELD, _PROBE_INTERVAL or _REASONING)")
 			continue
 		}
 		if ref == "" {
@@ -519,6 +537,8 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			u.APIKey = val
 		case "cap":
 			u.CapField = val
+		case "reasoning":
+			u.Reasoning = val
 		case "probe":
 			d, err := time.ParseDuration(val)
 			if err != nil || d < 10*time.Second {
@@ -545,6 +565,17 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		case "max_completion_tokens", "max_tokens":
 		default:
 			errs = append(errs, "upstream "+id+" has an unknown cap field "+u.CapField+" (max_completion_tokens or max_tokens)")
+			delete(ups, id)
+			continue
+		}
+		switch u.Reasoning {
+		case "":
+			u.Reasoning = ReasoningClosed
+			ups[id] = u
+		case ReasoningClosed, ReasoningEffort, ReasoningTemplate:
+		default:
+			errs = append(errs, "upstream "+id+" has an unknown reasoning setting "+u.Reasoning+
+				" ("+ReasoningClosed+", "+ReasoningEffort+" or "+ReasoningTemplate+")")
 			delete(ups, id)
 		}
 	}

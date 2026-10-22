@@ -46,6 +46,12 @@ type protocol struct {
 	// tokenAxisParam judges one top-level field on the self-hosted axis; nil
 	// means the field may be forwarded.
 	tokenAxisParam func(name string) *refusal
+	// reasoningParam names the surface's standard reasoning-effort field on
+	// the self-hosted axis, or "" when the surface has none. When the model's
+	// primary upstream opens reasoning the pipeline judges this field itself
+	// instead of tokenAxisParam; when it does not, tokenAxisParam refuses it
+	// like any other closed field.
+	reasoningParam string
 	// fences run in order on the money axis, after the model fence and before
 	// the credential check. There is no default: a surface whose body has a
 	// different shape needs fences that read that shape, and an inherited
