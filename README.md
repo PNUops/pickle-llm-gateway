@@ -379,8 +379,9 @@ Messages 경로에서 `claude-opus-5-5`(없는 날짜를 붙인 이름까지)를
 **TOKEN 축에서 `verbosity`는 계속 거절하고, `reasoning_effort`는 업스트림 설정이 정합니다.**
 `LLMGW_UPSTREAM_<REF>_REASONING`이 `closed`(기본)면 지금처럼 거절하고, `effort`면 그대로 전달하고,
 `template`이면 `reasoning_effort`를 지우고 채팅 템플릿의 사고 스위치(`chat_template_kwargs.enable_thinking`,
-`none`이면 끔, 그 밖은 켬)로 바꿔 보냅니다. 받는 값은 `none`, `minimal`, `low`, `medium`, `high`,
-`xhigh`이고, 그 밖의 값은 `invalid_parameter_value`로 거절하며 `null`은 보내지 않은 것으로 봅니다.
+`none`이면 끔, 그 밖은 켬)로 바꿔 보냅니다. 게이트웨이가 받는 값은 `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`이고, 그 밖의 값은 `invalid_parameter_value`로 거절하며 `null`은 보내지 않은 것으로 봅니다.
+`effort` 업스트림에는 값을 그대로 보내므로, 그 업스트림이 모르는 값은 업스트림의 거절로 돌아옵니다.
 `chat_template_kwargs`, `thinking_token_budget`, 공급자의 `reasoning` 객체는 어떤 설정에서도 거절합니다.
 일반 API 필드가 아니라 특정 서빙의 스위치이고, `template` 업스트림에는 게이트웨이가 직접 넣습니다.
 

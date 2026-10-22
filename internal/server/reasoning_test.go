@@ -254,3 +254,24 @@ func TestReasoningJudgedOnPrimaryUpstream(t *testing.T) {
 		t.Fatalf("closed primary with an open fallback: got %d %s", status, body)
 	}
 }
+
+// A stream is shaped twice before it leaves: the usage request merged into
+// stream_options, then the reasoning field for the attempt. Both have to reach
+// the upstream.
+func TestReasoningEffortOnStream(t *testing.T) {
+	h := newHarness(t, nil, reasoningOn(config.ReasoningTemplate))
+	status, body := h.chat(t, testToken, selfHostedBody(`,"stream":true,"reasoning_effort":"low"`))
+	if status != 200 {
+		t.Fatalf("got %d %s", status, body)
+	}
+	params, _ := h.mock.last()
+	if string(params["chat_template_kwargs"]) != `{"enable_thinking":true}` {
+		t.Fatalf("stream lost the template switch: %v", params)
+	}
+	if _, ok := params["reasoning_effort"]; ok {
+		t.Fatalf("stream forwarded reasoning_effort to a template upstream: %v", params)
+	}
+	if string(params["stream_options"]) != `{"include_usage":true}` {
+		t.Fatalf("stream lost its usage request: %s", params["stream_options"])
+	}
+}
