@@ -241,10 +241,12 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			return
 		}
 		start := s.now()
+		noAttempts := 0
 		ev := spool.Event{
 			EventUUID:   spool.NewEventUUID(),
 			RequestedAt: start,
 			Endpoint:    route.name,
+			Attempts:    &noAttempts,
 		}
 		w.Header().Set("X-Request-Id", ev.EventUUID)
 		// Latency is fixed when the answer ends. An answer whose cost is read
@@ -568,7 +570,8 @@ func (s *Server) handlePassthrough(route passthroughRoute) http.HandlerFunc {
 			return
 		}
 		ev.UpstreamRef = up.Ref
-		ev.Attempts = 1
+		oneAttempt := 1
+		ev.Attempts = &oneAttempt
 		s.health.recordAttempt(ref)
 		// One attempt, no retry and no fallback, unlike chat. A passthrough
 		// model carries no fallback ref to try, and an image generation is

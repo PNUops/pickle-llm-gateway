@@ -809,9 +809,9 @@ func TestUpstreamErrorShaping(t *testing.T) {
 		}
 		// A request the upstream answered badly still cost that upstream a
 		// generation slot. An event that names nobody bills it to nobody.
-		if ev.UpstreamRef != "mock" || ev.Attempts != 1 {
+		if ev.UpstreamRef != "mock" || recordedAttempts(ev) != 1 {
 			t.Fatalf("failed request not attributed: upstreamRef=%q attempts=%d",
-				ev.UpstreamRef, ev.Attempts)
+				ev.UpstreamRef, recordedAttempts(ev))
 		}
 	}
 }
@@ -831,9 +831,9 @@ func TestUpstreamTimeout(t *testing.T) {
 	}
 	// The upstream accepted the POST and may be generating right now, which is
 	// exactly the case where knowing who was asked is worth something.
-	if evs[0].UpstreamRef != "mock" || evs[0].Attempts != 1 {
+	if evs[0].UpstreamRef != "mock" || recordedAttempts(evs[0]) != 1 {
 		t.Fatalf("timed-out request not attributed: upstreamRef=%q attempts=%d",
-			evs[0].UpstreamRef, evs[0].Attempts)
+			evs[0].UpstreamRef, recordedAttempts(evs[0]))
 	}
 }
 
@@ -1532,8 +1532,8 @@ func TestUpstreamFallback(t *testing.T) {
 	if last.UpstreamRef != "backup" {
 		t.Fatalf("event says upstreamRef=%q, want the upstream that actually served it", last.UpstreamRef)
 	}
-	if last.Attempts != 2 {
-		t.Fatalf("attempts = %d, want both tries counted", last.Attempts)
+	if recordedAttempts(last) != 2 {
+		t.Fatalf("attempts = %d, want both tries counted", recordedAttempts(last))
 	}
 }
 
@@ -1567,9 +1567,9 @@ func TestUpstreamRefusalIsNotRetriedOrFailedOver(t *testing.T) {
 	}
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.UpstreamRef != "mock" || last.Attempts != 1 {
+	if last.UpstreamRef != "mock" || recordedAttempts(last) != 1 {
 		t.Fatalf("refused request not attributed: upstreamRef=%q attempts=%d",
-			last.UpstreamRef, last.Attempts)
+			last.UpstreamRef, recordedAttempts(last))
 	}
 }
 
@@ -1610,14 +1610,14 @@ func TestBothUpstreamsFailingStillNamesTheLastOneTried(t *testing.T) {
 	if last.UpstreamRef != "backup" {
 		t.Fatalf("event says upstreamRef=%q, want the last upstream tried", last.UpstreamRef)
 	}
-	if last.Attempts != 4 {
-		t.Fatalf("attempts = %d, want both upstreams' tries summed", last.Attempts)
+	if recordedAttempts(last) != 4 {
+		t.Fatalf("attempts = %d, want both upstreams' tries summed", recordedAttempts(last))
 	}
 }
 
 // The other direction: a request refused before anything left this host has no
 // upstream to name, and inventing one would bill an idle server for a request
-// it never saw. Both fields stay empty.
+// it never saw. The upstream stays empty and attempts is a known zero.
 func TestLocalRefusalNamesNoUpstream(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	status, body := h.chat(t, testToken,
@@ -1630,9 +1630,9 @@ func TestLocalRefusalNamesNoUpstream(t *testing.T) {
 	}
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.UpstreamRef != "" || last.Attempts != 0 {
+	if last.UpstreamRef != "" || recordedAttempts(last) != 0 {
 		t.Fatalf("local refusal was attributed to an upstream: upstreamRef=%q attempts=%d",
-			last.UpstreamRef, last.Attempts)
+			last.UpstreamRef, recordedAttempts(last))
 	}
 }
 
@@ -1704,9 +1704,9 @@ func TestTimeoutIsNotRetried(t *testing.T) {
 	}
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.UpstreamRef != "mock" || last.Attempts != 1 {
+	if last.UpstreamRef != "mock" || recordedAttempts(last) != 1 {
 		t.Fatalf("timed-out request not attributed: upstreamRef=%q attempts=%d",
-			last.UpstreamRef, last.Attempts)
+			last.UpstreamRef, recordedAttempts(last))
 	}
 }
 
@@ -1744,9 +1744,9 @@ func TestUpstreamThrottleIsNotRetriedAndSaysBusy(t *testing.T) {
 	}
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.UpstreamRef != "mock" || last.Attempts != 1 {
+	if last.UpstreamRef != "mock" || recordedAttempts(last) != 1 {
 		t.Fatalf("throttled request not attributed: upstreamRef=%q attempts=%d",
-			last.UpstreamRef, last.Attempts)
+			last.UpstreamRef, recordedAttempts(last))
 	}
 }
 
@@ -1844,8 +1844,8 @@ func TestRetrySucceedsAndIsCountedExactlyOnce(t *testing.T) {
 	}
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.Attempts != 2 {
-		t.Fatalf("event records %d attempts, want 2 — the cost of a request is not what it looks like", last.Attempts)
+	if recordedAttempts(last) != 2 {
+		t.Fatalf("event records %d attempts, want 2 — the cost of a request is not what it looks like", recordedAttempts(last))
 	}
 }
 
@@ -1940,8 +1940,8 @@ func TestTimeoutFallsBackWithoutReissuingToTheSameUpstream(t *testing.T) {
 	}
 	evs := h.spoolEvents(t)
 	last := evs[len(evs)-1]
-	if last.UpstreamRef != "backup" || last.Attempts != 2 {
-		t.Fatalf("event does not record the real cost: upstreamRef=%q attempts=%d", last.UpstreamRef, last.Attempts)
+	if last.UpstreamRef != "backup" || recordedAttempts(last) != 2 {
+		t.Fatalf("event does not record the real cost: upstreamRef=%q attempts=%d", last.UpstreamRef, recordedAttempts(last))
 	}
 }
 
