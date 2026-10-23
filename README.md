@@ -239,6 +239,14 @@ temperature  top_p  stop  presence_penalty  frequency_penalty  seed  user
 response_format  tools  tool_choice  parallel_tool_calls
 ```
 
+TOKEN 축의 `tools`는 클라이언트에서 실행하는 `type: function` 도구만 받습니다.
+도구와 함수 정의에는 표준 필드만 허용하며, 함수의 `parameters`는 JSON Schema 데이터로
+그대로 전달합니다. 함수 이름이나 스키마 속성 이름으로 서버 기능을 판정하지 않습니다.
+`tool_choice`는 `auto`, `none`, `required`와 정의된 함수의 명시 선택,
+`allowed_tools`의 함수 선택 목록을 받습니다. 도구 정의와 선택 구조의 중복 필드나
+지원하지 않는 도구 형식은 400 `invalid_parameter_value`로 거절합니다.
+이 검사는 스트리밍과 일반 응답, 기본 업스트림과 폴백에 공통으로 적용됩니다.
+
 **자동 선택 모델은 지원하지 않습니다.** `openrouter/` 아래 이름은 **모델을 고르는 이름**이라 어떤
 모델이 답할지 요청 시점에 정해지지 않고, 외부 공급자는 **고른 모델 기준으로 청구**합니다. 공급자
 전용 기능이고 일반적인 LLM API에는 없으므로 **모든 Key에서 거절합니다.** 예전에는 모델 제한이 걸린
@@ -262,6 +270,9 @@ Key에서만 거절했습니다.
 막는 쪽이 맞습니다 — **잃을 것이 없어서가 아니라 잃는 대가가 싸기 때문입니다.** 그런 모델은
 대개 무료 미리보기입니다.
 
+**아래의 서버 도구와 기능 권한 규칙은 유료(CREDIT) 축에 적용됩니다.**
+TOKEN 축은 위의 함수 도구 형식을 따릅니다.
+
 `tools`가 부르는 모델도 같은 펜스를 지납니다. 공급자의 서버 도구 일부가 본문 안에서 다른 모델을
 부르는데(`parameters.model`, Messages 경로에서는 도구 최상위의 `model`), 두 자리 모두 후보
 목록과 같은 규칙으로 판정합니다. **이미지 생성
@@ -277,11 +288,11 @@ Key에서만 거절했습니다.
 `apply_patch`, `datetime`, `experimental__search_models`, `shell`, `bash`)만 위 규칙으로 판정하고,
 나머지는 400 `unsupported_parameter`로 거절합니다. 이 서비스는 일반적인 LLM API가 제공하는 기능을
 지원하고 공급자 전용 확장까지 맞추지는 않기 때문입니다. `openrouter:files`도 지금은 거절합니다.
-접두가 없는 표준 도구(`function`, `custom`, `mcp`, `file_search`, `computer_use_preview` 등)는 그대로
+접두가 없는 표준 도구(`function`, `custom`, `mcp`, `file_search`, `computer_use_preview` 등)는 CREDIT 축에서 그대로
 통과합니다.
 
 **샌드박스에서 명령이나 코드를 실행하는 서버 도구(`openrouter:shell`, `openrouter:bash`,
-`local_shell`, `code_interpreter`)는 `containers` 기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 어느 Key에서나 403
+`local_shell`, `code_interpreter`)는 `containers` 기능 권한을 요구하고, 이 권한은 아직 부여하지 않습니다.** 그래서 지금은 CREDIT 축에서도 403
 `endpoint_not_allowed`로 거절하고, 거절 문구는 신청 대신 도구를 빼고 다시 보내라고 안내합니다.
 공급자의 컨테이너는 Key가 아니라 공급자 계정 단위로 묶이고, 어느 컨테이너를 쓸지는 요청에서
 정해집니다. 호출자가 고른 id(`container_reference`)나 `session_id`, `X-Session-Id` 헤더,
