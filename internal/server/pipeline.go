@@ -304,6 +304,16 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		refuse(errModelNotAllowed, spool.StatusBadRequest)
 		return
 	}
+	// Chat is the only completion surface open to TOKEN models. Its client
+	// functions stay the same profile on every configured upstream, including
+	// a fallback selected ahead of a cooling primary. Judge the full envelope
+	// before admission or routing; CREDIT tools keep their separate fences.
+	if !model.CreditAxis() {
+		if e := fenceTokenTools(params); e != nil {
+			refuse(*e, spool.StatusBadRequest)
+			return
+		}
+	}
 	// Budget-axis enforcement, now that the model (and so the axis) is known.
 	//
 	// charge meters this request against the key's tpm bucket. It is a no-op
