@@ -80,7 +80,7 @@ func TestTokenToolsRefuseExecutableShapesBeforeUpstream(t *testing.T) {
 					t.Errorf("a locally refused tool reached the upstream %d times", calls)
 				}
 				events := h.spoolEvents(t)
-				if len(events) != 1 || events[0].BudgetAxis != snapshot.AxisToken || events[0].Attempts != 0 || events[0].UpstreamRef != "" {
+				if len(events) != 1 || events[0].BudgetAxis != snapshot.AxisToken || recordedAttempts(events[0]) != 0 || events[0].UpstreamRef != "" {
 					t.Errorf("refusal must preserve TOKEN axis and zero attempts: %+v", events)
 				}
 			})
@@ -105,7 +105,7 @@ func TestTokenFunctionToolsPreserveSchemaData(t *testing.T) {
 						t.Fatalf("schema data was changed: %s", raw)
 					}
 					events := h.spoolEvents(t)
-					if len(events) != 1 || events[0].BudgetAxis != snapshot.AxisToken || events[0].Attempts != 1 || events[0].InputTokens+events[0].OutputTokens == 0 {
+					if len(events) != 1 || events[0].BudgetAxis != snapshot.AxisToken || recordedAttempts(events[0]) != 1 || events[0].InputTokens+events[0].OutputTokens == 0 {
 						t.Fatalf("function usage lost ordinary TOKEN accounting: %+v", events)
 					}
 				})

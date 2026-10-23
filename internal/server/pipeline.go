@@ -44,10 +44,12 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// Set before every fence, so a refused request still says which route it
 	// came in on. The one shape that never reaches the spool at all is an
 	// unauthenticated attempt, which belongs to nobody.
+	noAttempts := 0
 	ev := spool.Event{
 		EventUUID:   spool.NewEventUUID(),
 		RequestedAt: start,
 		Endpoint:    p.endpoint,
+		Attempts:    &noAttempts,
 	}
 	// The request id is the usage event's id, echoed on every response so a
 	// student can quote it in a support request (requirements §13) and so it
@@ -491,10 +493,11 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// it, so without this the accounting cannot tell a free local model from a
 	// paid fallback — and the two are billed to different people. Recorded
 	// before the failure switch below, because a request that died on the way
-	// still spent whatever the upstream had already done for it; both fields
-	// stay empty only when nothing was contacted at all.
+	// still spent whatever the upstream had already done for it. A reported
+	// zero distinguishes no attempt from legacy missing counts. A selected
+	// ref without an attempt is not proof of contacting that upstream.
 	ev.UpstreamRef = up.Ref
-	ev.Attempts = attempts
+	ev.Attempts = &attempts
 	if attemptErr != nil {
 		switch {
 		case r.Context().Err() != nil:

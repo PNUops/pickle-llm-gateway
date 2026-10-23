@@ -134,7 +134,7 @@ func TestStreamResultIncludesPayloadErrors(t *testing.T) {
 				if !tt.estimated && (ev.InputTokens != 7 || ev.OutputTokens != 5 || ev.CostUsd != "0.0012") {
 					t.Fatalf("reported usage was not preserved: %+v", ev)
 				}
-				if ev.BudgetAxis != axis || ev.Attempts != 1 || ev.UpstreamRef != "mock" || !ev.Streamed {
+				if ev.BudgetAxis != axis || recordedAttempts(ev) != 1 || ev.UpstreamRef != "mock" || !ev.Streamed {
 					t.Fatalf("request attribution changed: %+v", ev)
 				}
 				if counts := h.srv.metrics.statusMap(); counts[wantStatus] != 1 || len(counts) != 1 {
