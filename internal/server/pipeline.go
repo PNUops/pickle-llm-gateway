@@ -44,10 +44,12 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// Set before every fence, so a refused request still says which route it
 	// came in on. The one shape that never reaches the spool at all is an
 	// unauthenticated attempt, which belongs to nobody.
+	noAttempts := 0
 	ev := spool.Event{
 		EventUUID:   spool.NewEventUUID(),
 		RequestedAt: start,
 		Endpoint:    p.endpoint,
+		Attempts:    &noAttempts,
 	}
 	// The request id is the usage event's id, echoed on every response so a
 	// student can quote it in a support request (requirements §13) and so it
@@ -280,10 +282,10 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// The parameter allowlist governs the TOKEN axis and nothing else.
 	//
 	// One machine used to run on both axes, and running on both hid the fact
-	// that it was doing two different jobs. On the self-hosted side it is the
-	// enforcement point for a service decision — thinking is off by default,
-	// with no per-request opt-in (see tokenAxisParams) — and the serving
-	// capacity it rations is the platform's own. On the money axis it was our
+	// that it was doing two different jobs. On the self-hosted side it decides
+	// what a caller may change about serving capacity that is the platform's
+	// own, reasoning among it, which only an upstream that opens it accepts
+	// (see tokenAxisParams and reasoningOpen). On the money axis it was our
 	// convenience and nothing more: it refused fields the provider defines,
 	// on requests the student's own budget pays for, so every field it turned
 	// away was one the vendor would have served. Where the vendor accepts a
@@ -293,7 +295,15 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// answers 400 rather than 403, and it runs after the model is read because
 	// the axis is a fact about the model the body names.
 	if !model.CreditAxis() {
-		for name := range params {
+		reasoningOK := p.reasoningParam != "" && s.reasoningOpen(model)
+		for name, raw := range params {
+			if reasoningOK && name == p.reasoningParam {
+				if !validReasoningEffort(raw) {
+					refuse(errInvalidParamValue(name), spool.StatusBadRequest)
+					return
+				}
+				continue
+			}
 			if rf := p.tokenAxisParam(name); rf != nil {
 				refuseWith(rf, spool.StatusBadRequest)
 				return
@@ -483,10 +493,11 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// it, so without this the accounting cannot tell a free local model from a
 	// paid fallback — and the two are billed to different people. Recorded
 	// before the failure switch below, because a request that died on the way
-	// still spent whatever the upstream had already done for it; both fields
-	// stay empty only when nothing was contacted at all.
+	// still spent whatever the upstream had already done for it. A reported
+	// zero distinguishes no attempt from legacy missing counts. A selected
+	// ref without an attempt is not proof of contacting that upstream.
 	ev.UpstreamRef = up.Ref
-	ev.Attempts = attempts
+	ev.Attempts = &attempts
 	if attemptErr != nil {
 		switch {
 		case r.Context().Err() != nil:
@@ -690,7 +701,7 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	s.noteServedModel(ev, sentModel, res.servedModel)
 	contentChars := 0
 	if !res.haveUsage {
-		contentChars = len(res.answer)
+		contentChars = len(res.answer) + res.reasoningChars
 	}
 	if capture != nil {
 		capture.Response, capture.ResponseTruncated = capString(res.answer)

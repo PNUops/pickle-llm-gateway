@@ -46,6 +46,12 @@ type protocol struct {
 	// tokenAxisParam judges one top-level field on the self-hosted axis; nil
 	// means the field may be forwarded.
 	tokenAxisParam func(name string) *refusal
+	// reasoningParam names the surface's standard reasoning-effort field on
+	// the self-hosted axis, or "" when the surface has none. When the model's
+	// primary upstream opens reasoning the pipeline judges this field itself
+	// instead of tokenAxisParam; when it does not, tokenAxisParam refuses it
+	// like any other closed field.
+	reasoningParam string
 	// fences run in order on the money axis, after the model fence and before
 	// the credential check. There is no default: a surface whose body has a
 	// different shape needs fences that read that shape, and an inherited
@@ -123,6 +129,11 @@ type responseResult struct {
 	usage       usage
 	haveUsage   bool
 	answer      string // for the no-usage estimate and capture
+	// reasoningChars is the length of the reasoning text the answer carried
+	// beside its content. It counts toward the no-usage estimate only: that
+	// text is generated and billed like the answer, and it comes first, so
+	// leaving it out would meter a cut-off thinking answer as nearly free.
+	reasoningChars int
 	// upstreamError is the vendor's own error inside a 200 answer. The answer
 	// is still relayed as it came, like the same error inside a stream, but
 	// the request is not recorded as a success.

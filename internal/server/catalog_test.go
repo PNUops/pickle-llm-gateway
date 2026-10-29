@@ -93,7 +93,8 @@ func catalogHarness(t *testing.T, mutateDoc func(*snapshot.Document)) (*harness,
 }
 
 func refreshed(h *harness) bool {
-	return h.srv.refreshVendorCatalog(context.Background()) == catalogRead
+	doc, _, _ := h.srv.store.Current()
+	return h.srv.refreshVendorCatalog(context.Background(), strings.ToLower(doc.PassthroughRef)) == catalogRead
 }
 
 func listIDs(t *testing.T, h *harness, anthropic bool) []string {
@@ -402,5 +403,58 @@ func TestCatalogLoopFollowsPassthroughRef(t *testing.T) {
 			t.Fatal("the copy for the current upstream was never read")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestCatalogBackoffDoublesToTheIntervalAndResetsOnARead(t *testing.T) {
+	sched := catalogSchedule{retry: time.Minute, interval: 30 * time.Minute}
+	now := time.Unix(1_000_000, 0)
+	for _, want := range []time.Duration{1, 2, 4, 8, 16, 30, 30} {
+		if !sched.mayRead(now, "vendor") {
+			t.Fatal("a read was refused once its backoff had passed")
+		}
+		sched.record(catalogFailed, now)
+		if got := sched.notBefore.Sub(now); got != want*time.Minute {
+			t.Fatalf("backoff = %v, want %v", got, want*time.Minute)
+		}
+		if sched.mayRead(now.Add(want*time.Minute-time.Second), "vendor") {
+			t.Fatal("a read was allowed during the backoff")
+		}
+		now = sched.notBefore
+	}
+
+	// A skipped read changes nothing; a successful one starts over.
+	before := sched.notBefore
+	sched.record(catalogSkipped, now)
+	if sched.notBefore != before {
+		t.Fatal("a skipped read moved the backoff")
+	}
+	sched.record(catalogRead, now)
+	sched.record(catalogFailed, now)
+	if got := sched.notBefore.Sub(now); got != time.Minute {
+		t.Fatalf("backoff after a successful read = %v, want the retry period", got)
+	}
+}
+
+func TestCatalogBackoffDoesNotFollowTheUpstreamAcrossAChange(t *testing.T) {
+	sched := catalogSchedule{retry: time.Minute, interval: 30 * time.Minute}
+	now := time.Unix(1_000_000, 0)
+	for range 5 { // the old upstream fails until its backoff reaches the cap
+		if !sched.mayRead(now, "old") {
+			t.Fatal("a read was refused before its backoff")
+		}
+		sched.record(catalogFailed, now)
+		now = sched.notBefore
+	}
+	now = now.Add(-time.Second)
+	if sched.mayRead(now, "old") {
+		t.Fatal("the old upstream read during its backoff")
+	}
+	if !sched.mayRead(now, "new") {
+		t.Fatal("a new passthrough upstream waited out the old one's backoff")
+	}
+	sched.record(catalogFailed, now)
+	if got := sched.notBefore.Sub(now); got != time.Minute {
+		t.Fatalf("the new upstream's first backoff = %v, want the retry period", got)
 	}
 }
