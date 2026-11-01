@@ -143,6 +143,49 @@ func TestReasoningParsing(t *testing.T) {
 	}
 }
 
+func TestMessagesParsing(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_A_BASE_URL=https://a.example/v1",
+		"LLMGW_UPSTREAM_DGX_BASE_URL=http://127.0.0.1:8000/v1",
+		"LLMGW_UPSTREAM_DGX_MESSAGES=open",
+		"LLMGW_UPSTREAM_TUNED_BASE_URL=http://127.0.0.1:8001/v1",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES=open",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_MAX_INPUT_TOKENS=0",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_MAX_CONCURRENT=2",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_QUEUE_WAIT=0s",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	// Unset is closed: no upstream starts serving agents because it was
+	// configured before this setting existed.
+	if ups["a"].Messages != MessagesClosed {
+		t.Fatalf("default messages setting not applied: %+v", ups["a"])
+	}
+	if got := ups["dgx"]; got.Messages != MessagesOpen || got.MessagesMaxInputTokens != 65536 ||
+		got.MessagesMaxConcurrent != 2 || got.MessagesQueueWait != 10*time.Second {
+		t.Fatalf("defaults for an open upstream: %+v", got)
+	}
+	// An explicit 0 turns a bound off rather than falling back to the default.
+	if got := ups["tuned"]; got.MessagesMaxInputTokens != 0 || got.MessagesMaxConcurrent != 2 ||
+		got.MessagesQueueWait != 0 {
+		t.Fatalf("explicit values lost: %+v", got)
+	}
+	for _, bad := range [][]string{
+		{"LLMGW_UPSTREAM_D_MESSAGES=on"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_INPUT_TOKENS=-1"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_INPUT_TOKENS=64k"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_CONCURRENT=two"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_QUEUE_WAIT=10"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_QUEUE_WAIT=10m"},
+	} {
+		_, errs = upstreamsFromEnv(append([]string{"LLMGW_UPSTREAM_D_BASE_URL=https://d.example/v1"}, bad...))
+		if len(errs) == 0 {
+			t.Fatalf("bad messages setting accepted: %v", bad)
+		}
+	}
+}
+
 // Every default is filled on the same copy and written back once. An upstream
 // whose cap field (or reasoning setting) was given explicitly used to skip the
 // write-back and keep a zero probe interval, which probes in a tight loop.

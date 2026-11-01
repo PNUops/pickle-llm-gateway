@@ -41,6 +41,8 @@ type Server struct {
 	// chatLarge admits chat bodies and non-streamed chat responses above the
 	// ordinary bound; nil when the pool is configured off.
 	chatLarge *largeBodySlots
+	// agents bounds self-hosted Messages turns per upstream (agent_slots.go).
+	agents *agentSlots
 	// costs holds the generation lookups of streams that ended without a
 	// cost; see generation_cost.go.
 	costs *generationCosts
@@ -86,6 +88,7 @@ func New(cfg *config.Config, store *snapshot.Store, limiter *limits.Limiter, sp 
 		},
 		passthroughLarge: newLargeBodySlots(cfg.PassthroughMaxInFlight),
 		chatLarge:        newLargeBodySlots(cfg.ChatLargeBodySlots),
+		agents:           newAgentSlots(cfg.Upstreams),
 		health:           newUpstreamHealth(nil),
 		metrics:          m,
 		costs:            newGenerationCosts(m),
@@ -126,6 +129,7 @@ func (s *Server) Handler() http.Handler {
 	// to, and it and every other subpath are answered as unknown, in this
 	// surface's own envelope so an Anthropic client can read the refusal.
 	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 	mux.HandleFunc("/v1/messages/", s.handleMessagesUnknown)
 	// The OpenAI Responses surface. Every subpath reads a stored response,
 	// and nothing is stored, so all of them are answered as unknown.

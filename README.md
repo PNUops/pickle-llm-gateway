@@ -99,6 +99,40 @@ multipart는 그대로 넘기지 않고 해석한 뒤 아는 필드(`model`, `la
 `/v1/embeddings/models`, `/v1/tools`는 지원하지 않으며 인증 전에 404 `unknown_endpoint`로 답합니다.
 `/endpoints` 경로는 끝의 `/`와 대소문자가 달라도 같이 막습니다.
 
+`POST /v1/messages`는 Anthropic Messages API 경로입니다. Claude Code와 Anthropic SDK가 이 경로를
+부르고, Key는 `Authorization: Bearer`나 `x-api-key`로 받습니다. 기능 권한은 `chat`입니다. 유료 모델은
+공급자의 `/messages`로, 자체 서빙 모델은 **그 모델의 주 업스트림이 `LLMGW_UPSTREAM_<REF>_MESSAGES=open`일
+때만** 업스트림의 `/messages`로 전달합니다. 닫힌 업스트림(기본)의 자체 서빙 모델은 400
+`model_not_available_on_route`입니다. 자체 서빙 경로의 규칙은 이렇습니다.
+
+- **필드**: `model`, `messages`, `system`, `max_tokens`, `stop_sequences`, `stream`, `temperature`,
+  `top_p`, `top_k`, `tools`, `tool_choice`만 전달합니다. `thinking`, `output_config`, `metadata`,
+  `context_management`, `service_tier`는 지우고 보냅니다. 에이전트 클라이언트가 스스로 붙이는 필드라
+  거절하면 모든 요청이 막히고, 사고 여부는 업스트림 기본값을 따르기 때문입니다. 그 밖의 필드
+  (`chat_template_kwargs`, `thinking_token_budget` 포함)는 이름을 밝혀 400 `unsupported_parameter`로
+  거절합니다.
+- **도구**: 클라이언트가 실행하는 도구(`name`, `description`, `input_schema`, `cache_control`,
+  `strict`, `type: custom`)만 받습니다. 서버 도구와 Chat 모양의 도구는 400 `invalid_parameter_value`입니다.
+- **출력 상한**: 모델 최대값보다 큰 `max_tokens`는 거절하지 않고 최대값으로 낮춥니다.
+- **입력 한도**: 업스트림 토크나이저로 센 입력(`system`, `tools`, `messages`)이
+  `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_INPUT_TOKENS`(기본 65536)를 넘으면 400 `input_too_long`으로
+  바로 거절합니다. 문구는 `prompt is too long: N tokens > M maximum.`으로 시작하고 대화를 압축하라는
+  안내가 이어집니다. 본문 바이트가 한도보다 충분히 작으면 세지 않고, 세기가 실패하면 통과시킵니다
+  (업스트림의 문맥 한도는 그대로 남습니다).
+- **동시 턴**: 업스트림 하나에서 동시에 처리하는 턴을 모든 Key를 합쳐
+  `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT`(기본 2)개로 묶습니다. 넘는 턴은
+  `LLMGW_UPSTREAM_<REF>_MESSAGES_QUEUE_WAIT`(기본 10s)까지 기다리고, 그래도 자리가 없으면 429
+  `agent_busy`와 `Retry-After: 10`으로 답합니다. 기다리는 턴은 한도 수만큼만 받습니다. 자리는 응답이
+  끝까지 전달될 때까지 잡습니다. Chat은 이 한도와 무관합니다.
+- **폴백**: 주 업스트림이 열렸어도 닫힌 폴백 업스트림으로는 보내지 않습니다.
+- **사용량**: `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`를 더한 값을 입력
+  토큰으로 기록하고 분당 토큰과 일일 토큰 한도에 씁니다. 캐시에서 읽은 값은 캐시 입력으로 따로
+  기록합니다. 사용량 없이 끊긴 응답은 추정치(표시됨)로 기록합니다. 입력을 셌다면 센 값을 씁니다.
+
+`POST /v1/messages/count_tokens`는 인증 뒤, 열린 업스트림의 자체 서빙 모델이면 업스트림 값을 그대로
+돌려줍니다. 유료 모델과 그 밖의 경우는 404 `unknown_endpoint`이고 클라이언트는 자체 추정으로 넘어갑니다.
+세기는 기록하지 않고 Key 한도에도 넣지 않습니다.
+
 `POST /v1/responses`는 OpenAI Responses API 경로입니다. Codex와 OpenAI SDK의 `responses.create()`가
 이 경로를 부릅니다. 기능 권한은 `/v1/chat/completions`와 같은 `chat`이고 **유료 모델만** 받습니다.
 자체 서빙 모델 이름은 400 `model_not_available_on_route`로 거절합니다. 요청과 응답은 번역하지 않고
@@ -489,7 +523,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**입니다. 값은 �
 
 | 기능 | 여는 것 |
 |---|---|
-| `chat` | `POST /v1/chat/completions`(자체 서빙과 유료 모델 모두), `POST /v1/messages`, `POST /v1/responses`, `POST /v1/completions`(이 셋은 유료 모델만) |
+| `chat` | `POST /v1/chat/completions`(자체 서빙과 유료 모델 모두), `POST /v1/messages`(유료 모델, 그리고 Messages를 연 업스트림의 자체 서빙 모델)와 그 `count_tokens`(자체 서빙 모델만), `POST /v1/responses`, `POST /v1/completions`(이 둘은 유료 모델만) |
 | `web_search` | 유료 모델 채팅의 웹 검색. `plugins`의 `{"id":"web"}`, 모델 이름이나 `models` 후보, 서버 도구와 fusion 플러그인이 지정한 모델의 `:online` 접미사, `openrouter:web_search` 도구와 그 다른 철자(`web_search`, `web_search_preview`, `web_search_20250305` 등), OpenAI 표준 `web_search_options` |
 | `pdf_ocr` | 유료 모델 채팅의 유료 PDF OCR. `file-parser` 플러그인이 `pdf.engine`으로 `mistral-ocr`를 지정한 요청 |
 | `images` | `POST /v1/images`, `POST /v1/images/generations`, `GET /v1/images/models`, 그리고 유료 모델 채팅의 이미지 출력(`modalities`에 `image`, `openrouter:image_generation` 도구와 `image_generation`) |
@@ -763,6 +797,10 @@ go run ./cmd/llm-gateway
 | `LLMGW_UPSTREAM_<REF>_CAP_FIELD` | | 출력 상한을 주입할 필드. 기본 `max_completion_tokens`, 구형 서버는 `max_tokens` 지정 |
 | `LLMGW_UPSTREAM_<REF>_PROBE_INTERVAL` | | `/models` active probe 주기(최소 `10s`). 기본값은 사설·loopback IP `60s`, 외부 주소·hostname `5m`이며 배치 위치를 주소로 판단할 수 없을 때 명시 |
 | `LLMGW_UPSTREAM_<REF>_REASONING` | | 자체 서빙 모델의 `reasoning_effort` 처리. `closed`(기본, 거절), `effort`(그대로 전달), `template`(채팅 템플릿 사고 스위치로 변환) |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES` | | 자체 서빙 모델에 `/v1/messages`와 `count_tokens`를 열지. `closed`(기본) 또는 `open` |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_INPUT_TOKENS` | `65536` | 열린 업스트림의 Messages 입력 토큰 한도. `0`이면 끔 |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT` | `2` | 열린 업스트림에서 모든 Key를 합친 동시 Messages 턴 수. `0`이면 끔 |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES_QUEUE_WAIT` | `10s` | 동시 턴이 찼을 때 기다리는 최대 시간(0s~5m). `0s`면 바로 429 |
 
 <details>
 <summary>조정 값 (기본값으로 동작)</summary>

@@ -519,7 +519,6 @@ func TestMessagesCountTokensIsUnknown(t *testing.T) {
 	h, v := messagesHarness(t, nil)
 	for _, c := range []struct{ path, token string }{
 		{"/v1/messages/count_tokens?beta=true", testToken},
-		{"/v1/messages/count_tokens", ""},
 		{"/v1/messages/batches", testToken},
 		{"/v1/messages/", testToken},
 	} {
@@ -540,6 +539,17 @@ func TestMessagesCountTokensIsUnknown(t *testing.T) {
 			t.Fatal("a 404 asks for no retry")
 		}
 	}
+	// The counter authenticates before it answers, since a self-hosted model
+	// may be counted there; a request without a key hears that.
+	req, _ := http.NewRequest(http.MethodPost, h.gw.URL+"/v1/messages/count_tokens",
+		strings.NewReader(messagesFor("anthropic/claude-sonnet-4.5")))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	expectAnthropicRefusal(t, resp.StatusCode, raw, 401, "authentication_error", "missing_api_key")
 	if v.callCount() != 0 {
 		t.Fatal("count_tokens reached the vendor")
 	}

@@ -235,6 +235,10 @@ func (s *Server) callUpstream(ctx context.Context, p *protocol, model *snapshot.
 				continue
 			}
 		}
+		if !model.CreditAxis() && p.tokenUpstream != nil && !p.tokenUpstream(up) {
+			last = &attemptError{err: errUpstreamClosedToSurface}
+			continue
+		}
 		lastUp = up
 		capField := p.capWriteField
 		if capField == "" {
