@@ -57,7 +57,7 @@ var (
 	// than 404: the model exists and is served elsewhere, and the caller can
 	// act on that by naming a paid model or using the chat route.
 	errModelNotOnMessages = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
-		"자체 서빙 모델은 아직 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+		"이 자체 서빙 모델은 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotOnResponses = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
 		"자체 서빙 모델은 아직 /v1/responses에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotOnCompletions = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",

@@ -49,7 +49,7 @@ type protocol struct {
 	// with tokenOpen set also runs the self-hosted input cap and the
 	// per-upstream turn bound (see messages_token.go).
 	tokenOpen     func(s *Server, model *snapshot.Model) bool
-	tokenUpstream func(up config.Upstream) bool
+	tokenUpstream func(model *snapshot.Model, up config.Upstream) bool
 	// tokenStrip are top-level fields removed, not refused, on the
 	// self-hosted axis: fields an agent client sends on every request that
 	// would change reasoning or ask for a vendor feature the upstream does not

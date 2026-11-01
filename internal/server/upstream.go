@@ -235,7 +235,7 @@ func (s *Server) callUpstream(ctx context.Context, p *protocol, model *snapshot.
 				continue
 			}
 		}
-		if !model.CreditAxis() && p.tokenUpstream != nil && !p.tokenUpstream(up) {
+		if !model.CreditAxis() && p.tokenUpstream != nil && !p.tokenUpstream(model, up) {
 			last = &attemptError{err: errUpstreamClosedToSurface}
 			continue
 		}

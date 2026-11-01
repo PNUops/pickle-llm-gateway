@@ -332,12 +332,15 @@ func TestSelfHostedMessagesQueueAdmitsWhenFreed(t *testing.T) {
 	}
 }
 
-func TestSelfHostedMessagesSkipsClosedFallback(t *testing.T) {
+func TestSelfHostedMessagesNeverFallsBack(t *testing.T) {
 	h := newHarness(t, func(d *snapshot.Document) { d.Models[0].FallbackRef = "hosted" }, func(c *config.Config) {
 		up := c.Upstreams["mock"]
 		up.Messages = config.MessagesOpen
 		c.Upstreams["mock"] = up
-		c.Upstreams["hosted"] = config.Upstream{Ref: "hosted", BaseURL: "http://hosted.invalid/v1", CapField: "max_completion_tokens"}
+		// Open as well: the turn was counted and placed on the primary, so
+		// no fallback takes it, open or not.
+		c.Upstreams["hosted"] = config.Upstream{Ref: "hosted", BaseURL: "http://hosted.invalid/v1", CapField: "max_completion_tokens",
+			Messages: config.MessagesOpen}
 	})
 	var mu sync.Mutex
 	var hosts []string
@@ -356,7 +359,7 @@ func TestSelfHostedMessagesSkipsClosedFallback(t *testing.T) {
 	defer mu.Unlock()
 	for _, host := range hosts {
 		if host == "hosted.invalid" {
-			t.Fatal("the closed fallback was attempted")
+			t.Fatal("the fallback was attempted")
 		}
 	}
 	if len(hosts) == 0 {
@@ -412,4 +415,45 @@ func TestSelfHostedMessagesCutStreamKeepsEstimate(t *testing.T) {
 	if ev.Status == spool.StatusOK || !ev.Estimated || ev.InputTokens != 60 || ev.OutputTokens == 0 {
 		t.Fatalf("record: %+v", ev)
 	}
+}
+
+func TestSelfHostedCountTokensRefusals(t *testing.T) {
+	h, u := selfHostedHarness(t, 0, 0, 0, nil)
+	u.countStatus = http.StatusBadRequest
+	post := func(method, body string) (int, []byte) {
+		req, _ := http.NewRequest(method, h.gw.URL+"/v1/messages/count_tokens", strings.NewReader(body))
+		req.Header.Set("X-Api-Key", testToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, raw
+	}
+	// A request that cannot name its model hears the route's 404, so a
+	// client falls back to its own estimate as it did before.
+	for _, c := range []struct{ method, body string }{
+		{http.MethodGet, ""},
+		{http.MethodPost, "not json"},
+		{http.MethodPost, `{"messages":[]}`},
+	} {
+		code, raw := post(c.method, c.body)
+		expectAnthropicRefusal(t, code, raw, 404, "not_found_error", "unknown_endpoint")
+	}
+	// The counter's own rejection names the model the way the caller does.
+	u.mu.Lock()
+	u.countStatus = 0
+	u.mu.Unlock()
+	h.srv.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": {"application/json"}}, Request: r,
+			Body: io.NopCloser(strings.NewReader(`{"error":{"type":"BadRequestError","message":"model ` + upstreamModel + ` rejected this input"}}`))}, nil
+	})}
+	code, raw := post(http.MethodPost, agentTurnBody)
+	if code != 400 || strings.Contains(string(raw), upstreamModel) {
+		t.Fatalf("counter rejection leaked the served name: %d %s", code, raw)
+	}
+	// A tool the turn would refuse is refused here in the same words.
+	code, raw = post(http.MethodPost, `{"model":"pickle-general","messages":[],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
+	expectAnthropicRefusal(t, code, raw, 400, "invalid_request_error", "invalid_parameter_value")
 }

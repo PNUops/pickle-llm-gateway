@@ -71,12 +71,14 @@ func (s *Server) messagesTokenAdmit(model *snapshot.Model) bool {
 	return ok && up.Messages == config.MessagesOpen
 }
 
-// messagesTokenUpstream reports whether one attempt may go to up. A fallback
-// that does not serve this surface is skipped, the way one without a
-// credential is on the money axis: the request was admitted on its primary
-// and is not sent to a box whose operator never opened it to agents.
-func messagesTokenUpstream(up config.Upstream) bool {
-	return up.Messages == config.MessagesOpen
+// messagesTokenUpstream reports whether one attempt may go to up: only the
+// primary upstream the turn was admitted on. Its input was counted against
+// that upstream's cap and it holds that upstream's turn place, so sending it
+// to a fallback, open or not, would run it on a box whose bounds it never
+// passed. A fallback is skipped the way one without a credential is on the
+// money axis, and a primary in cooldown fails the turn instead of moving it.
+func messagesTokenUpstream(model *snapshot.Model, up config.Upstream) bool {
+	return up.Messages == config.MessagesOpen && strings.EqualFold(up.Ref, model.UpstreamRef)
 }
 
 // fenceMessagesTokenTools is the self-hosted tool profile on this surface:
@@ -208,7 +210,7 @@ const countInputTimeout = 5 * time.Second
 
 // countMessagesTokens asks up how many input tokens the request is, with the
 // model already renamed to the upstream's name.
-func (s *Server) countMessagesTokens(ctx context.Context, up config.Upstream, params map[string]json.RawMessage) (int, *attemptError) {
+func (s *Server) countMessagesTokens(ctx context.Context, up config.Upstream, model *snapshot.Model, params map[string]json.RawMessage) (int, *attemptError) {
 	body := make(map[string]json.RawMessage, len(countFields))
 	for _, f := range countFields {
 		if v, ok := params[f]; ok {
@@ -227,6 +229,9 @@ func (s *Server) countMessagesTokens(ctx context.Context, up config.Upstream, pa
 		path:   "/messages/count_tokens",
 		body:   b,
 		cred:   up.APIKey,
+		// A relayed rejection names the model the way the caller does.
+		upstreamModel: model.UpstreamModel,
+		publicModel:   model.PublicName,
 	})
 	if ae != nil {
 		return 0, ae
@@ -247,13 +252,13 @@ func (s *Server) countMessagesTokens(ctx context.Context, up config.Upstream, pa
 // counting or the counter was unavailable. A counter that fails admits the
 // request: the cap protects other callers' latency, not the upstream, whose
 // own context limit still refuses an input that cannot fit.
-func (s *Server) messagesInputWithinCap(ctx context.Context, up config.Upstream, params map[string]json.RawMessage,
+func (s *Server) messagesInputWithinCap(ctx context.Context, up config.Upstream, model *snapshot.Model, params map[string]json.RawMessage,
 	bodyBytes int, refuse func(apiError, string)) (int, bool) {
 	limit := up.MessagesMaxInputTokens
 	if limit <= 0 || fitsWithoutCounting(bodyBytes, limit) {
 		return 0, true
 	}
-	n, ae := s.countMessagesTokens(ctx, up, params)
+	n, ae := s.countMessagesTokens(ctx, up, model, params)
 	if ae != nil {
 		if ctx.Err() == nil {
 			s.metrics.messagesCountFailures.Add(1)
@@ -283,20 +288,18 @@ func fitsWithoutCounting(bodyBytes, maxTokens int) bool {
 // handleCountTokens answers the Messages token counter. A self-hosted model
 // whose upstream opens this surface is counted by that upstream's own
 // counter, the number the input cap is judged on. Anything else gets the
-// fast 404 the route has always given, after authentication, so an agent
-// client falls back to its own estimate for a paid model.
+// fast 404 the route has always given, so an agent client falls back to its
+// own estimate: a paid model, an unknown one, and a request that cannot be
+// read far enough to name its model (wrong method, too large, not JSON).
+// Authentication comes first, since a count goes to a shared upstream.
 //
 // It is not metered: counting generates nothing and spends no sequence on
 // the upstream, so it takes no per-key limit and writes no usage record. The
 // gateway-wide in-flight bound and the ordinary body bound hold it.
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAnthropicError(w, errMethod, "")
-		return
-	}
 	doc, keyLookup, modelLookup := s.store.Current()
-	if !doc.ServiceEnabled {
-		writeAnthropicError(w, errServiceDisabled, "")
+	if r.Method != http.MethodPost || !doc.ServiceEnabled {
+		writeAnthropicError(w, errNotFound, "")
 		return
 	}
 	token, missing := messagesToken(r)
@@ -322,18 +325,14 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.RequestBodyMaxBytes)
 	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeAnthropicError(w, errRequestTooLarge, "")
-		return
-	}
 	var params map[string]json.RawMessage
-	if json.Unmarshal(raw, &params) != nil {
-		writeAnthropicError(w, errBadJSON, "")
+	if err != nil || json.Unmarshal(raw, &params) != nil {
+		writeAnthropicError(w, errNotFound, "")
 		return
 	}
 	req, rf := parseMessages(params)
 	if rf != nil {
-		writeAnthropicError(w, rf.e, "")
+		writeAnthropicError(w, errNotFound, "")
 		return
 	}
 	model := modelLookup(req.publicModel)
@@ -345,9 +344,15 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, errModelNotAllowed, "")
 		return
 	}
+	// The same tool profile the turn itself would meet, so the two routes
+	// refuse the same definitions in the same words.
+	if e := fenceMessagesTokenTools(params); e != nil {
+		writeAnthropicError(w, *e, "")
+		return
+	}
 	up := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
 	params["model"] = json.RawMessage(strconv.Quote(model.UpstreamModel))
-	n, ae := s.countMessagesTokens(r.Context(), up, params)
+	n, ae := s.countMessagesTokens(r.Context(), up, model, params)
 	switch {
 	case ae == nil:
 	case ae.refusal != nil:

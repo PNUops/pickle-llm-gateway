@@ -496,7 +496,7 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// and after the model is renamed because the counter is the upstream's.
 	if tokenOpen {
 		up := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
-		if counted, ok := s.messagesInputWithinCap(r.Context(), up, params, len(rawBody), refuse); !ok {
+		if counted, ok := s.messagesInputWithinCap(r.Context(), up, model, params, len(rawBody), refuse); !ok {
 			return
 		} else if counted > 0 {
 			// The counted input stands in for the byte estimate on an ending

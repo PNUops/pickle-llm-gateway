@@ -124,10 +124,10 @@ func (s *Server) Handler() http.Handler {
 	// The legacy completions surface (completions.go). Nothing is served
 	// under it.
 	mux.HandleFunc("/v1/completions", s.handleCompletions)
-	// The Anthropic Messages surface. Nothing under it is served beyond the
-	// route itself: the token-counting route has nothing upstream to forward
-	// to, and it and every other subpath are answered as unknown, in this
-	// surface's own envelope so an Anthropic client can read the refusal.
+	// The Anthropic Messages surface and its token counter, which answers only
+	// for a self-hosted model on an open upstream (messages_token.go). Every
+	// other subpath is answered as unknown, in this surface's own envelope so
+	// an Anthropic client can read the refusal.
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 	mux.HandleFunc("/v1/messages/", s.handleMessagesUnknown)

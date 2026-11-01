@@ -79,11 +79,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.serveProtocol(protoMessages, w, r)
 }
 
-// handleMessagesUnknown answers the token-counting route, and anything else
-// under the Messages path, with a fast 404 in the Anthropic envelope. The vendor has no such route to forward to, and a client
-// that gets a 404 here falls back to its own estimate without retrying. It is
-// answered before authentication, like any other route this service does not
-// serve, and it records nothing: nothing was served.
+// handleMessagesUnknown answers every subpath of the Messages route except
+// the token counter with a fast 404 in the Anthropic envelope. It is answered
+// before authentication, like any other route this service does not serve,
+// and it records nothing: nothing was served.
 func (s *Server) handleMessagesUnknown(w http.ResponseWriter, _ *http.Request) {
 	writeAnthropicError(w, errNotFound, "")
 }
