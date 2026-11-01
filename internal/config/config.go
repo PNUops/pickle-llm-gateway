@@ -39,6 +39,26 @@ type Upstream struct {
 	// takes that upstream's decision with it. It does not decide whether the
 	// model reasons when the field is absent: that is the upstream's default.
 	Reasoning string
+	// Messages says whether a self-hosted (TOKEN-axis) model served here may
+	// be called on the Anthropic Messages surface and its token counter:
+	// MessagesClosed (the default) refuses it there, MessagesOpen serves it.
+	// It is a property of the upstream for the reason Reasoning is: an agent
+	// turn is long and spends this upstream's serving capacity, and a TOKEN
+	// model on a hosted upstream is a different question from one on a local
+	// GPU box. The three values below apply only while it is open.
+	Messages string
+	// MessagesMaxInputTokens refuses a Messages request whose input, counted
+	// by the upstream's own tokenizer, is above it; 0 turns the cap off. A
+	// long prompt is prefilled one at a time on a single serving box and
+	// stalls every other request on it, chat included, while it runs.
+	MessagesMaxInputTokens int
+	// MessagesMaxConcurrent bounds the Messages turns in flight on this
+	// upstream across every key; 0 turns the bound off. A turn holds its
+	// place until its answer has been relayed in full.
+	MessagesMaxConcurrent int
+	// MessagesQueueWait is how long a turn over that bound waits for a place
+	// before it is refused with 429 and a Retry-After; 0 refuses at once.
+	MessagesQueueWait time.Duration
 	// ProbeInterval controls the read-only GET /models observation loop. A
 	// private or loopback literal defaults to the on-prem cadence; a public
 	// address or hostname defaults to the external cadence. Operators can set
@@ -51,6 +71,27 @@ const (
 	ReasoningClosed   = "closed"
 	ReasoningEffort   = "effort"
 	ReasoningTemplate = "template"
+)
+
+// Messages settings for an upstream; see Upstream.Messages.
+const (
+	MessagesClosed = "closed"
+	MessagesOpen   = "open"
+)
+
+// The Messages bounds an open upstream gets when the environment names none.
+// They come from the 2026-10-22 load trial on the single self-hosted box (8
+// concurrent sequences, prefix caching on). Chat's per-token time doubled
+// once about 120K tokens of agent input were in flight, whatever the mix (two
+// agents at 60K, four at 20K, one at 100K); four agents at 60K made it 3.4
+// times slower with a worst chat answer of 69 seconds, and eight at 60K
+// stalled chat for over a minute. Two turns at the cap stay on the doubling
+// line. The cap bounds how long one uncached prefill holds the box; the count
+// bounds how many of them run at once.
+const (
+	defaultMessagesMaxInputTokens = 65536
+	defaultMessagesMaxConcurrent  = 2
+	defaultMessagesQueueWait      = 10 * time.Second
 )
 
 // SnapshotSource names where the authorization document comes from.
@@ -493,6 +534,9 @@ var reservedUpstreamSettings = map[string]bool{
 func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 	ups := map[string]Upstream{}
 	var errs []string
+	// Which numeric settings the environment named, so an explicit 0 (off)
+	// stays distinct from a setting left to its default.
+	set := map[string]map[string]bool{}
 	const p = envPrefix + "UPSTREAM_"
 	for _, kv := range environ {
 		name, val, ok := strings.Cut(kv, "=")
@@ -519,8 +563,17 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			ref, field = strings.TrimSuffix(rest, "_PROBE_INTERVAL"), "probe"
 		case strings.HasSuffix(rest, "_REASONING"):
 			ref, field = strings.TrimSuffix(rest, "_REASONING"), "reasoning"
+		case strings.HasSuffix(rest, "_MESSAGES_MAX_INPUT_TOKENS"):
+			ref, field = strings.TrimSuffix(rest, "_MESSAGES_MAX_INPUT_TOKENS"), "msgInput"
+		case strings.HasSuffix(rest, "_MESSAGES_MAX_CONCURRENT"):
+			ref, field = strings.TrimSuffix(rest, "_MESSAGES_MAX_CONCURRENT"), "msgConcurrent"
+		case strings.HasSuffix(rest, "_MESSAGES_QUEUE_WAIT"):
+			ref, field = strings.TrimSuffix(rest, "_MESSAGES_QUEUE_WAIT"), "msgWait"
+		case strings.HasSuffix(rest, "_MESSAGES"):
+			ref, field = strings.TrimSuffix(rest, "_MESSAGES"), "messages"
 		default:
-			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY, _CAP_FIELD, _PROBE_INTERVAL or _REASONING)")
+			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY, _CAP_FIELD, _PROBE_INTERVAL, _REASONING, "+
+				"_MESSAGES, _MESSAGES_MAX_INPUT_TOKENS, _MESSAGES_MAX_CONCURRENT or _MESSAGES_QUEUE_WAIT)")
 			continue
 		}
 		if ref == "" {
@@ -530,6 +583,9 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		id := strings.ToLower(ref)
 		u := ups[id]
 		u.Ref = id
+		if set[id] == nil {
+			set[id] = map[string]bool{}
+		}
 		switch field {
 		case "base":
 			u.BaseURL = strings.TrimRight(val, "/")
@@ -539,6 +595,28 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			u.CapField = val
 		case "reasoning":
 			u.Reasoning = val
+		case "messages":
+			u.Messages = val
+		case "msgInput", "msgConcurrent":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 0 {
+				errs = append(errs, name+" must be a whole number, 0 to turn it off")
+				continue
+			}
+			if field == "msgInput" {
+				u.MessagesMaxInputTokens = n
+			} else {
+				u.MessagesMaxConcurrent = n
+			}
+			set[id][field] = true
+		case "msgWait":
+			d, err := time.ParseDuration(val)
+			if err != nil || d < 0 || d > 5*time.Minute {
+				errs = append(errs, name+" must be a duration from 0s to 5m (e.g. 10s)")
+				continue
+			}
+			u.MessagesQueueWait = d
+			set[id][field] = true
 		case "probe":
 			d, err := time.ParseDuration(val)
 			if err != nil || d < 10*time.Second {
@@ -576,6 +654,25 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 				" ("+ReasoningClosed+", "+ReasoningEffort+" or "+ReasoningTemplate+")")
 			delete(ups, id)
 			continue
+		}
+		switch u.Messages {
+		case "":
+			u.Messages = MessagesClosed
+		case MessagesClosed, MessagesOpen:
+		default:
+			errs = append(errs, "upstream "+id+" has an unknown messages setting "+u.Messages+
+				" ("+MessagesClosed+" or "+MessagesOpen+")")
+			delete(ups, id)
+			continue
+		}
+		if !set[id]["msgInput"] {
+			u.MessagesMaxInputTokens = defaultMessagesMaxInputTokens
+		}
+		if !set[id]["msgConcurrent"] {
+			u.MessagesMaxConcurrent = defaultMessagesMaxConcurrent
+		}
+		if !set[id]["msgWait"] {
+			u.MessagesQueueWait = defaultMessagesQueueWait
 		}
 		// One write-back for every default filled above. Writing it only where
 		// a default was filled lost the others: an upstream with an explicit

@@ -5,9 +5,9 @@
 // same way. What this file changes about the shared pipeline is how the key is
 // read, which fields name a model, how usage is read, and the error envelope.
 //
-// It serves paid models only. A self-hosted model is refused with a reason
-// rather than forwarded, because the self-hosted side has its own parameter
-// rules on this surface that have not been written.
+// It serves paid models, and self-hosted models whose upstream opens the
+// surface (messages_token.go); any other self-hosted model is refused with a
+// reason rather than forwarded.
 package server
 
 import (
@@ -39,12 +39,16 @@ var protoMessages = &protocol{
 			largeResponse: c.ChatLargeResponseMaxBytes,
 		}
 	},
-	parse:      parseMessages,
-	creditOnly: &errModelNotOnMessages,
-	// Unreachable while the surface is closed to the self-hosted axis; if
-	// that is ever lifted without writing this surface's own list, every
-	// field is refused rather than forwarded unread.
-	tokenAxisParam: func(name string) *refusal { return &refusal{e: errUnsupportedParam(name)} },
+	parse: parseMessages,
+	// A self-hosted model is served only where its upstream opens this
+	// surface; everywhere else it gets the refusal below.
+	creditOnly:       &errModelNotOnMessages,
+	tokenOpen:        (*Server).messagesTokenAdmit,
+	tokenUpstream:    messagesTokenUpstream,
+	tokenStrip:       messagesTokenStrip,
+	tokenAxisParam:   messagesTokenAxisParam,
+	tokenTools:       fenceMessagesTokenTools,
+	clampTokenOutput: true,
 	// Model names follow the chat rules: a name the catalogue does not list is
 	// forwarded to the vendor under the key's allow and deny lists, whether or
 	// not it carries a provider prefix.
@@ -63,22 +67,22 @@ var protoMessages = &protocol{
 	capWriteField:  "max_tokens",
 	shape:          shapeMessages,
 	// No body capture: its record format is not designed for this surface.
-	capture:         nil,
-	noUsageEstimate: true,
-	readResponse:    readMessagesResponse,
-	newStream:       newMessagesStream,
-	writeError:      writeAnthropicError,
+	capture:            nil,
+	noUsageEstimate:    true,
+	tokenUsageEstimate: true,
+	readResponse:       readMessagesResponse,
+	newStream:          newMessagesStream,
+	writeError:         writeAnthropicError,
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.serveProtocol(protoMessages, w, r)
 }
 
-// handleMessagesUnknown answers the token-counting route, and anything else
-// under the Messages path, with a fast 404 in the Anthropic envelope. The vendor has no such route to forward to, and a client
-// that gets a 404 here falls back to its own estimate without retrying. It is
-// answered before authentication, like any other route this service does not
-// serve, and it records nothing: nothing was served.
+// handleMessagesUnknown answers every subpath of the Messages route except
+// the token counter with a fast 404 in the Anthropic envelope. It is answered
+// before authentication, like any other route this service does not serve,
+// and it records nothing: nothing was served.
 func (s *Server) handleMessagesUnknown(w http.ResponseWriter, _ *http.Request) {
 	writeAnthropicError(w, errNotFound, "")
 }
@@ -382,9 +386,14 @@ func (m *messagesStream) read(e sseEvent, res *streamResult) ([]byte, bool) {
 			m.settle(res)
 		}
 	case "content_block_delta":
-		if delta, _ := payload["delta"].(map[string]any); delta != nil && delta["type"] == "text_delta" {
-			t, _ := delta["text"].(string)
-			res.contentChars += len(t)
+		// Every generated delta counts toward the estimate an ending without
+		// usage falls back to: tool arguments and thinking are generated and
+		// billed like text, and an agent turn is mostly tool arguments.
+		if delta, _ := payload["delta"].(map[string]any); delta != nil {
+			for _, field := range []string{"text", "partial_json", "thinking"} {
+				t, _ := delta[field].(string)
+				res.contentChars += len(t)
+			}
 		}
 	}
 	// Everything else is relayed as the upstream wrote it: no other event

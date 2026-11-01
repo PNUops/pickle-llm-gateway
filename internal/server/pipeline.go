@@ -275,7 +275,8 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// served whatever fields it carries, and before the model fences, because
 	// the model exists and the key may well be allowed it: the remedy is a
 	// different route or a paid model, not a different grant.
-	if p.creditOnly != nil && !model.CreditAxis() {
+	tokenOpen := !model.CreditAxis() && p.tokenOpen != nil && p.tokenOpen(s, model)
+	if p.creditOnly != nil && !model.CreditAxis() && !tokenOpen {
 		refuse(*p.creditOnly, spool.StatusBadRequest)
 		return
 	}
@@ -295,6 +296,9 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// answers 400 rather than 403, and it runs after the model is read because
 	// the axis is a fact about the model the body names.
 	if !model.CreditAxis() {
+		for name := range p.tokenStrip {
+			delete(params, name)
+		}
 		reasoningOK := p.reasoningParam != "" && s.reasoningOpen(model)
 		for name, raw := range params {
 			if reasoningOK && name == p.reasoningParam {
@@ -319,7 +323,11 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// a fallback selected ahead of a cooling primary. Judge the full envelope
 	// before admission or routing; CREDIT tools keep their separate fences.
 	if !model.CreditAxis() {
-		if e := fenceTokenTools(params); e != nil {
+		tools := p.tokenTools
+		if tools == nil {
+			tools = fenceTokenTools
+		}
+		if e := tools(params); e != nil {
 			refuse(*e, spool.StatusBadRequest)
 			return
 		}
@@ -452,6 +460,9 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 			refuse(errInvalidParamValue(f), spool.StatusBadRequest)
 			return
 		}
+		if model.MaxOutputTokens > 0 && n > model.MaxOutputTokens && p.clampTokenOutput && !model.CreditAxis() {
+			n = model.MaxOutputTokens
+		}
 		if model.MaxOutputTokens > 0 && n > model.MaxOutputTokens {
 			refuse(errOutputTooLong(f, model.MaxOutputTokens), spool.StatusBadRequest)
 			return
@@ -479,6 +490,35 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 	// Already on the event, stamped before the fences above.
 	streaming := ev.Streamed
 	p.shape(params, req, model, streaming)
+
+	// The self-hosted input cap and turn bound, after every per-key charge so
+	// a caller looping oversized requests is still held by its own limits,
+	// and after the model is renamed because the counter is the upstream's.
+	if tokenOpen {
+		up := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
+		if counted, ok := s.messagesInputWithinCap(r.Context(), up, model, params, len(rawBody), refuse); !ok {
+			return
+		} else if counted > 0 {
+			// The counted input stands in for the byte estimate on an ending
+			// without usage, so an interrupted long turn is not metered near
+			// zero. The estimate divides bytes by four.
+			inputBytes = counted * 4
+		} else {
+			inputBytes = len(rawBody)
+		}
+		release, ok := s.agents.acquire(r.Context(), up.Ref)
+		if !ok {
+			if r.Context().Err() != nil {
+				ev.Status = spool.StatusCanceled
+				ev.ErrorType = "client_disconnected"
+				record()
+				return
+			}
+			refuseAs(errAgentBusy, spool.StatusRateLimited, "agent_concurrency")
+			return
+		}
+		defer release()
+	}
 
 	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
 	defer cancel()
@@ -583,7 +623,7 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 		recordStream = s.withGenerationCost(resp.Header.Get(generationIDHeader), up, key.CredentialFor(up.Ref),
 			&ev, stopClock, record, &s.costs.stream)
 	}
-	if p.noUsageEstimate {
+	if p.noUsageEstimate && (model.CreditAxis() || !p.tokenUsageEstimate) {
 		inner := recordStream
 		// Every ending without usage drops the estimate from the record; the
 		// answer itself has already been relayed as it came.
@@ -747,7 +787,7 @@ func (s *Server) finishNonStream(p *protocol, w http.ResponseWriter, resp *http.
 	default:
 		ev.Status = spool.StatusOK
 	}
-	if p.noUsageEstimate && !res.haveUsage {
+	if p.noUsageEstimate && (creditAxis || !p.tokenUsageEstimate) && !res.haveUsage {
 		// Relayed as it came, as on every other surface. The bucket is charged
 		// by estimate, which is a throttle; the record keeps no counts.
 		in, out := estimateTokens(inputBytes, contentChars)

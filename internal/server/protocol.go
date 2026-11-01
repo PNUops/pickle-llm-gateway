@@ -43,6 +43,25 @@ type protocol struct {
 	// It is judged once the model has resolved and before tokenAxisParam,
 	// which a surface closed to the self-hosted axis does not need to define.
 	creditOnly *apiError
+	// tokenOpen, when set, lifts creditOnly for a self-hosted model whose
+	// primary upstream serves this surface; tokenUpstream then judges each
+	// attempt, so a fallback that does not serve it is skipped. A surface
+	// with tokenOpen set also runs the self-hosted input cap and the
+	// per-upstream turn bound (see messages_token.go).
+	tokenOpen     func(s *Server, model *snapshot.Model) bool
+	tokenUpstream func(model *snapshot.Model, up config.Upstream) bool
+	// tokenStrip are top-level fields removed, not refused, on the
+	// self-hosted axis: fields an agent client sends on every request that
+	// would change reasoning or ask for a vendor feature the upstream does not
+	// have. Removed before tokenAxisParam runs.
+	tokenStrip map[string]bool
+	// tokenTools judges the tool envelope on the self-hosted axis; nil is
+	// chat's (fenceTokenTools).
+	tokenTools func(params map[string]json.RawMessage) *apiError
+	// clampTokenOutput lowers an output request above the model maximum to
+	// that maximum on the self-hosted axis instead of refusing it. Agent
+	// clients send one large fixed value that the caller does not choose.
+	clampTokenOutput bool
 	// tokenAxisParam judges one top-level field on the self-hosted axis; nil
 	// means the field may be forwarded.
 	tokenAxisParam func(name string) *refusal
@@ -79,6 +98,12 @@ type protocol struct {
 	// wrong once it is summed. The rate-limit bucket is still charged by
 	// estimate: that is a throttle, not accounting.
 	noUsageEstimate bool
+	// tokenUsageEstimate keeps the estimate on the self-hosted axis of a
+	// noUsageEstimate surface. There the record is what the daily token
+	// allowance sums, and an agent turn interrupted mid-answer is routine:
+	// dropping the counts would meter a long prefill the upstream already ran
+	// as free. The estimate is flagged as one.
+	tokenUsageEstimate bool
 
 	// readResponse reads a decoded non-streamed answer: it puts the public
 	// name in place of the served one and pulls out what metering needs.

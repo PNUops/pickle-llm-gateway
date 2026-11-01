@@ -28,6 +28,10 @@ type counters struct {
 	// The same two for passthrough answers that ended without a cost.
 	passthroughCostFilled  atomic.Int64
 	passthroughCostMissing atomic.Int64
+	// Self-hosted Messages: inputs refused above the cap, and counts that
+	// failed and were admitted uncounted.
+	messagesInputRefused  atomic.Int64
+	messagesCountFailures atomic.Int64
 }
 
 func (c *counters) observe(ev spool.Event) {
@@ -77,6 +81,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"outputTokens":           s.metrics.outputTokens.Load(),
 		"upstreamRetries":        s.metrics.upstreamRetries.Load(),
 		"upstreamFallbacks":      s.metrics.upstreamFallbacks.Load(),
+		"messagesAgentSlots":     s.agents.snapshot(),
+		"messagesInputRefused":   s.metrics.messagesInputRefused.Load(),
+		"messagesCountFailures":  s.metrics.messagesCountFailures.Load(),
 		"bodiesCaptured":         s.metrics.bodiesCaptured.Load(),
 		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
 		"streamCostFilled":       s.metrics.streamCostFilled.Load(),

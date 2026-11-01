@@ -9,6 +9,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -56,7 +57,7 @@ var (
 	// than 404: the model exists and is served elsewhere, and the caller can
 	// act on that by naming a paid model or using the chat route.
 	errModelNotOnMessages = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
-		"자체 서빙 모델은 아직 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+		"이 자체 서빙 모델은 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotOnResponses = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
 		"자체 서빙 모델은 아직 /v1/responses에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
 	errModelNotOnCompletions = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
@@ -123,6 +124,10 @@ var (
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
 		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, " +
 			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions입니다."}
+	// Every self-hosted agent place on the upstream is taken and the short
+	// wait for one ran out. 429 with a Retry-After: waiting is the remedy.
+	errAgentBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "agent_busy",
+		"자체 서빙 모델에서 동시에 처리하는 에이전트 요청이 모두 차 있습니다. 잠시 후 다시 시도해주세요."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드입니다."}
 	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",
@@ -153,17 +158,31 @@ var retryAfterSeconds = map[string]int{
 	// full pool can take minutes to drain; five seconds is the retry pace,
 	// not a promise that one is free by then.
 	"large_request_busy": 5,
+	// A self-hosted agent turn holds its place through its whole answer,
+	// seconds to minutes; this is the retry pace after the queue wait.
+	"agent_busy": 10,
 }
 
 // Internal sentinels for upstream failure reasons. They never reach a client;
 // the client sees the shaped envelope above.
 var (
-	errUnconfiguredUpstream = errors.New("model references an unconfigured upstream")
-	errNoKeyCredential      = errors.New("key has no credential for this upstream")
-	errUpstreamAuth         = errors.New("upstream rejected our credential")
-	errUpstreamStatus       = errors.New("upstream returned an error status")
-	errUpstreamThrottled    = errors.New("upstream is throttling this gateway")
+	errUnconfiguredUpstream    = errors.New("model references an unconfigured upstream")
+	errNoKeyCredential         = errors.New("key has no credential for this upstream")
+	errUpstreamAuth            = errors.New("upstream rejected our credential")
+	errUpstreamStatus          = errors.New("upstream returned an error status")
+	errUpstreamThrottled       = errors.New("upstream is throttling this gateway")
+	errUpstreamClosedToSurface = errors.New("upstream does not serve this surface for self-hosted models")
 )
+
+// errAgentInputTooLong refuses a self-hosted Messages input above the
+// upstream's cap. The message opens with the vendor's own wording for an
+// oversized prompt, which agent clients recognise and answer by offering to
+// compact the conversation; the rest tells the student to do that.
+func errAgentInputTooLong(tokens, limit int) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "input_too_long",
+		fmt.Sprintf("prompt is too long: %d tokens > %d maximum. ", tokens, limit) +
+			"자체 서빙 모델의 에이전트 요청 입력 한도를 넘었습니다. 대화를 압축(/compact)하거나 새 대화를 시작한 뒤 다시 시도해주세요."}
+}
 
 // The same public code as an outright unknown field, because to an SDK the
 // fact is identical: this request may not carry that field. What differs is
