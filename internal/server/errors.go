@@ -25,94 +25,94 @@ type apiError struct {
 
 var (
 	errMissingKey = apiError{http.StatusUnauthorized, "authentication_error", "missing_api_key",
-		"API Key가 없습니다. Authorization: Bearer <API Key> 헤더를 보내주세요."}
+		"API 키가 없어요. Authorization: Bearer <API Key> 헤더를 보내 주세요."}
 	// The same refusal for an Anthropic client, which sends its key in
 	// x-api-key or as a bearer depending on how it was configured; naming only
 	// one would send half of them to change the wrong setting.
 	errMissingKeyMessages = apiError{http.StatusUnauthorized, "authentication_error", "missing_api_key",
-		"API Key가 없습니다. x-api-key: <API Key> 또는 Authorization: Bearer <API Key> 헤더를 보내주세요."}
+		"API 키가 없어요. x-api-key: <API Key> 또는 Authorization: Bearer <API Key> 헤더를 보내 주세요."}
 	errInvalidKey = apiError{http.StatusUnauthorized, "authentication_error", "invalid_api_key",
-		"API Key가 올바르지 않습니다. 콘솔에서 발급한 Key인지 확인해주세요."}
+		"API 키가 올바르지 않아요. 콘솔에서 발급한 키 값을 확인해 주세요."}
 	errKeyExpired = apiError{http.StatusUnauthorized, "authentication_error", "api_key_expired",
-		"API Key의 유효기간이 지났습니다. 콘솔에서 새 Key를 발급해주세요."}
+		"API 키의 유효기간이 지났어요. 계속 쓰려면 콘솔에서 새 키를 신청해 주세요."}
 	errKeyRevoked = apiError{http.StatusUnauthorized, "authentication_error", "api_key_revoked",
-		"폐기된 API Key입니다. 콘솔에서 새 Key를 발급해주세요."}
+		"폐기된 API 키예요. 계속 쓰려면 콘솔에서 새 키를 신청해 주세요."}
 	errKeySuspended = apiError{http.StatusForbidden, "permission_error", "account_suspended",
-		"이용이 정지된 상태입니다. 관리자에게 문의해주세요."}
+		"이용이 정지된 상태예요. 관리자에게 문의해 주세요."}
 	errQuotaExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "quota_exhausted",
-		"사용량 한도를 모두 사용했습니다. 한도는 기간이 지나면 초기화되며, 증액이 필요하면 콘솔에서 신청해주세요."}
+		"토큰 한도로 요청이 거절됐어요. 한도와 초기화 주기를 확인하고, 증액이 필요하면 콘솔에서 신청해 주세요."}
 	errCreditUnavailable = apiError{http.StatusForbidden, "permission_error", "credit_unavailable",
-		"이 API Key에는 유료 모델을 쓸 금액 한도가 없습니다. 콘솔에서 한도를 신청해주세요."}
+		"이 API 키에는 유료 모델을 쓸 금액 한도가 없어요. 콘솔에서 한도를 신청해 주세요."}
 	// 503 rather than 403 on purpose: nothing about the request is wrong and
 	// the state ends on its own, so the honest answer is "not yet", which is
 	// also the one OpenAI-compatible clients retry without being told. The
 	// budget was granted; only its upstream key is still being created.
 	errCreditPending = apiError{http.StatusServiceUnavailable, "server_error", "credit_pending",
-		"승인된 금액 한도를 이 API Key에 적용하는 중입니다. 적용이 끝나면 자동으로 사용할 수 있으니 잠시 후 다시 시도해주세요."}
+		"승인된 금액 한도를 적용 중이에요. 잠시 후 다시 시도해 주세요."}
 	errCreditExhausted = apiError{http.StatusTooManyRequests, "rate_limit_error", "credit_exhausted",
-		"유료 모델에 부여된 금액 한도를 모두 사용했습니다. 증액이 필요하면 콘솔에서 신청해주세요."}
+		"유료 모델 금액 한도로 요청이 거절됐어요. 증액이 필요하면 콘솔에서 신청해 주세요."}
 	errServiceDisabled = apiError{http.StatusServiceUnavailable, "server_error", "service_disabled",
-		"LLM API 서비스가 점검 중입니다. 잠시 후 다시 시도해주세요."}
+		"현재 LLM API를 이용할 수 없어요. 잠시 후 다시 시도해 주세요."}
 	// A self-hosted model on a route that serves paid models only. 400 rather
 	// than 404: the model exists and is served elsewhere, and the caller can
 	// act on that by naming a paid model or using the chat route.
 	errModelNotOnMessages = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
-		"이 자체 서빙 모델은 /v1/messages에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+		"이 자체 서빙 모델은 /v1/messages에서 쓸 수 없어요. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해 주세요."}
 	errModelNotOnResponses = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
-		"자체 서빙 모델은 아직 /v1/responses에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+		"자체 서빙 모델은 아직 /v1/responses에서 쓸 수 없어요. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해 주세요."}
 	errModelNotOnCompletions = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
-		"자체 서빙 모델은 /v1/completions에서 쓸 수 없습니다. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해주세요."}
+		"자체 서빙 모델은 /v1/completions에서 쓸 수 없어요. 유료 모델 이름을 지정하거나 /v1/chat/completions를 사용해 주세요."}
 	errModelNotFound = apiError{http.StatusNotFound, "invalid_request_error", "model_not_found",
-		"요청한 모델이 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
+		"요청한 모델이 없어요. GET /v1/models로 모델 목록을 확인해 주세요."}
 	// Two fences answer with this code, and they need different advice, so the
 	// message differs while the code does not — a second public code would be
 	// one more string every SDK and demo has to learn for a fact they already
 	// handle. This one is the catalogue fence: those models ARE listed by
 	// /v1/models, so the original advice is right here.
 	errModelNotAllowed = apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key로는 요청한 모델을 사용할 수 없습니다. GET /v1/models로 이용 가능한 모델을 확인해주세요."}
+		"이 API 키로는 요청한 모델을 사용할 수 없어요. GET /v1/models로 모델 목록을 확인해 주세요."}
 	// The money fence. A commercial model reached through passthrough is never
 	// in /v1/models, so pointing there would send the caller to a list that
 	// cannot contain the answer; the console shows the key's own allow list.
 	errCreditModelNotAllowed = apiError{http.StatusForbidden, "permission_error",
 		"model_not_allowed",
-		"이 API Key로는 요청한 유료 모델을 사용할 수 없습니다. 콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+		"이 API 키로는 요청한 유료 모델을 사용할 수 없어요. 콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 	errRateRequests = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_requests",
-		"자체 서빙 모델의 분당 요청 횟수 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
+		"자체 서빙 모델의 분당 요청 횟수 한도를 넘었어요. 잠시 후 다시 시도해 주세요."}
 	errRateTokens = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_tokens",
-		"자체 서빙 모델의 분당 토큰 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요."}
+		"자체 서빙 모델의 분당 토큰 사용량 한도를 넘었어요. 잠시 후 다시 시도해 주세요."}
 	errRateConcurrency = apiError{http.StatusTooManyRequests, "rate_limit_error", "rate_limit_concurrency",
-		"자체 서빙 모델의 동시 요청 수 한도를 초과했습니다. 진행 중인 요청이 끝난 뒤 다시 시도해주세요."}
+		"자체 서빙 모델의 동시 요청 수 한도를 넘었어요. 진행 중인 요청이 끝난 뒤 다시 시도해 주세요."}
 	// A body above the ordinary bound when every large-body slot of its
 	// surface is taken, chat's or the passthrough's. 429 because waiting is
 	// the remedy and the shortage is a limit rather than a fault.
 	errLargeRequestBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "large_request_busy",
-		"큰 요청(2 MiB 초과)을 처리할 자리가 지금은 없습니다. 잠시 후 다시 시도하거나, 파일과 이미지를 URL로 보내 요청을 줄여주세요."}
+		"큰 요청을 처리할 자리가 없어요. 잠시 후 다시 시도하거나 요청 크기를 줄여 주세요."}
 	// The chat response bound, said out loud: a non-streamed answer bigger than
 	// this service relays, or one that found no large-body slot free.
 	// Streaming helps only a long text answer, whose events are small; a
 	// picture streams as one event under the same slot and bound, so the
 	// remedy for an image is a smaller or fewer one.
 	errChatResponseTooLarge = apiError{http.StatusBadGateway, "server_error", "upstream_response_too_large",
-		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 긴 텍스트 응답이면 stream으로 받거나 최대 출력 길이(max_tokens)를 줄이고, 이미지 생성이면 해상도나 개수를 줄여주세요."}
+		"모델 서버 응답이 허용 크기를 넘었거나 큰 응답을 처리할 자리가 없어요. 긴 텍스트는 stream으로 받거나 최대 출력 길이(max_tokens)를 줄여 주세요. 이미지는 해상도나 개수를 줄여 주세요."}
 	errServerBusy = apiError{http.StatusServiceUnavailable, "server_error", "server_busy",
-		"요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요."}
+		"요청이 많아 처리할 수 없어요. 잠시 후 다시 시도해 주세요."}
 	errRequestTooLarge = apiError{http.StatusBadRequest, "invalid_request_error", "request_too_large",
-		"요청 본문이 허용 크기를 초과했습니다."}
+		"요청 본문이 허용 크기를 넘었어요."}
 	errInputTooLong = apiError{http.StatusBadRequest, "invalid_request_error", "input_too_long",
-		"입력이 모델의 최대 입력 길이를 초과했습니다."}
+		"입력이 모델의 최대 입력 길이를 넘었어요."}
 	// The upload stopped before the declared body arrived. Distinct from a
 	// malformed body: nothing the caller sent was wrong, it was cut off.
 	errRequestBodyUnreadable = apiError{http.StatusBadRequest, "invalid_request_error", "request_body_incomplete",
-		"요청 본문을 끝까지 받지 못했습니다. 다시 보내주세요."}
+		"요청 본문을 끝까지 받지 못했어요. 다시 보내 주세요."}
 	errBadJSON = apiError{http.StatusBadRequest, "invalid_request_error", "invalid_json",
-		"요청 본문이 올바른 JSON이 아닙니다."}
+		"요청 본문이 올바른 JSON이 아니에요."}
 	errUpstreamRejected = apiError{http.StatusBadRequest, "invalid_request_error", "upstream_rejected",
-		"모델 서버가 요청을 거부했습니다. 요청 파라미터를 확인해주세요."}
+		"모델 서버가 요청을 거부했어요. 요청 파라미터를 확인해 주세요."}
 	errUpstream = apiError{http.StatusBadGateway, "server_error", "upstream_error",
-		"모델 서버 호출에 실패했습니다. 잠시 후 다시 시도해주세요."}
+		"모델 서버 호출에 실패했어요. 잠시 후 다시 시도해 주세요."}
 	errUpstreamTimeout = apiError{http.StatusGatewayTimeout, "server_error", "upstream_timeout",
-		"모델 서버 응답이 제한 시간을 초과했습니다. 잠시 후 다시 시도해주세요."}
+		"모델 서버 응답이 제한 시간을 넘었어요. 잠시 후 다시 시도해 주세요."}
 	// The response cap, said out loud. io.LimitReader truncates silently, so
 	// without this the caller gets "the upstream sent something unparseable" —
 	// a server fault they cannot act on — for a response that was simply
@@ -120,19 +120,19 @@ var (
 	// The remedy is theirs, so it is named.
 	errPassthroughResponseTooLarge = apiError{http.StatusBadGateway, "server_error",
 		"upstream_response_too_large",
-		"모델 서버 응답이 중계 가능한 크기를 넘었거나 지금 큰 응답을 처리할 자리가 없습니다. 한 번에 만드는 개수(n)나 요청한 크기를 줄여주세요."}
+		"모델 서버 응답이 허용 크기를 넘었거나 큰 응답을 처리할 자리가 없어요. 한 번에 만드는 개수(n)나 요청한 크기를 줄여 주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
-		"지원하지 않는 경로입니다. 지원 범위는 GET /v1/models, POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, " +
-			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions입니다."}
+		"지원하지 않는 경로예요. 지원 경로: GET /v1/models, POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, " +
+			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions."}
 	// Every self-hosted agent place on the upstream is taken and the short
 	// wait for one ran out. 429 with a Retry-After: waiting is the remedy.
 	errAgentBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "agent_busy",
-		"자체 서빙 모델에서 동시에 처리하는 에이전트 요청이 모두 차 있습니다. 잠시 후 다시 시도해주세요."}
+		"자체 서빙 모델에서 동시에 처리하는 에이전트 요청이 모두 차 있어요. 잠시 후 다시 시도해 주세요."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
-		"지원하지 않는 HTTP 메서드입니다."}
+		"지원하지 않는 HTTP 메서드예요."}
 	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",
 		"streaming_not_supported",
-		"이 경로는 스트리밍을 지원하지 않습니다. stream을 빼고 요청해주세요."}
+		"이 경로는 stream: true를 지원하지 않아요. stream을 빼거나 false로 보내 주세요."}
 )
 
 // retryAfterSeconds is the Retry-After each error carries, keyed by the code
@@ -181,7 +181,7 @@ var (
 func errAgentInputTooLong(tokens, limit int) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "input_too_long",
 		fmt.Sprintf("prompt is too long: %d tokens > %d maximum. ", tokens, limit) +
-			"자체 서빙 모델의 에이전트 요청 입력 한도를 넘었습니다. 대화를 압축(/compact)하거나 새 대화를 시작한 뒤 다시 시도해주세요."}
+			"자체 서빙 모델의 에이전트 요청 입력 한도를 넘었어요. 대화를 압축(/compact)하거나 새 대화를 시작한 뒤 다시 시도해 주세요."}
 }
 
 // The same public code as an outright unknown field, because to an SDK the
@@ -189,8 +189,8 @@ func errAgentInputTooLong(tokens, limit int) apiError {
 // what the caller can do about it, and that belongs in the message.
 func errParamNeedsCreditModel(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
-		"자체 서빙 모델은 이 파라미터를 지원하지 않습니다: " + name +
-			". 유료 모델에서만 사용할 수 있습니다."}
+		"요청한 모델에서는 이 파라미터를 쓸 수 없어요: " + name +
+			". 지원하는 유료 모델을 확인해 주세요."}
 }
 
 // A model named by one of the vendor's server tools. Same public code and same
@@ -203,12 +203,12 @@ func errToolModelNotAllowed(name string) apiError {
 	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-			"이 API Key로는 tools가 지정한 모델을 사용할 수 없습니다. " +
-				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+			"이 API 키로는 tools가 지정한 모델을 사용할 수 없어요. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 	}
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key로는 tools가 지정한 " + name + "을(를) 사용할 수 없습니다. " +
-			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+		"이 API 키로는 tools가 지정한 " + name + " 모델을 쓸 수 없어요. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 }
 
 // A server tool left without a model on a fenced key. The vendor would pick one
@@ -216,9 +216,9 @@ func errToolModelNotAllowed(name string) apiError {
 // are constants from the fence's own table, never the request's spelling.
 func errToolModelRequired(toolType, param string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 tools의 " + toolType +
-			"에 " + param + "을(를) 직접 지정해야 합니다. " +
-			"지정하지 않으면 요청 밖에서 모델이 정해져 허용 여부를 판단할 수 없기 때문입니다."}
+		"이 API 키에 허용된 모델이 정해져 있어요. tools의 " + toolType +
+			" 설정에 " + param + " 값을 직접 지정해 주세요. " +
+			"모델을 미리 알 수 없어 이 키로 쓸 수 있는지 확인할 수 없어요."}
 }
 
 // A model named by a `plugins` entry. Same rule and code as the tools refusal;
@@ -229,28 +229,28 @@ func errPluginModelNotAllowed(name string) apiError {
 	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-			"이 API Key로는 plugins가 지정한 모델을 사용할 수 없습니다. " +
-				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+			"이 API 키로는 plugins가 지정한 모델을 사용할 수 없어요. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 	}
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key로는 plugins가 지정한 " + name + "을(를) 사용할 수 없습니다. " +
-			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+		"이 API 키로는 plugins가 지정한 " + name + " 모델을 쓸 수 없어요. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 }
 
 // A router plugin on a fenced key. Like the router name, the remedy is to name
 // a model. The id echoed is the canonical one, not the caller's spelling.
 func errRouterPluginNotAllowed(id string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key에는 사용할 수 있는 모델이 정해져 있어 plugins의 " + id + " 설정을 쓸 수 없습니다. " +
-			"어떤 모델이 답할지 미리 알 수 없어 허용 여부를 판단할 수 없기 때문입니다. " +
-			"모델 이름을 직접 지정해주세요."}
+		"이 API 키에는 사용할 수 있는 모델이 정해져 있어 plugins의 " + id + " 설정을 쓸 수 없어요. " +
+			"모델을 미리 알 수 없어 허용 여부를 확인할 수 없어요. " +
+			"모델 이름을 직접 지정해 주세요."}
 }
 
 // The fusion plugin's preset or an empty panel on a fenced key: either leaves
 // the panel to the vendor's side, out of the fence's sight.
 var errFusionPluginNeedsModels = apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-	"이 API Key에는 사용할 수 있는 모델이 정해져 있어 plugins의 fusion에 preset이나 빈 analysis_models를 쓸 수 없습니다. " +
-		"model과 analysis_models를 직접 지정해주세요."}
+	"이 API 키에는 사용할 수 있는 모델이 정해져 있어 plugins의 fusion에 preset이나 빈 analysis_models를 쓸 수 없어요. " +
+		"model과 analysis_models를 직접 지정해 주세요."}
 
 // toolRefusalType names the tools refusal in the usage record. It reuses the
 // existing types rather than adding one: the contract already enumerates these,
@@ -272,7 +272,7 @@ func toolRefusalType(e apiError) string {
 // account rather than the caller's.
 var errPresetNotAllowed = apiError{http.StatusBadRequest, "invalid_request_error",
 	"preset_not_supported",
-	"이 게이트웨이는 preset을 지원하지 않습니다. 모델 이름을 직접 지정해주세요."}
+	"이 게이트웨이는 preset을 지원하지 않아요. 모델 이름을 직접 지정해 주세요."}
 
 // A router name, refused for every key like a preset: the vendor's routers are
 // its own feature, not one of the general model APIs. The generic refusal is
@@ -283,8 +283,8 @@ var errPresetNotAllowed = apiError{http.StatusBadRequest, "invalid_request_error
 // own refusal, which says where the name was.
 func errRouterModelNotSupported(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "router_not_supported",
-		"자동 선택 모델(" + name + ")은 지원하지 않습니다. " +
-			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해주세요."}
+		"자동 선택 모델(" + name + ")은 지원하지 않아요. " +
+			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해 주세요."}
 }
 
 // routerInField is a field refusal for a router name. It keeps the field's
@@ -296,8 +296,8 @@ func routerInField(field, name string) (apiError, bool) {
 		return apiError{}, false
 	}
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		field + "자동 선택 모델(" + name + ")은 지원하지 않습니다. " +
-			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해주세요."}, true
+		field + "자동 선택 모델(" + name + ")은 지원하지 않아요. " +
+			"일반적인 LLM API가 제공하는 모델 이름을 직접 지정해 주세요."}, true
 }
 
 // A fallback candidate the key may not be billed for. It names the entry
@@ -311,12 +311,12 @@ func errCandidateModelNotAllowed(name string) apiError {
 	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-			"이 API Key로는 대체 모델 목록(models)에 적힌 모델을 사용할 수 없습니다. " +
-				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+			"이 API 키로는 대체 모델 목록(models)에 적힌 모델을 사용할 수 없어요. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 	}
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key로는 대체 모델 목록(models)의 " + name + "을(를) 사용할 수 없습니다. " +
-			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+		"이 API 키로는 대체 모델 목록(models)의 " + name + " 모델을 쓸 수 없어요. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 }
 
 // The same refusal for the Messages surface's own fallback list, named the
@@ -327,12 +327,12 @@ func errFallbackModelNotAllowed(name string) apiError {
 	}
 	if name == "" || len(name) > maxPassthroughNameBytes {
 		return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-			"이 API Key로는 대체 모델 목록(fallbacks)에 적힌 모델을 사용할 수 없습니다. " +
-				"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+			"이 API 키로는 대체 모델 목록(fallbacks)에 적힌 모델을 사용할 수 없어요. " +
+				"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 	}
 	return apiError{http.StatusForbidden, "permission_error", "model_not_allowed",
-		"이 API Key로는 대체 모델 목록(fallbacks)의 " + name + "을(를) 사용할 수 없습니다. " +
-			"콘솔의 키 상세에서 허용된 모델을 확인해주세요."}
+		"이 API 키로는 대체 모델 목록(fallbacks)의 " + name + " 모델을 쓸 수 없어요. " +
+			"콘솔의 키 상세에서 허용된 모델을 확인해 주세요."}
 }
 
 // errOutputTooLong names the field and the model's cap, which is the only
@@ -340,31 +340,31 @@ func errFallbackModelNotAllowed(name string) apiError {
 // default output length gets this on every request until the value is lowered.
 func errOutputTooLong(field string, max int) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "output_limit_exceeded",
-		"요청한 최대 출력 길이가 모델의 허용치를 초과했습니다. " + field + " 값을 " +
-			strconv.Itoa(max) + " 이하로 지정해주세요."}
+		"요청한 최대 출력 길이가 모델의 허용치를 넘었어요. " + field + " 값을 " +
+			strconv.Itoa(max) + " 이하로 지정해 주세요."}
 }
 
 func errUnsupportedParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
-		"지원하지 않는 파라미터입니다: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해주세요."}
+		"지원하지 않는 파라미터예요: " + name + ". 지원 파라미터는 이용 안내 문서를 확인해 주세요."}
 }
 
 // A field this route recognises but cannot honour, with the advice that fits
 // it. Same public code as an unknown field: to an SDK the fact is the same.
 func errUnsupportedValue(name, advice string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
-		"지원하지 않는 파라미터입니다: " + name + ". " + advice}
+		"지원하지 않는 파라미터예요: " + name + ". " + advice}
 }
 
 // errMalformedForm answers a multipart body that cannot be read as a form of
 // named parts. It names the shape rather than a field, because no field is at
 // fault: the caller's client sent something that is not a form.
 var errMalformedForm = apiError{http.StatusBadRequest, "invalid_request_error", "invalid_multipart_form",
-	"multipart 본문을 읽을 수 없습니다. 음성 파일은 file 파트 하나로, 나머지 값은 이름이 있는 텍스트 파트로 보내주세요."}
+	"multipart 본문을 읽을 수 없어요. 음성 파일은 file 파트 하나로, 나머지 값은 이름이 있는 텍스트 파트로 보내 주세요."}
 
 func errInvalidParamValue(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "invalid_parameter_value",
-		"파라미터 값이 올바르지 않습니다: " + name}
+		"파라미터 값이 올바르지 않아요: " + name}
 }
 
 // The endpoint fence. 403 with a code of its own rather than a 404,
@@ -382,8 +382,8 @@ func errInvalidParamValue(name string) apiError {
 // that only said no would leave them with nowhere to go.
 func errEndpointNotAllowed(label string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
-		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
-			"콘솔에서 이 기능을 신청하면 승인 후 사용할 수 있습니다."}
+		"이 API 키에는 " + label + " 기능이 허용되어 있지 않아요. " +
+			"필요하면 콘솔에서 이 기능을 신청하고 승인 결과를 확인해 주세요."}
 }
 
 // errContainerToolNotAllowed refuses a server tool that runs in a container.
@@ -395,9 +395,9 @@ func errEndpointNotAllowed(label string) apiError {
 // errEndpointNotAllowed.
 func errContainerToolNotAllowed(label string) apiError {
 	return apiError{http.StatusForbidden, "permission_error", "endpoint_not_allowed",
-		"이 API Key에는 " + label + " 기능이 허용되어 있지 않습니다. " +
-			"모델이 샌드박스에서 명령이나 코드를 실행하는 서버 도구(shell, bash, local_shell, code_interpreter)는 아직 신청할 수 없는 기능입니다. " +
-			"요청에서 이 도구를 빼고 다시 보내주세요."}
+		"이 API 키에는 " + label + " 기능이 허용되어 있지 않아요. " +
+			"모델이 샌드박스에서 명령이나 코드를 실행하는 서버 도구(shell, bash, local_shell, code_interpreter)는 아직 신청할 수 없는 기능이에요. " +
+			"요청에서 이 도구를 빼고 다시 보내 주세요."}
 }
 
 // errUnsupportedServerTool refuses a tool in the vendor's own namespace that
@@ -405,17 +405,17 @@ func errContainerToolNotAllowed(label string) apiError {
 // an SDK the fact is the same. The canonical name is echoed only when it is
 // short enough to be a real tool name; it is client input.
 func errUnsupportedServerTool(toolType string) apiError {
-	msg := "지원하지 않는 서버 도구입니다"
+	msg := "지원하지 않는 서버 도구예요"
 	if len(toolType) <= maxPassthroughNameBytes {
 		msg += ": " + toolType
 	}
 	return apiError{http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
-		msg + ". 이 서비스는 일반적인 LLM API가 제공하는 도구만 지원합니다. 요청에서 이 도구를 빼고 다시 보내주세요."}
+		msg + ". 요청에서 이 도구를 빼고 다시 보내 주세요."}
 }
 
 func errMissingParam(name string) apiError {
 	return apiError{http.StatusBadRequest, "invalid_request_error", "missing_parameter",
-		"필수 파라미터가 없습니다: " + name}
+		"필수 파라미터가 없어요: " + name}
 }
 
 func writeAPIError(w http.ResponseWriter, e apiError) {

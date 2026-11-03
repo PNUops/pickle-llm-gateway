@@ -94,10 +94,10 @@ var statefulFields = []struct {
 	isFlag bool
 	advice string
 }{
-	{"store", true, "이 서비스는 응답을 서버에 저장하지 않습니다. store를 빼거나 false로 보내고, 이전 대화는 input에 모두 담아 보내주세요."},
-	{"previous_response_id", false, "이 서비스는 응답을 서버에 저장하지 않아 이전 응답을 이어 쓸 수 없습니다. 이전 대화를 input에 모두 담아 보내주세요."},
-	{"conversation", false, "이 서비스는 대화를 서버에 저장하지 않습니다. 이전 대화를 input에 모두 담아 보내주세요."},
-	{"background", true, "백그라운드 실행은 응답을 서버에 저장해야 해서 지원하지 않습니다. background를 빼거나 false로 보내주세요."},
+	{"store", true, "이 경로는 응답을 서버에 저장하지 않아요. store를 빼거나 false로 보내고, 이전 대화는 input에 모두 담아 보내 주세요."},
+	{"previous_response_id", false, "이 경로는 응답을 서버에 저장하지 않아 이전 응답을 이어 쓸 수 없어요. 이전 대화를 input에 모두 담아 보내 주세요."},
+	{"conversation", false, "이 경로는 대화를 서버에 저장하지 않아요. 이전 대화를 input에 모두 담아 보내 주세요."},
+	{"background", true, "백그라운드 실행은 응답을 서버에 저장해야 해서 지원하지 않아요. background를 빼거나 false로 보내 주세요."},
 }
 
 // parseResponses reads the model and the input, the two fields the vendor

@@ -194,7 +194,7 @@ func jsonBoolOrNull(raw json.RawMessage) bool {
 
 func invalidMessagesTokenTool(field string) *apiError {
 	e := errInvalidParamValue(field)
-	e.message = field + "에는 클라이언트가 실행하는 도구(name, description, input_schema)와 올바른 도구 선택만 사용할 수 있습니다. 서버 도구나 확장 필드를 제거하고 도구 정의를 확인해주세요."
+	e.message = field + "에는 클라이언트가 실행하는 도구(name, description, input_schema)와 올바른 도구 선택만 사용할 수 있어요. 서버 도구나 확장 필드를 제거하고 도구 정의를 확인해 주세요."
 	return &e
 }
 

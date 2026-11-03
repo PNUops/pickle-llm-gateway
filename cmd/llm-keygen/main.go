@@ -59,7 +59,7 @@ func main() {
 			if err := revokeKey(*snapPath, *revoke); err != nil {
 				fatal(err)
 			}
-			fmt.Printf("%s를 폐기했습니다. 게이트웨이는 다음 폴링에서 반영합니다: %s\n", *revoke, *snapPath)
+			fmt.Printf("키 폐기를 스냅샷에 기록했어요: %s\n파일: %s\n파일 폴링 모드의 게이트웨이에서 반영 상태를 확인해 주세요.\n", *revoke, *snapPath)
 			return
 		}
 		on, err := parseSwitch(*serviceEnabled)
@@ -69,11 +69,11 @@ func main() {
 		if err := setService(*snapPath, on); err != nil {
 			fatal(err)
 		}
-		state := "점검 모드로 전환했습니다(모든 요청 거부)"
+		state := "점검 모드를 스냅샷에 기록했어요(모든 요청 거부)."
 		if on {
-			state = "정상 운영으로 되돌렸습니다"
+			state = "점검 해제를 스냅샷에 기록했어요."
 		}
-		fmt.Printf("%s 게이트웨이는 다음 폴링에서 반영합니다: %s\n", state, *snapPath)
+		fmt.Printf("%s\n파일: %s\n파일 폴링 모드의 게이트웨이에서 반영 상태를 확인해 주세요.\n", state, *snapPath)
 		return
 	}
 
@@ -114,10 +114,10 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("API Key (지금 한 번만 표시됩니다. 분실하면 재발급하세요):\n%s\n\n", token)
+	fmt.Printf("API Key (지금 한 번만 보여요. 복사해서 안전하게 보관해 주세요):\n%s\n\n", token)
 	fmt.Printf("keyId: %s\n", keyID)
 	if *snapPath != "" {
-		fmt.Printf("스냅샷에 추가되었습니다: %s\n", *snapPath)
+		fmt.Printf("스냅샷에 추가되었어요: %s\n", *snapPath)
 	} else {
 		fmt.Printf("스냅샷 keys 배열에 추가할 항목:\n%s\n", entryJSON)
 	}
