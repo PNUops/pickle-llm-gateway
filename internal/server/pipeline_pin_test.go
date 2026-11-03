@@ -106,7 +106,7 @@ func TestChatStreamErrorEventBytes(t *testing.T) {
 	h.srv.client = streamFrom(`data: {"model":"` + upstreamModel + `","choices":[{"index":0,"delta":{"content":"partial"}}]}` + "\n\n")
 	_, body := h.chat(t, testToken, streamRequest)
 	want := `data: {"choices":[{"delta":{"content":"partial"},"index":0}],"model":"pickle-general"}` + "\n\n" +
-		`data: {"error":{"message":"모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.","type":"server_error","code":"upstream_stream_interrupted"}}` + "\n\n" +
+		`data: {"error":{"message":"모델 서버 응답이 중간에 끊겼어요. 응답이 불완전할 수 있어요.","type":"server_error","code":"upstream_stream_interrupted"}}` + "\n\n" +
 		"data: [DONE]\n\n"
 	if string(body) != want {
 		t.Fatalf("stream bytes changed:\n got %q\nwant %q", body, want)

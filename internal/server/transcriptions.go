@@ -226,7 +226,7 @@ func refuseOpenAITranscriptionFields(params map[string]json.RawMessage) *apiErro
 		}
 		if !transcriptionFormats[format] {
 			e := errUnsupportedValue("response_format",
-				"이 경로는 json과 verbose_json만 돌려줍니다. response_format을 빼거나 json, verbose_json으로 보내주세요. 자막 형식은 verbose_json의 segments로 만들 수 있습니다.")
+				"이 경로는 json과 verbose_json만 돌려줘요. response_format을 빼거나 json, verbose_json으로 보내 주세요. 자막 형식은 verbose_json의 segments로 만들 수 있어요.")
 			return &e
 		}
 	}

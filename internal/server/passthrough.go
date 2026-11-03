@@ -1049,17 +1049,17 @@ func refuseOpenAIImageFields(params map[string]json.RawMessage) *apiError {
 		}
 		if format != "b64_json" {
 			e := errUnsupportedValue("response_format",
-				"이 경로는 이미지를 b64_json으로만 돌려줍니다. response_format을 빼거나 b64_json으로 보내주세요.")
+				"이 경로는 이미지를 b64_json으로만 돌려줘요. response_format을 빼거나 b64_json으로 보내 주세요.")
 			return &e
 		}
 	}
 	if _, ok := present("style"); ok {
-		e := errUnsupportedValue("style", "style은 지원하지 않습니다. 원하는 스타일은 prompt에 적어주세요.")
+		e := errUnsupportedValue("style", "style은 지원하지 않아요. 원하는 스타일은 prompt에 적어 주세요.")
 		return &e
 	}
 	if _, ok := present("moderation"); ok {
 		e := errUnsupportedValue("moderation",
-			"moderation은 이 위치에서 지원하지 않습니다. OpenAI 모델이면 provider.options.openai.moderation으로 보내주세요.")
+			"moderation은 이 위치에서 지원하지 않아요. OpenAI 모델이면 provider.options.openai.moderation으로 보내 주세요.")
 		return &e
 	}
 	return nil
@@ -1126,7 +1126,7 @@ func refuseOpenAISpeechFields(params map[string]json.RawMessage) *apiError {
 		}
 		if !speechFormats[format] {
 			e := errUnsupportedValue("response_format",
-				"이 경로는 mp3와 pcm만 만듭니다. response_format을 mp3나 pcm으로 보내주세요. 빼면 pcm(24kHz 16비트 모노, 헤더 없음)입니다.")
+				"response_format은 mp3나 pcm으로 보내 주세요. 생략하면 pcm(24kHz 16비트 모노, 헤더 없음)으로 응답해요.")
 			return &e
 		}
 	}
@@ -1138,13 +1138,13 @@ func refuseOpenAISpeechFields(params map[string]json.RawMessage) *apiError {
 		}
 		if format != "audio" {
 			e := errUnsupportedValue("stream_format",
-				"이 경로는 음성 파일을 한 번에 돌려주며 스트리밍(sse)은 지원하지 않습니다. stream_format을 빼거나 audio로 보내주세요.")
+				"이 경로는 음성 파일을 한 번에 돌려주며 스트리밍(sse)은 지원하지 않아요. stream_format을 빼거나 audio로 보내 주세요.")
 			return &e
 		}
 	}
 	if _, ok := present("input_references"); ok {
 		e := errUnsupportedValue("input_references",
-			"참조 음성으로 목소리를 만드는 기능(음성 복제)은 지원하지 않습니다. input_references를 빼고 voice로 목소리를 골라주세요.")
+			"참조 음성으로 목소리를 만드는 기능(음성 복제)은 지원하지 않아요. input_references를 빼고 voice로 목소리를 골라 주세요.")
 		return &e
 	}
 	return nil

@@ -284,7 +284,7 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		// The gateway's own duration cap, not an upstream fault.
 		ev.Status = spool.StatusTimeout
 		ev.ErrorType = "request_deadline_exceeded"
-		writeRaw(x.errorEvent("request_deadline_exceeded", "요청 전체 시간 상한을 초과해 스트림을 종료했습니다."))
+		writeRaw(x.errorEvent("request_deadline_exceeded", "요청 전체 제한 시간을 넘어 스트림을 종료했어요."))
 	case errors.Is(readErr, errResponseOverCap):
 		// This service's own relay bound, not an upstream fault, and the
 		// caller can act on it, so it is named rather than reported as an
@@ -293,11 +293,11 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = errPassthroughResponseTooLarge.code
 		writeRaw(x.errorEvent(errPassthroughResponseTooLarge.code,
-			"모델 서버 응답의 이벤트 하나가 중계 가능한 크기를 넘어 스트림을 종료했습니다. 응답이 불완전합니다."))
+			"모델 서버 응답의 이벤트 하나가 허용 크기를 넘어 스트림을 종료했어요. 응답이 불완전해요."))
 	case readErr != nil:
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_interrupted"
-		writeRaw(x.errorEvent("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다."))
+		writeRaw(x.errorEvent("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼어요. 응답이 불완전할 수 있어요."))
 	case !x.done() && !res.upstreamError:
 		// The connection closed cleanly but the upstream never said it was
 		// done, so the answer may stop mid-sentence. To the caller this is the
@@ -307,7 +307,7 @@ func (s *Server) relayStream(w http.ResponseWriter, resp *http.Response, x strea
 		// the more specific cause.
 		ev.Status = spool.StatusUpstreamErr
 		ev.ErrorType = "upstream_stream_unterminated"
-		writeRaw(x.errorEvent("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다."))
+		writeRaw(x.errorEvent("upstream_stream_interrupted", "모델 서버 응답이 중간에 끊겼어요. 응답이 불완전할 수 있어요."))
 	case res.dropped > 0:
 		// The stream reached its end, but some chunks could not be forwarded,
 		// so the answer the student received is incomplete. The upstream's

@@ -160,10 +160,10 @@ func TestResponsesRefusesStoredState(t *testing.T) {
 	h, v := responsesHarness(t, nil)
 	for _, c := range []struct{ field, value, advice string }{
 		{"store", "true", "input에 모두 담아"},
-		{"previous_response_id", `"resp_123"`, "이전 응답을 이어 쓸 수 없습니다"},
-		{"previous_response_id", `""`, "이전 응답을 이어 쓸 수 없습니다"},
-		{"conversation", `"conv_1"`, "대화를 서버에 저장하지 않습니다"},
-		{"conversation", `{"id":"conv_1"}`, "대화를 서버에 저장하지 않습니다"},
+		{"previous_response_id", `"resp_123"`, "이전 응답을 이어 쓸 수 없어요"},
+		{"previous_response_id", `""`, "이전 응답을 이어 쓸 수 없어요"},
+		{"conversation", `"conv_1"`, "대화를 서버에 저장하지 않아요"},
+		{"conversation", `{"id":"conv_1"}`, "대화를 서버에 저장하지 않아요"},
 		{"background", "true", "background를 빼거나"},
 	} {
 		status, body, _ := sendResponses(t, h, nil, responsesWith("vendor-model", c.field, c.value))
