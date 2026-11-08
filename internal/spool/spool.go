@@ -97,6 +97,26 @@ type Event struct {
 	// upstream's response headers arrive and so is present on non-streaming
 	// requests too.
 	Streamed bool `json:"streamed,omitempty"`
+	// Object is set on a submit the vendor accepted on an async route (a
+	// batch, a video), whether or not the synchronous ownership bind
+	// succeeded. The api binds the intent from it when the bind did not land,
+	// and recreates the row from it when a database restore lost it, which is
+	// why it travels on every accepted submit and not only after a failure.
+	Object *ObjectRef `json:"object,omitempty"`
+}
+
+// ObjectRef names the async object a submit created and the intent it was
+// recorded under.
+type ObjectRef struct {
+	Kind     string `json:"kind"`
+	IntentID string `json:"intentId,omitempty"`
+	ObjectID string `json:"objectId"`
+	// Compensated is true when the gateway undid the submit after a failed
+	// bind, so the api records the row as released rather than owned.
+	Compensated bool `json:"compensated"`
+	// ExpiresAt is the vendor-stated end of the object's life, when it has
+	// one, in RFC 3339.
+	ExpiresAt string `json:"expiresAt,omitempty"`
 }
 
 // Route names. An open vocabulary: the control plane stores one it does not
@@ -112,6 +132,13 @@ const (
 	EndpointMessages       = "messages"
 	EndpointResponses      = "responses"
 	EndpointCompletions    = "completions"
+	// EndpointBatches is a batch submit. The status and result reads, the
+	// delete and the list are EndpointBatchReads, so polling a batch does not
+	// read as using the capability, and a completed batch's price is recorded
+	// once, as EndpointBatchCost.
+	EndpointBatches    = "batches"
+	EndpointBatchReads = "batches_read"
+	EndpointBatchCost  = "batches_cost"
 )
 
 // costLiteralMax bounds the marshaled price. A real one is a handful of

@@ -217,6 +217,7 @@ var endpointNames = map[string]string{
 	snapshot.EndpointSpeech:         "TTS",
 	snapshot.EndpointTranscriptions: "STT",
 	snapshot.EndpointContainers:     "코드 실행",
+	snapshot.EndpointBatches:        "배치",
 }
 
 // endpointLabel renders one capability for a message. A token with no name

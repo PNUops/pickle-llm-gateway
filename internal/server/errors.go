@@ -123,7 +123,20 @@ var (
 		"모델 서버 응답이 허용 크기를 넘었거나 큰 응답을 처리할 자리가 없어요. 한 번에 만드는 개수(n)나 요청한 크기를 줄여 주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
 		"지원하지 않는 경로예요. 지원 경로: GET /v1/models, POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, " +
-			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions."}
+			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions, " +
+			"POST /v1/batches, GET /v1/batches, GET /v1/batches/{id}, DELETE /v1/batches/{id}."}
+	// The ownership ledger could not be asked, so a request that names or
+	// creates an async object cannot be decided. Only those requests stop;
+	// everything else keeps serving. Waiting is the remedy.
+	errOwnershipUnavailable = apiError{http.StatusServiceUnavailable, "server_error",
+		"ownership_unavailable",
+		"작업 소유 기록을 확인할 수 없어요. 잠시 후 다시 시도해 주세요."}
+	// Another key's object and no object at all get the same answer, so the
+	// answer cannot be used to find out what other keys have made.
+	errObjectNotFound = apiError{http.StatusNotFound, "invalid_request_error", "object_not_found",
+		"요청한 작업을 찾을 수 없어요. 이 API 키로 만든 작업의 id인지 확인해 주세요."}
+	errBatchNotFinished = apiError{http.StatusConflict, "invalid_request_error", "batch_not_finished",
+		"아직 끝나지 않은 배치는 지울 수 없어요. 배치가 끝난 뒤 다시 시도해 주세요."}
 	// Every self-hosted agent place on the upstream is taken and the short
 	// wait for one ran out. 429 with a Retry-After: waiting is the remedy.
 	errAgentBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "agent_busy",
@@ -165,6 +178,9 @@ var retryAfterSeconds = map[string]int{
 	// A self-hosted agent turn holds its place through its whole answer,
 	// seconds to minutes; this is the retry pace after the queue wait.
 	"agent_busy": 10,
+	// The api answers again within seconds of a restart, and a cache miss is
+	// all that waits on it.
+	"ownership_unavailable": 5,
 }
 
 // Internal sentinels for upstream failure reasons. They never reach a client;

@@ -361,6 +361,10 @@ type attemptSpec struct {
 	// name forwarded is already the caller's own.
 	upstreamModel string
 	publicModel   string
+	// pass names statuses besides 200 that come back as a response for the
+	// caller to read rather than being classified here: an async submit's
+	// 201 or 202, and the 404, 409 and 410 an object route acts on itself.
+	pass map[int]bool
 }
 
 // attemptFor is the shape of one call on a surface for a model. Client
@@ -448,7 +452,7 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		}
 		return nil, &attemptError{err: err, timeout: timedOut, kind: kind}
 	}
-	if resp.StatusCode == http.StatusOK {
+	if resp.StatusCode == http.StatusOK || spec.pass[resp.StatusCode] {
 		return resp, nil
 	}
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, rejectionReadLimit))

@@ -36,6 +36,7 @@ llm-gateway ── 키 검증 · 한도 적용 · 모델명 변환 · 사용량 
 | `POST /v1/rerank` | 리랭크 (`rerank`) |
 | `POST /v1/audio/speech` | TTS (`speech`) |
 | `POST /v1/audio/transcriptions` | STT (`transcriptions`) |
+| `POST /v1/batches`, `GET /v1/batches`, `GET /v1/batches/{id}`, `DELETE /v1/batches/{id}` | 배치 (`batches`)와 배치가 보내는 경로의 기능 |
 
 `POST /v1/rerank`는 OpenAI나 Anthropic이 아니라 Cohere, Voyage 같은 API의 리랭크 호출이에요. 질의와 문서 목록을 받아
 관련도 순서를 돌려줘요. 사용량은 응답의 `usage`에서 읽되 업스트림 문서상 선택 필드이고, 모델에 따라 토큰 수
@@ -506,6 +507,7 @@ Key의 `passthroughEndpoints`는 그 Key의 **기능 권한**이에요. 값은 �
 | `rerank` | `POST /v1/rerank` |
 | `transcriptions` | `POST /v1/audio/transcriptions` |
 | `speech` | `POST /v1/audio/speech`, 그리고 유료 모델 채팅의 음성 출력(`modalities`에 `audio`). 음성 입력은 판정하지 않아요 |
+| `batches` | `POST /v1/batches`(제출), `GET /v1/batches`(목록), `GET /v1/batches/{id}`(상태와 결과), `DELETE /v1/batches/{id}`(끝난 배치 삭제). 배치가 보내는 경로의 기능(`chat`이나 `embeddings`)도 함께 있어야 해요 |
 | `containers` | 유료 모델 채팅의 샌드박스 명령과 코드 실행. `openrouter:shell` 도구와 그 다른 철자(`shell`, `shell_<날짜>`, `local_shell`), `openrouter:bash` 도구와 날짜 없는 `bash`, `code_interpreter`. **아직 부여하지 않아요** |
 
 채팅 안의 기능은 **그 기능만을 뜻하는 필드로만** 판정해요. 그 기능을 쓸 수도 있었던 요청은
@@ -665,7 +667,24 @@ workspace 단위로 묶으므로, 어느 Key가 만든 객체인지는 관리 AP
 (실패하면 벤더를 부르지 않아요), 벤더가 받은 뒤 객체 id를 붙이고, 조회 전에 그 Key의 것인지
 물어요. 확인된 소유만 5분 동안 기억하고 「소유 아님」은 기억하지 않아요. 관리 API에 묻지
 못하면 그 객체를 다루는 요청만 503이고, 객체를 다루지 않는 다른 경로는 지금처럼 관리 API 없이
-동작해요. 아직 이 패키지를 쓰는 경로는 없어요.
+동작해요. 이 패키지를 쓰는 경로는 배치예요.
+
+배치는 요청을 본문의 `requests[]`에 직접 담고 결과도 배치 객체에 담겨 오므로 파일 업로드가 필요
+없어요. 한 배치는 대상 경로(`endpoint`) 하나와 모델 하나를 써요. 대상 경로는
+`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/embeddings` 넷이고, 제출 때 모델 허용
+목록을 배치의 `model`에, 각 `requests[].body`에는 그 경로를 따로 부를 때와 같은 판정을 적용해요.
+본문이 `model`을 적으면 배치의 `model`과 같아야 하고 `stream: true`는 거절해요.
+`callback_url`은 받지 않아요. 결과는 `GET /v1/batches/{id}`로 확인해요.
+
+- 제출 전에 소유 의도를 기록하고 벤더가 받은 뒤 배치 id를 붙여요. 벤더에 취소 경로가 없어서,
+  id를 붙이지 못해도 제출은 성공으로 답하고 사용량 이벤트의 `object` 멤버로 늦게 붙여요.
+- 다른 Key의 배치와 없는 배치는 똑같이 404 `object_not_found`예요.
+- 목록은 workspace 전체 목록에서 이 Key의 배치만 남겨요. 다음 페이지 표지(`after`, `last_id`)는
+  언제나 이 Key의 배치 id이고, 이 Key의 것이 아닌 `after`는 400이에요.
+- 금액은 배치가 끝난 뒤 조회한 응답의 `usage.cost`로 한 번 기록해요. 여러 번 조회해도 이벤트 id가
+  배치 id에서 나와 관리 API가 하나로 남겨요. 사용량 기록의 경로 이름은 제출 `batches`, 조회와 삭제와
+  목록 `batches_read`, 금액 `batches_cost`예요.
+- 관리 API 연결(`LLMGW_CONTROL_BASE_URL`, `LLMGW_CONTROL_TOKEN`)이 없으면 배치 경로는 503이에요.
 
 오류 응답은 OpenAI와 같은 형식이며 메시지는 한국어예요. 업스트림 오류의 본문과 주소는
 외부 응답에 싣지 않아요.
@@ -755,6 +774,8 @@ go run ./cmd/llm-gateway
 | `LLMGW_CONTROL_BASE_URL` | | `http` 모드에서 관리 API 주소. 필수 |
 | `LLMGW_CONTROL_TOKEN` | | `http` 모드에서 관리 API 인증 토큰. 필수 |
 | `LLMGW_CONTROL_TIMEOUT` | `10s` | 동기화 한 번의 시간 상한 |
+| `LLMGW_OWNERSHIP_TIMEOUT` | `2s` | 비동기 경로의 소유 기록 호출 한 번의 시간 상한 |
+| `LLMGW_OWNERSHIP_BIND_BUDGET` | `12s` | 벤더가 제출을 받은 뒤 소유 기록 bind를 재시도하는 전체 시간 |
 | `LLMGW_SNAPSHOT_POLL_INTERVAL` | `5s` | 스냅샷 변경 확인 주기 |
 | `LLMGW_REQUEST_BODY_MAX_BYTES` | `2097152` | 큰 본문 슬롯 없이 받는 요청 본문 크기 상한. 채팅과 패스스루가 함께 써요 |
 | `LLMGW_CHAT_LARGE_BODY_MAX_BYTES` | `26214400` | 큰 본문 슬롯으로 받는 채팅 요청 본문 크기 상한 |
