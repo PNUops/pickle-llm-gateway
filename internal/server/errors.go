@@ -128,6 +128,10 @@ var (
 	// wait for one ran out. 429 with a Retry-After: waiting is the remedy.
 	errAgentBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "agent_busy",
 		"자체 서빙 모델에서 동시에 처리하는 에이전트 요청이 모두 차 있어요. 잠시 후 다시 시도해 주세요."}
+	// The same code as errAgentBusy: to a client the fact and the remedy
+	// are the same, a shared place on the self-hosted upstream is taken.
+	errLongInputBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "agent_busy",
+		"자체 서빙 모델에서 긴 입력을 처리하는 자리가 모두 차 있어요. 잠시 후 다시 시도하거나 입력을 줄여 주세요."}
 	errMethod = apiError{http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed",
 		"지원하지 않는 HTTP 메서드예요."}
 	errPassthroughNoStreaming = apiError{http.StatusBadRequest, "invalid_request_error",

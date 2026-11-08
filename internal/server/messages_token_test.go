@@ -39,6 +39,15 @@ func (u *selfHostedMessages) install(h *harness) {
 		count, countStatus, answer, stream, hold := u.count, u.countStatus, u.answer, u.stream, u.hold
 		u.mu.Unlock()
 		hdr := http.Header{"Content-Type": {"application/json"}}
+		if r.URL.Path == "/tokenize" {
+			// The serving process's chat tokenizer, beside the versioned API.
+			if countStatus != 0 && countStatus != http.StatusOK {
+				return &http.Response{StatusCode: countStatus, Header: hdr, Request: r,
+					Body: io.NopCloser(strings.NewReader(`{"error":{"message":"tokenizer down"}}`))}, nil
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: hdr, Request: r,
+				Body: io.NopCloser(strings.NewReader(`{"count":` + itoa(count) + `,"max_model_len":131072,"tokens":[1,2,3]}`))}, nil
+		}
 		if strings.HasSuffix(r.URL.Path, "/count_tokens") {
 			if countStatus == 0 {
 				countStatus = http.StatusOK
@@ -177,7 +186,6 @@ func TestSelfHostedMessagesFieldRules(t *testing.T) {
 	}{
 		{"template switch", `{"model":"pickle-general","messages":[],"chat_template_kwargs":{"enable_thinking":true}}`, "unsupported_parameter"},
 		{"thinking budget", `{"model":"pickle-general","messages":[],"thinking_token_budget":10}`, "unsupported_parameter"},
-		{"unknown field", `{"model":"pickle-general","messages":[],"mcp_servers":[]}`, "unsupported_parameter"},
 		{"server tool", `{"model":"pickle-general","messages":[],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`, "invalid_parameter_value"},
 		{"chat-shaped tool", `{"model":"pickle-general","messages":[],"tools":[{"type":"function","function":{"name":"f"}}]}`, "invalid_parameter_value"},
 		{"tool without schema", `{"model":"pickle-general","messages":[],"tools":[{"name":"f"}]}`, "invalid_parameter_value"},
@@ -196,6 +204,24 @@ func TestSelfHostedMessagesFieldRules(t *testing.T) {
 		`"tool_choice":{"type":"tool","name":"f","disable_parallel_tool_use":true},"top_k":5,"stop_sequences":["x"]}`
 	if code, raw, _ := sendMessages(t, h, nil, ok); code != 200 {
 		t.Fatalf("allowed fields refused: %d %s", code, raw)
+	}
+
+	// A field off the list is removed and the turn goes on: agent clients
+	// add fields release by release and their users cannot stop them.
+	unknown := `{"model":"pickle-general","max_tokens":10,"messages":[],"mcp_servers":[],"betas_hint":{"x":1}}`
+	if code, raw, _ := sendMessages(t, h, nil, unknown); code != 200 {
+		t.Fatalf("unknown fields refused: %d %s", code, raw)
+	}
+	_, bodies := u.calls()
+	sent := bodies[len(bodies)-1]
+	if _, has := sent["mcp_servers"]; has {
+		t.Fatalf("unknown field forwarded: %v", sent)
+	}
+	if _, has := sent["betas_hint"]; has {
+		t.Fatalf("unknown field forwarded: %v", sent)
+	}
+	if got := h.srv.metrics.messagesFieldsStripped.Load(); got != 2 {
+		t.Fatalf("stripped fields counted %d, want 2", got)
 	}
 }
 
@@ -456,4 +482,140 @@ func TestSelfHostedCountTokensRefusals(t *testing.T) {
 	// A tool the turn would refuse is refused here in the same words.
 	code, raw = post(http.MethodPost, `{"model":"pickle-general","messages":[],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
 	expectAnthropicRefusal(t, code, raw, 400, "invalid_request_error", "invalid_parameter_value")
+}
+
+// chatLongHarness opens the mock upstream to agents with one place and a
+// chat threshold of 64 tokens, behind a base URL ending in /v1 as a serving
+// process's does.
+func chatLongHarness(t *testing.T) (*harness, *selfHostedMessages) {
+	t.Helper()
+	h := newHarness(t, nil, func(c *config.Config) {
+		up := c.Upstreams["mock"]
+		up.BaseURL += "/v1"
+		up.Messages = config.MessagesOpen
+		up.MessagesMaxConcurrent = 1
+		up.MessagesQueueWait = 50 * time.Millisecond
+		up.MessagesChatInputTokens = 64
+		c.Upstreams["mock"] = up
+	})
+	u := &selfHostedMessages{answer: selfHostedAnswer, stream: selfHostedStream, count: 64}
+	u.install(h)
+	return h, u
+}
+
+// A chat prompt at the threshold takes one of the agent places, so a long
+// chat prefill and an agent turn are bounded together on the same box.
+func TestSelfHostedChatLongInputTakesTurnPlace(t *testing.T) {
+	h, u := chatLongHarness(t)
+	hold := make(chan struct{})
+	u.hold = hold
+	first := make(chan int, 1)
+	go func() { first <- serveVariant(t, h, protoChat, nil, chatBody).Code }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.srv.agents.snapshot()["mock"]["inUse"] != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("long chat never took a place")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	code, raw, _ := sendMessages(t, h, nil, agentTurnBody)
+	expectAnthropicRefusal(t, code, raw, 429, "rate_limit_error", "agent_busy")
+	close(hold)
+	if c := <-first; c != 200 {
+		t.Fatalf("long chat: %d", c)
+	}
+	paths, bodies := u.calls()
+	if len(paths) == 0 || paths[0] != "/tokenize" {
+		t.Fatalf("chat was not counted at the tokenizer beside /v1: %v", paths)
+	}
+	// The tokenizer reads what renders the prompt and nothing else.
+	for name := range bodies[0] {
+		switch name {
+		case "model", "messages", "tools":
+		default:
+			t.Fatalf("tokenizer got %s", name)
+		}
+	}
+	if string(bodies[0]["model"]) != `"`+upstreamModel+`"` {
+		t.Fatalf("tokenizer model %s", bodies[0]["model"])
+	}
+	if h.srv.metrics.chatLongInputPlaces.Load() != 1 {
+		t.Fatal("long chat not counted")
+	}
+	if h.srv.agents.snapshot()["mock"]["inUse"] != 0 {
+		t.Fatal("place not released")
+	}
+}
+
+// Over the bound, a long chat is refused the way an agent turn is.
+func TestSelfHostedChatLongInputRefusedWhenFull(t *testing.T) {
+	h, u := chatLongHarness(t)
+	hold := make(chan struct{})
+	u.hold = hold
+	first := make(chan int, 1)
+	go func() {
+		code, _, _ := sendMessages(t, h, nil, agentTurnBody)
+		first <- code
+	}()
+	for h.srv.agents.snapshot()["mock"]["inUse"] != 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	rec := serveVariant(t, h, protoChat, nil, chatBody)
+	if rec.Code != 429 || !strings.Contains(rec.Body.String(), `"agent_busy"`) || rec.Header().Get("Retry-After") != "10" {
+		t.Fatalf("long chat over the bound: %d %s %v", rec.Code, rec.Body, rec.Header())
+	}
+	if ev := lastEvent(t, h); ev.Status != spool.StatusRateLimited || ev.ErrorType != "agent_concurrency" {
+		t.Fatalf("record: %+v", ev)
+	}
+	close(hold)
+	<-first
+}
+
+// Below the threshold, or when the count fails, chat stays outside the bound.
+func TestSelfHostedChatShortInputOutsideBound(t *testing.T) {
+	h, u := chatLongHarness(t)
+	u.count = 63
+	if rec := serveVariant(t, h, protoChat, nil, chatBody); rec.Code != 200 {
+		t.Fatalf("short chat: %d %s", rec.Code, rec.Body)
+	}
+	if h.srv.metrics.chatLongInputPlaces.Load() != 0 {
+		t.Fatal("short chat took a place")
+	}
+	// A failed count leaves it outside the bound and is counted apart from
+	// the Messages counter.
+	u.mu.Lock()
+	u.count, u.countStatus = 64, http.StatusInternalServerError
+	u.mu.Unlock()
+	if rec := serveVariant(t, h, protoChat, nil, chatBody); rec.Code != 200 {
+		t.Fatalf("chat with a failed count: %d %s", rec.Code, rec.Body)
+	}
+	if h.srv.metrics.chatLongInputPlaces.Load() != 0 || h.srv.metrics.chatCountFailures.Load() != 1 ||
+		h.srv.metrics.messagesCountFailures.Load() != 0 {
+		t.Fatal("failed chat count misfiled")
+	}
+	// A body too short in bytes to reach the threshold is not counted.
+	h2, u2 := chatLongHarness(t)
+	up := h2.srv.cfg.Upstreams["mock"]
+	up.MessagesChatInputTokens = 32768
+	h2.srv.cfg.Upstreams["mock"] = up
+	if rec := serveVariant(t, h2, protoChat, nil, chatBody); rec.Code != 200 {
+		t.Fatalf("small chat: %d", rec.Code)
+	}
+	if paths, _ := u2.calls(); len(paths) != 1 || paths[0] == "/tokenize" {
+		t.Fatalf("small chat was counted: %v", paths)
+	}
+}
+
+// A base URL without the /v1 suffix is used as it is.
+func TestSelfHostedChatTokenizerWithoutVersionSuffix(t *testing.T) {
+	h, u := chatLongHarness(t)
+	up := h.srv.cfg.Upstreams["mock"]
+	up.BaseURL = strings.TrimSuffix(up.BaseURL, "/v1")
+	h.srv.cfg.Upstreams["mock"] = up
+	if rec := serveVariant(t, h, protoChat, nil, chatBody); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if paths, _ := u.calls(); len(paths) == 0 || paths[0] != "/tokenize" {
+		t.Fatalf("calls: %v", paths)
+	}
 }

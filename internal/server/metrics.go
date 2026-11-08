@@ -32,6 +32,12 @@ type counters struct {
 	// failed and were admitted uncounted.
 	messagesInputRefused  atomic.Int64
 	messagesCountFailures atomic.Int64
+	// Fields removed from self-hosted Messages requests because they are
+	// not on the forwarded list, and chat requests long enough to take an
+	// agent turn place.
+	messagesFieldsStripped atomic.Int64
+	chatLongInputPlaces    atomic.Int64
+	chatCountFailures      atomic.Int64
 }
 
 func (c *counters) observe(ev spool.Event) {
@@ -84,6 +90,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"messagesAgentSlots":     s.agents.snapshot(),
 		"messagesInputRefused":   s.metrics.messagesInputRefused.Load(),
 		"messagesCountFailures":  s.metrics.messagesCountFailures.Load(),
+		"messagesFieldsStripped": s.metrics.messagesFieldsStripped.Load(),
+		"chatLongInputPlaces":    s.metrics.chatLongInputPlaces.Load(),
+		"chatCountFailures":      s.metrics.chatCountFailures.Load(),
 		"bodiesCaptured":         s.metrics.bodiesCaptured.Load(),
 		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
 		"streamCostFilled":       s.metrics.streamCostFilled.Load(),

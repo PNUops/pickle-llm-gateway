@@ -132,7 +132,9 @@ var protoChat = &protocol{
 	},
 	parse:          parseChat,
 	tokenAxisParam: chatTokenAxisParam,
-	reasoningParam: "reasoning_effort",
+
+	longInputShares: true,
+	reasoningParam:  "reasoning_effort",
 	fences: []fence{
 		fencePresetField,
 		fenceCandidates,

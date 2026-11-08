@@ -59,6 +59,13 @@ type Upstream struct {
 	// MessagesQueueWait is how long a turn over that bound waits for a place
 	// before it is refused with 429 and a Retry-After; 0 refuses at once.
 	MessagesQueueWait time.Duration
+	// MessagesChatInputTokens makes a chat request to a model on this
+	// upstream take one of the same turn places when its input, counted by
+	// the upstream's tokenizer, is at least this long; 0 keeps chat out of
+	// the bound. A long chat prompt is the same prefill as an agent turn and
+	// holds the box the same way; a short one stays outside, so it is never
+	// refused here and waits only in the serving process's own queue.
+	MessagesChatInputTokens int
 	// ProbeInterval controls the read-only GET /models observation loop. A
 	// private or loopback literal defaults to the on-prem cadence; a public
 	// address or hostname defaults to the external cadence. Operators can set
@@ -80,18 +87,20 @@ const (
 )
 
 // The Messages bounds an open upstream gets when the environment names none.
-// They come from the 2026-10-22 load trial on the single self-hosted box (8
-// concurrent sequences, prefix caching on). Chat's per-token time doubled
-// once about 120K tokens of agent input were in flight, whatever the mix (two
-// agents at 60K, four at 20K, one at 100K); four agents at 60K made it 3.4
-// times slower with a worst chat answer of 69 seconds, and eight at 60K
-// stalled chat for over a minute. Two turns at the cap stay on the doubling
-// line. The cap bounds how long one uncached prefill holds the box; the count
-// bounds how many of them run at once.
+// The cap comes from the 2026-10-22 load trial on the single self-hosted box
+// (8 concurrent sequences, prefix caching on): it bounds how long one
+// uncached prefill holds the box, about 13 to 15 seconds at 64K. The count is
+// the box's own sequence count, above which the trial saw no more
+// throughput: a turn beyond it would only queue inside the serving process,
+// where nothing can refuse it or tell the caller to come back. The wait is
+// long enough for a typical turn at the cap to finish and short enough that a
+// waiting connection is not mistaken for a hung one. The chat threshold is
+// half the cap: a chat prompt that long is an agent-sized prefill.
 const (
-	defaultMessagesMaxInputTokens = 65536
-	defaultMessagesMaxConcurrent  = 2
-	defaultMessagesQueueWait      = 10 * time.Second
+	defaultMessagesMaxInputTokens  = 65536
+	defaultMessagesMaxConcurrent   = 8
+	defaultMessagesQueueWait       = 60 * time.Second
+	defaultMessagesChatInputTokens = 32768
 )
 
 // SnapshotSource names where the authorization document comes from.
@@ -567,13 +576,15 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			ref, field = strings.TrimSuffix(rest, "_MESSAGES_MAX_INPUT_TOKENS"), "msgInput"
 		case strings.HasSuffix(rest, "_MESSAGES_MAX_CONCURRENT"):
 			ref, field = strings.TrimSuffix(rest, "_MESSAGES_MAX_CONCURRENT"), "msgConcurrent"
+		case strings.HasSuffix(rest, "_MESSAGES_CHAT_INPUT_TOKENS"):
+			ref, field = strings.TrimSuffix(rest, "_MESSAGES_CHAT_INPUT_TOKENS"), "msgChatInput"
 		case strings.HasSuffix(rest, "_MESSAGES_QUEUE_WAIT"):
 			ref, field = strings.TrimSuffix(rest, "_MESSAGES_QUEUE_WAIT"), "msgWait"
 		case strings.HasSuffix(rest, "_MESSAGES"):
 			ref, field = strings.TrimSuffix(rest, "_MESSAGES"), "messages"
 		default:
 			errs = append(errs, name+" is not a recognized upstream field (_BASE_URL, _API_KEY, _CAP_FIELD, _PROBE_INTERVAL, _REASONING, "+
-				"_MESSAGES, _MESSAGES_MAX_INPUT_TOKENS, _MESSAGES_MAX_CONCURRENT or _MESSAGES_QUEUE_WAIT)")
+				"_MESSAGES, _MESSAGES_MAX_INPUT_TOKENS, _MESSAGES_MAX_CONCURRENT, _MESSAGES_QUEUE_WAIT or _MESSAGES_CHAT_INPUT_TOKENS)")
 			continue
 		}
 		if ref == "" {
@@ -597,16 +608,19 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 			u.Reasoning = val
 		case "messages":
 			u.Messages = val
-		case "msgInput", "msgConcurrent":
+		case "msgInput", "msgConcurrent", "msgChatInput":
 			n, err := strconv.Atoi(val)
 			if err != nil || n < 0 {
 				errs = append(errs, name+" must be a whole number, 0 to turn it off")
 				continue
 			}
-			if field == "msgInput" {
+			switch field {
+			case "msgInput":
 				u.MessagesMaxInputTokens = n
-			} else {
+			case "msgConcurrent":
 				u.MessagesMaxConcurrent = n
+			default:
+				u.MessagesChatInputTokens = n
 			}
 			set[id][field] = true
 		case "msgWait":
@@ -673,6 +687,9 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		}
 		if !set[id]["msgWait"] {
 			u.MessagesQueueWait = defaultMessagesQueueWait
+		}
+		if !set[id]["msgChatInput"] {
+			u.MessagesChatInputTokens = defaultMessagesChatInputTokens
 		}
 		// One write-back for every default filled above. Writing it only where
 		// a default was filled lost the others: an upstream with an explicit
