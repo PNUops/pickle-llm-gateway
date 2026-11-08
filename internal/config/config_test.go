@@ -114,6 +114,8 @@ func TestReasoningParsing(t *testing.T) {
 		"LLMGW_UPSTREAM_B_REASONING=effort",
 		"LLMGW_UPSTREAM_C_BASE_URL=http://127.0.0.1:8000/v1",
 		"LLMGW_UPSTREAM_C_REASONING=template",
+		"LLMGW_UPSTREAM_D_BASE_URL=http://127.0.0.1:8001/v1",
+		"LLMGW_UPSTREAM_D_REASONING=budget",
 	})
 	if len(errs) != 0 {
 		t.Fatal(errs)
@@ -122,8 +124,8 @@ func TestReasoningParsing(t *testing.T) {
 	if ups["a"].Reasoning != ReasoningClosed {
 		t.Fatalf("default reasoning not applied: %+v", ups["a"])
 	}
-	if ups["b"].Reasoning != ReasoningEffort || ups["c"].Reasoning != ReasoningTemplate {
-		t.Fatalf("explicit reasoning lost: %+v %+v", ups["b"], ups["c"])
+	if ups["b"].Reasoning != ReasoningEffort || ups["c"].Reasoning != ReasoningTemplate || ups["d"].Reasoning != ReasoningBudget {
+		t.Fatalf("explicit reasoning lost: %+v %+v %+v", ups["b"], ups["c"], ups["d"])
 	}
 	ups, errs = upstreamsFromEnv([]string{
 		"LLMGW_UPSTREAM_E_BASE_URL=https://e.example/v1",

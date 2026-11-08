@@ -401,7 +401,9 @@ Messages 경로에서 `claude-opus-5-5`(없는 날짜를 붙인 이름까지)를
 **TOKEN 축에서 `verbosity`는 계속 거절하고, `reasoning_effort`는 업스트림 설정이 정해요.**
 `LLMGW_UPSTREAM_<REF>_REASONING`이 `closed`(기본)면 지금처럼 거절하고, `effort`면 그대로 전달하고,
 `template`이면 `reasoning_effort`를 지우고 채팅 템플릿의 사고 스위치(`chat_template_kwargs.enable_thinking`,
-`none`이면 끔, 그 밖은 켬)로 바꿔 보내요. 게이트웨이가 받는 값은 `none`, `minimal`, `low`, `medium`,
+`none`이면 끔, 그 밖은 켬)로 바꿔 보내요. `budget`이면 같은 스위치에 더해 사고 토큰 예산
+`thinking_token_budget`을 넣어요(`minimal`, `low`는 1024, `medium`은 4096, `high`, `xhigh`는 8192). 서빙
+프로세스가 예산을 다 쓰면 사고를 끝내고 답을 이어 써요. vLLM은 추론 파서가 켜져 있어야 이 필드를 받아요. 게이트웨이가 받는 값은 `none`, `minimal`, `low`, `medium`,
 `high`, `xhigh`이고, 그 밖의 값은 `invalid_parameter_value`로 거절하며 `null`은 보내지 않은 것으로 봐요.
 `effort` 업스트림에는 값을 그대로 보내므로, 그 업스트림이 모르는 값은 업스트림의 거절로 돌아와요.
 `chat_template_kwargs`, `thinking_token_budget`, 공급자의 `reasoning` 객체는 어떤 설정에서도 거절해요.
@@ -732,7 +734,7 @@ go run ./cmd/llm-gateway
 | `LLMGW_UPSTREAM_<REF>_API_KEY` | | 업스트림 인증 토큰. 비우면 인증 없이 호출 |
 | `LLMGW_UPSTREAM_<REF>_CAP_FIELD` | | 출력 상한을 주입할 필드. 기본 `max_completion_tokens`, 구형 서버는 `max_tokens` 지정 |
 | `LLMGW_UPSTREAM_<REF>_PROBE_INTERVAL` | | `/models` active probe 주기(최소 `10s`). 기본값은 사설이나 loopback IP `60s`, 외부 주소나 hostname `5m`이며 배치 위치를 주소로 판단할 수 없을 때 명시 |
-| `LLMGW_UPSTREAM_<REF>_REASONING` | | 자체 서빙 모델의 `reasoning_effort` 처리. `closed`(기본, 거절), `effort`(그대로 전달), `template`(채팅 템플릿 사고 스위치로 변환) |
+| `LLMGW_UPSTREAM_<REF>_REASONING` | | 자체 서빙 모델의 `reasoning_effort` 처리. `closed`(기본, 거절), `effort`(그대로 전달), `template`(채팅 템플릿 사고 스위치로 변환), `budget`(사고 스위치와 노력별 사고 토큰 예산) |
 | `LLMGW_UPSTREAM_<REF>_MESSAGES` | | 자체 서빙 모델에 `/v1/messages`와 `count_tokens`를 열지. `closed`(기본) 또는 `open` |
 | `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_INPUT_TOKENS` | `65536` | 열린 업스트림의 Messages 입력 토큰 한도. `0`이면 끔 |
 | `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT` | `8` | 열린 업스트림에서 모든 Key를 합친 동시 Messages 턴 수. `0`이면 끔 |
