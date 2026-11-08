@@ -35,8 +35,9 @@ type Upstream struct {
 	// ReasoningClosed refuses the field, ReasoningEffort forwards it as is,
 	// ReasoningTemplate turns it into the chat template's thinking switch,
 	// ReasoningBudget does the same and bounds the thinking with a per-request
-	// token budget the serving process enforces. It is a property of the upstream because the serving capacity a reasoning
-	// request spends is the upstream's, so moving a model to another upstream
+	// token budget the serving process enforces. It is a property of the
+	// upstream because the serving capacity a reasoning request spends is the
+	// upstream's, so moving a model to another upstream
 	// takes that upstream's decision with it. It does not decide whether the
 	// model reasons when the field is absent: that is the upstream's default.
 	Reasoning string

@@ -403,7 +403,9 @@ Messages 경로에서 `claude-opus-5-5`(없는 날짜를 붙인 이름까지)를
 `template`이면 `reasoning_effort`를 지우고 채팅 템플릿의 사고 스위치(`chat_template_kwargs.enable_thinking`,
 `none`이면 끔, 그 밖은 켬)로 바꿔 보내요. `budget`이면 같은 스위치에 더해 사고 토큰 예산
 `thinking_token_budget`을 넣어요(`minimal`, `low`는 1024, `medium`은 4096, `high`, `xhigh`는 8192). 서빙
-프로세스가 예산을 다 쓰면 사고를 끝내고 답을 이어 써요. vLLM은 추론 파서가 켜져 있어야 이 필드를 받아요. 게이트웨이가 받는 값은 `none`, `minimal`, `low`, `medium`,
+프로세스가 예산을 다 쓰면 사고를 끝내고 답을 이어 써요. vLLM은 추론 파서가 켜져 있어야 이 필드를 받아요.
+사고 토큰도 출력 상한(`max_completion_tokens`, `max_tokens`) 안에서 세므로, 상한이 예산보다 작으면 답 없이
+`length`로 끝날 수 있어요. 게이트웨이가 받는 값은 `none`, `minimal`, `low`, `medium`,
 `high`, `xhigh`이고, 그 밖의 값은 `invalid_parameter_value`로 거절하며 `null`은 보내지 않은 것으로 봐요.
 `effort` 업스트림에는 값을 그대로 보내므로, 그 업스트림이 모르는 값은 업스트림의 거절로 돌아와요.
 `chat_template_kwargs`, `thinking_token_budget`, 공급자의 `reasoning` 객체는 어떤 설정에서도 거절해요.

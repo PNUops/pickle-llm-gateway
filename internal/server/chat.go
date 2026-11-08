@@ -61,8 +61,8 @@ func renameFirstCandidate(params map[string]json.RawMessage, upstream string) {
 // this list is consulted (see reasoning.go). `chat_template_kwargs` and
 // `thinking_token_budget` are absent for good. They are one serving process's
 // own switches rather than part of the general API, and an upstream that opens
-// reasoning in that dialect gets the template switch from the gateway, never
-// from the caller. The serving process does not refuse any of the three —
+// reasoning in that dialect gets the template switch (and, on a budget
+// upstream, the budget) from the gateway, never from the caller. The serving process does not refuse any of the three —
 // measured, same request with and only without the field:
 //
 //	reasoning_effort "low" → 200, content null, reasoning "Here's a thinking process:..."

@@ -312,6 +312,14 @@ func TestReasoningEffortBoundedForBudgetUpstream(t *testing.T) {
 	if _, ok := params["thinking_token_budget"]; ok {
 		t.Fatalf("budget injected without reasoning_effort: %v", params)
 	}
+	// null is absent on a budget upstream too.
+	if status, body := h.chat(t, testToken, selfHostedBody(`,"reasoning_effort":null`)); status != 200 {
+		t.Fatalf("null: got %d %s", status, body)
+	}
+	params, _ = h.mock.last()
+	if _, ok := params["thinking_token_budget"]; ok {
+		t.Fatalf("budget injected for null: %v", params)
+	}
 	// The caller still cannot set the budget, or the switch, itself.
 	for _, extra := range []string{`,"thinking_token_budget":100000`, `,"chat_template_kwargs":{"enable_thinking":true}`} {
 		if status, body := h.chat(t, testToken, selfHostedBody(extra)); status != 400 {
