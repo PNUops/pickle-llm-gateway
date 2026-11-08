@@ -108,9 +108,10 @@ multipart는 그대로 넘기지 않고 해석한 뒤 아는 필드(`model`, `la
 
 - **필드**: `model`, `messages`, `system`, `max_tokens`, `stop_sequences`, `stream`, `temperature`,
   `top_p`, `top_k`, `tools`, `tool_choice`만 전달해요. `thinking`, `output_config`, `metadata`,
-  `context_management`, `service_tier`는 지우고 보내요. 추론 여부는 업스트림 기본값을 따라요. 그 밖의 필드
-  (`chat_template_kwargs`, `thinking_token_budget` 포함)는 이름을 밝혀 400 `unsupported_parameter`로
-  거절해요.
+  `context_management`, `service_tier`는 지우고 보내요. 추론 여부는 업스트림 기본값을 따라요. 그 밖의
+  필드도 지우고 보내요. 지운 필드 이름은 로그에 남기고 `/metrics`의 `messagesFieldsStripped`로 세요.
+  추론 스위치인 `chat_template_kwargs`, `thinking_token_budget`만 이름을 밝혀 400
+  `unsupported_parameter`로 거절해요.
 - **도구**: 클라이언트가 실행하는 도구(`name`, `description`, `input_schema`, `cache_control`,
   `strict`, `type: custom`)만 받아요. 서버 도구와 Chat 모양의 도구는 400 `invalid_parameter_value`로 거절해요.
 - **출력 상한**: 모델 최대값보다 큰 `max_tokens`는 거절하지 않고 최대값으로 낮춰요.
@@ -120,10 +121,16 @@ multipart는 그대로 넘기지 않고 해석한 뒤 아는 필드(`model`, `la
   안내가 이어져요. 본문 바이트가 한도보다 충분히 작으면 세지 않고, 세기가 실패하면 통과시켜요
   (업스트림의 문맥 한도는 그대로 남아요).
 - **동시 턴**: 업스트림 하나에서 동시에 처리하는 턴을 모든 Key를 합쳐
-  `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT`(기본 2)개로 묶어요. 넘는 턴은
-  `LLMGW_UPSTREAM_<REF>_MESSAGES_QUEUE_WAIT`(기본 10s)까지 기다리고, 그래도 자리가 없으면 429
+  `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT`(기본 8)개로 묶어요. 넘는 턴은
+  `LLMGW_UPSTREAM_<REF>_MESSAGES_QUEUE_WAIT`(기본 60s)까지 기다리고, 그래도 자리가 없으면 429
   `agent_busy`와 `Retry-After: 10`으로 답해요. 기다리는 턴은 한도 수만큼만 받아요. 자리는 응답이
-  끝까지 전달될 때까지 잡아요. Chat은 이 한도와 무관해요.
+  끝까지 전달될 때까지 잡아요.
+- **긴 Chat**: 같은 업스트림의 자체 서빙 모델로 가는 Chat 요청도 입력이
+  `LLMGW_UPSTREAM_<REF>_MESSAGES_CHAT_INPUT_TOKENS`(기본 32768) 이상이면 같은 자리를 하나 잡아요.
+  긴 Chat의 prefill은 에이전트 턴과 같은 무게라서요. 입력은 업스트림의 `/tokenize`(기본 URL 끝의
+  `/v1`을 뗀 자리)로 세고, 본문 바이트가 기준보다 충분히 작으면 세지 않아요. 세기가 실패하면 자리 없이
+  보내요. 자리가 없으면 같은 429 `agent_busy`로 답하고 `/metrics`의 `chatLongInputPlaces`가 자리를 잡은
+  긴 Chat 수예요. 짧은 Chat은 이 한도와 무관해요.
 - **폴백**: 폴백 업스트림으로 보내지 않아요. 주 업스트림이 쉬는 동안의 턴은 실패해요.
 - **사용량**: `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`를 더한 값을 입력
   토큰으로 기록하고 분당 토큰과 일일 토큰 한도에 써요. 캐시에서 읽은 값은 캐시 입력으로 따로
@@ -726,8 +733,9 @@ go run ./cmd/llm-gateway
 | `LLMGW_UPSTREAM_<REF>_REASONING` | | 자체 서빙 모델의 `reasoning_effort` 처리. `closed`(기본, 거절), `effort`(그대로 전달), `template`(채팅 템플릿 사고 스위치로 변환) |
 | `LLMGW_UPSTREAM_<REF>_MESSAGES` | | 자체 서빙 모델에 `/v1/messages`와 `count_tokens`를 열지. `closed`(기본) 또는 `open` |
 | `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_INPUT_TOKENS` | `65536` | 열린 업스트림의 Messages 입력 토큰 한도. `0`이면 끔 |
-| `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT` | `2` | 열린 업스트림에서 모든 Key를 합친 동시 Messages 턴 수. `0`이면 끔 |
-| `LLMGW_UPSTREAM_<REF>_MESSAGES_QUEUE_WAIT` | `10s` | 동시 턴이 찼을 때 기다리는 최대 시간(0s~5m). `0s`면 바로 429 |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES_MAX_CONCURRENT` | `8` | 열린 업스트림에서 모든 Key를 합친 동시 Messages 턴 수. `0`이면 끔 |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES_QUEUE_WAIT` | `60s` | 동시 턴이 찼을 때 기다리는 최대 시간(0s~5m). `0s`면 바로 429 |
+| `LLMGW_UPSTREAM_<REF>_MESSAGES_CHAT_INPUT_TOKENS` | `32768` | 열린 업스트림의 자체 서빙 Chat 요청이 동시 턴 자리를 잡는 입력 토큰 기준. `0`이면 Chat은 한도 밖 |
 
 <details>
 <summary>조정 값 (기본값으로 동작)</summary>

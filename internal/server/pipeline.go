@@ -300,6 +300,7 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 			delete(params, name)
 		}
 		reasoningOK := p.reasoningParam != "" && s.reasoningOpen(model)
+		var stripped []string
 		for name, raw := range params {
 			if reasoningOK && name == p.reasoningParam {
 				if !validReasoningEffort(raw) {
@@ -309,9 +310,17 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 				continue
 			}
 			if rf := p.tokenAxisParam(name); rf != nil {
+				if p.tokenStripUnknown != nil && p.tokenStripUnknown(name) {
+					delete(params, name)
+					stripped = append(stripped, name)
+					continue
+				}
 				refuseWith(rf, spool.StatusBadRequest)
 				return
 			}
+		}
+		if len(stripped) > 0 {
+			s.noteStrippedFields(&ev, stripped)
 		}
 	}
 	if !key.AllowsModel(model) {
@@ -518,6 +527,26 @@ func (s *Server) serveProtocol(p *protocol, w http.ResponseWriter, r *http.Reque
 			return
 		}
 		defer release()
+	} else if p.longInputShares && !model.CreditAxis() {
+		// A long chat prompt on the same upstream is the same prefill as an
+		// agent turn, so it takes one of the same places. Its upstream is
+		// still chosen per attempt as chat's always is; a place held while a
+		// fallback serves it costs the primary's agents one turn of waiting.
+		up := s.cfg.Upstreams[strings.ToLower(model.UpstreamRef)]
+		if s.chatInputIsLong(r.Context(), up, model, params, len(rawBody)) {
+			release, ok := s.agents.acquire(r.Context(), up.Ref)
+			if !ok {
+				if r.Context().Err() != nil {
+					ev.Status = spool.StatusCanceled
+					ev.ErrorType = "client_disconnected"
+					record()
+					return
+				}
+				refuseAs(errLongInputBusy, spool.StatusRateLimited, "agent_concurrency")
+				return
+			}
+			defer release()
+		}
 	}
 
 	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)

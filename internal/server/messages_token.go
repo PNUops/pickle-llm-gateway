@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,10 +23,9 @@ import (
 // surface at all is its Messages setting (see config.Upstream.Messages).
 
 // messagesTokenParams are the top-level fields forwarded for a self-hosted
-// model on this surface. An unknown field is refused, for the reason chat's
-// list gives: replacing the serving process must not silently change what a
-// caller may send. chat_template_kwargs and thinking_token_budget are refused
-// for the reason chat gives: they are one serving process's own switches.
+// model on this surface. Any other field is removed before forwarding, so
+// replacing the serving process cannot silently change what a caller may
+// send, and the request goes on without it (see messagesTokenStripUnknown).
 var messagesTokenParams = map[string]bool{
 	"model":          true,
 	"messages":       true,
@@ -57,11 +57,52 @@ var messagesTokenStrip = map[string]bool{
 	"service_tier":       true,
 }
 
+// messagesTokenRefused are refused rather than removed. They are one serving
+// process's own switches for reasoning, refused on chat for that reason; a
+// caller who sends one asks for a change in how the answer is generated, and
+// removing it would hand back the default as if it had been honoured.
+var messagesTokenRefused = map[string]bool{
+	"chat_template_kwargs":  true,
+	"thinking_token_budget": true,
+}
+
 func messagesTokenAxisParam(name string) *refusal {
 	if messagesTokenParams[name] {
 		return nil
 	}
 	return &refusal{e: errUnsupportedParam(name)}
+}
+
+// messagesTokenStripUnknown removes every field off the forwarded list but
+// the refused ones. Agent clients add top-level fields release by release
+// (beta features, vendor hints), and their users cannot stop them; refusing
+// an unknown one refused every turn of every user of that release until the
+// list caught up. The removed names are logged and counted, so a field that
+// starts arriving can be judged on what it is.
+func messagesTokenStripUnknown(name string) bool {
+	return !messagesTokenRefused[name]
+}
+
+// strippedFieldsLogged bounds what one request puts in the log: the names
+// are the caller's, and a body may carry any number of them.
+const (
+	strippedFieldsLogged   = 16
+	strippedFieldNameBytes = 64
+)
+
+// noteStrippedFields logs and counts the fields removed from one request.
+func (s *Server) noteStrippedFields(ev *spool.Event, names []string) {
+	s.metrics.messagesFieldsStripped.Add(int64(len(names)))
+	sort.Strings(names)
+	if len(names) > strippedFieldsLogged {
+		names = names[:strippedFieldsLogged]
+	}
+	for i, n := range names {
+		if len(n) > strippedFieldNameBytes {
+			names[i] = n[:strippedFieldNameBytes]
+		}
+	}
+	s.log.Info("unknown fields removed", "keyId", ev.KeyID, "model", ev.PublicModelName, "fields", names)
 }
 
 // messagesTokenAdmit reports whether a self-hosted model may be served on this
@@ -283,6 +324,83 @@ const countSkipMargin = 2048
 // fitsWithoutCounting reports whether a body is certainly under a token cap.
 func fitsWithoutCounting(bodyBytes, maxTokens int) bool {
 	return bodyBytes+countSkipMargin <= maxTokens
+}
+
+// chatInputIsLong reports whether a self-hosted chat request on up is long
+// enough to take an agent turn place: up serves agents with a turn bound and
+// a chat threshold, and the prompt counted by up's own tokenizer reaches it.
+// A body too short in bytes to reach it is not counted. A count that fails
+// leaves the request outside the bound, as a failed count admits a turn
+// past the input cap: the bound protects other callers' latency, and chat
+// was outside it until the threshold existed.
+func (s *Server) chatInputIsLong(ctx context.Context, up config.Upstream, model *snapshot.Model, params map[string]json.RawMessage, bodyBytes int) bool {
+	limit := up.MessagesChatInputTokens
+	if up.Messages != config.MessagesOpen || up.MessagesMaxConcurrent <= 0 || limit <= 0 ||
+		fitsWithoutCounting(bodyBytes, limit-1) {
+		return false
+	}
+	n, ae := s.countChatTokens(ctx, up, model, params)
+	if ae != nil {
+		if ctx.Err() == nil {
+			s.metrics.messagesCountFailures.Add(1)
+			s.log.Warn("chat input count failed, leaving it outside the turn bound", "upstreamRef", up.Ref, "error", ae.err)
+		}
+		return false
+	}
+	if n < limit {
+		return false
+	}
+	s.metrics.chatLongInputPlaces.Add(1)
+	return true
+}
+
+// chatCountFields are the parts of a chat request the serving process's
+// tokenizer reads to render the prompt.
+var chatCountFields = []string{"model", "messages", "tools"}
+
+// tokenizeResponseMax bounds the tokenizer's answer, which lists every token
+// id: at a 131,072-token context that is under a megabyte.
+const tokenizeResponseMax = 8 << 20
+
+// countChatTokens asks up how many tokens a chat request's rendered prompt
+// is, with the model already renamed to the upstream's name. The serving
+// process answers on its /tokenize route, which sits beside the versioned
+// API rather than under it, so a base URL ending in /v1 loses that suffix.
+func (s *Server) countChatTokens(ctx context.Context, up config.Upstream, model *snapshot.Model, params map[string]json.RawMessage) (int, *attemptError) {
+	body := make(map[string]json.RawMessage, len(chatCountFields))
+	for _, f := range chatCountFields {
+		if v, ok := params[f]; ok {
+			body[f] = v
+		}
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return 0, &attemptError{err: err}
+	}
+	ctx, cancel := context.WithTimeout(ctx, countInputTimeout)
+	defer cancel()
+	root := up
+	root.BaseURL = strings.TrimSuffix(up.BaseURL, "/v1")
+	resp, ae := s.do(ctx, root, attemptSpec{
+		client:        s.client,
+		method:        http.MethodPost,
+		path:          "/tokenize",
+		body:          b,
+		cred:          up.APIKey,
+		upstreamModel: model.UpstreamModel,
+		publicModel:   model.PublicName,
+	})
+	if ae != nil {
+		return 0, ae
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Count *int `json:"count"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, tokenizeResponseMax)).Decode(&out) != nil || out.Count == nil || *out.Count < 0 {
+		return 0, &attemptError{err: errUpstreamStatus, kind: failureInvalidResponse}
+	}
+	return *out.Count, nil
 }
 
 // handleCountTokens answers the Messages token counter. A self-hosted model

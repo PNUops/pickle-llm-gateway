@@ -153,6 +153,7 @@ func TestMessagesParsing(t *testing.T) {
 		"LLMGW_UPSTREAM_TUNED_MESSAGES_MAX_INPUT_TOKENS=0",
 		"LLMGW_UPSTREAM_TUNED_MESSAGES_MAX_CONCURRENT=2",
 		"LLMGW_UPSTREAM_TUNED_MESSAGES_QUEUE_WAIT=0s",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_CHAT_INPUT_TOKENS=0",
 	})
 	if len(errs) != 0 {
 		t.Fatal(errs)
@@ -163,12 +164,12 @@ func TestMessagesParsing(t *testing.T) {
 		t.Fatalf("default messages setting not applied: %+v", ups["a"])
 	}
 	if got := ups["dgx"]; got.Messages != MessagesOpen || got.MessagesMaxInputTokens != 65536 ||
-		got.MessagesMaxConcurrent != 2 || got.MessagesQueueWait != 10*time.Second {
+		got.MessagesMaxConcurrent != 8 || got.MessagesQueueWait != 60*time.Second || got.MessagesChatInputTokens != 32768 {
 		t.Fatalf("defaults for an open upstream: %+v", got)
 	}
 	// An explicit 0 turns a bound off rather than falling back to the default.
 	if got := ups["tuned"]; got.MessagesMaxInputTokens != 0 || got.MessagesMaxConcurrent != 2 ||
-		got.MessagesQueueWait != 0 {
+		got.MessagesQueueWait != 0 || got.MessagesChatInputTokens != 0 {
 		t.Fatalf("explicit values lost: %+v", got)
 	}
 	for _, bad := range [][]string{
@@ -178,6 +179,7 @@ func TestMessagesParsing(t *testing.T) {
 		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_CONCURRENT=two"},
 		{"LLMGW_UPSTREAM_D_MESSAGES_QUEUE_WAIT=10"},
 		{"LLMGW_UPSTREAM_D_MESSAGES_QUEUE_WAIT=10m"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_CHAT_INPUT_TOKENS=32k"},
 	} {
 		_, errs = upstreamsFromEnv(append([]string{"LLMGW_UPSTREAM_D_BASE_URL=https://d.example/v1"}, bad...))
 		if len(errs) == 0 {

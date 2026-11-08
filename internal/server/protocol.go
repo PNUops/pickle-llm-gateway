@@ -65,6 +65,17 @@ type protocol struct {
 	// tokenAxisParam judges one top-level field on the self-hosted axis; nil
 	// means the field may be forwarded.
 	tokenAxisParam func(name string) *refusal
+	// tokenStripUnknown, when set, says whether a field tokenAxisParam
+	// refuses is removed instead, with its name logged. A surface whose
+	// clients add fields of their own on every request uses it so a new
+	// client release does not refuse every turn; the fields it still refuses
+	// are the ones that would change serving if forwarded.
+	tokenStripUnknown func(name string) bool
+	// longInputShares makes a self-hosted request whose input reaches its
+	// upstream's chat threshold take one of the agent turn places (see
+	// config.Upstream.MessagesChatInputTokens). Set on chat, the one other
+	// surface open to the self-hosted axis.
+	longInputShares bool
 	// reasoningParam names the surface's standard reasoning-effort field on
 	// the self-hosted axis, or "" when the surface has none. When the model's
 	// primary upstream opens reasoning the pipeline judges this field itself

@@ -42,13 +42,14 @@ var protoMessages = &protocol{
 	parse: parseMessages,
 	// A self-hosted model is served only where its upstream opens this
 	// surface; everywhere else it gets the refusal below.
-	creditOnly:       &errModelNotOnMessages,
-	tokenOpen:        (*Server).messagesTokenAdmit,
-	tokenUpstream:    messagesTokenUpstream,
-	tokenStrip:       messagesTokenStrip,
-	tokenAxisParam:   messagesTokenAxisParam,
-	tokenTools:       fenceMessagesTokenTools,
-	clampTokenOutput: true,
+	creditOnly:        &errModelNotOnMessages,
+	tokenOpen:         (*Server).messagesTokenAdmit,
+	tokenUpstream:     messagesTokenUpstream,
+	tokenStrip:        messagesTokenStrip,
+	tokenAxisParam:    messagesTokenAxisParam,
+	tokenStripUnknown: messagesTokenStripUnknown,
+	tokenTools:        fenceMessagesTokenTools,
+	clampTokenOutput:  true,
 	// Model names follow the chat rules: a name the catalogue does not list is
 	// forwarded to the vendor under the key's allow and deny lists, whether or
 	// not it carries a provider prefix.
