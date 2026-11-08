@@ -275,3 +275,55 @@ func TestReasoningEffortOnStream(t *testing.T) {
 		t.Fatalf("stream lost its usage request: %s", params["stream_options"])
 	}
 }
+
+func TestReasoningEffortBoundedForBudgetUpstream(t *testing.T) {
+	h := newHarness(t, nil, reasoningOn(config.ReasoningBudget))
+	for _, tc := range []struct{ effort, template, budget string }{
+		{"none", `{"enable_thinking":false}`, ""},
+		{"minimal", `{"enable_thinking":true}`, "1024"},
+		{"low", `{"enable_thinking":true}`, "1024"},
+		{"medium", `{"enable_thinking":true}`, "4096"},
+		{"high", `{"enable_thinking":true}`, "8192"},
+		{"xhigh", `{"enable_thinking":true}`, "8192"},
+	} {
+		status, body := h.chat(t, testToken, selfHostedBody(`,"reasoning_effort":"`+tc.effort+`"`))
+		if status != 200 {
+			t.Fatalf("reasoning_effort %s: got %d %s", tc.effort, status, body)
+		}
+		params, _ := h.mock.last()
+		if _, ok := params["reasoning_effort"]; ok {
+			t.Fatalf("reasoning_effort was forwarded to a budget upstream: %v", params)
+		}
+		if got := string(params["chat_template_kwargs"]); got != tc.template {
+			t.Fatalf("effort %s became %s, want %s", tc.effort, got, tc.template)
+		}
+		if got := string(params["thinking_token_budget"]); got != tc.budget {
+			t.Fatalf("effort %s budget %q, want %q", tc.effort, got, tc.budget)
+		}
+	}
+	// Absent keeps the server's default: nothing is injected.
+	if status, body := h.chat(t, testToken, selfHostedBody("")); status != 200 {
+		t.Fatalf("no field: got %d %s", status, body)
+	}
+	params, _ := h.mock.last()
+	if _, ok := params["chat_template_kwargs"]; ok {
+		t.Fatalf("template switch injected without reasoning_effort: %v", params)
+	}
+	if _, ok := params["thinking_token_budget"]; ok {
+		t.Fatalf("budget injected without reasoning_effort: %v", params)
+	}
+	// null is absent on a budget upstream too.
+	if status, body := h.chat(t, testToken, selfHostedBody(`,"reasoning_effort":null`)); status != 200 {
+		t.Fatalf("null: got %d %s", status, body)
+	}
+	params, _ = h.mock.last()
+	if _, ok := params["thinking_token_budget"]; ok {
+		t.Fatalf("budget injected for null: %v", params)
+	}
+	// The caller still cannot set the budget, or the switch, itself.
+	for _, extra := range []string{`,"thinking_token_budget":100000`, `,"chat_template_kwargs":{"enable_thinking":true}`} {
+		if status, body := h.chat(t, testToken, selfHostedBody(extra)); status != 400 {
+			t.Fatalf("%s accepted on a budget upstream: %d %s", extra, status, body)
+		}
+	}
+}

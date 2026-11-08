@@ -33,9 +33,11 @@ type Upstream struct {
 	// Reasoning says whether a self-hosted (TOKEN-axis) model served here
 	// accepts the caller's reasoning_effort, and in which dialect it goes out:
 	// ReasoningClosed refuses the field, ReasoningEffort forwards it as is,
-	// ReasoningTemplate turns it into the chat template's thinking switch. It
-	// is a property of the upstream because the serving capacity a reasoning
-	// request spends is the upstream's, so moving a model to another upstream
+	// ReasoningTemplate turns it into the chat template's thinking switch,
+	// ReasoningBudget does the same and bounds the thinking with a per-request
+	// token budget the serving process enforces. It is a property of the
+	// upstream because the serving capacity a reasoning request spends is the
+	// upstream's, so moving a model to another upstream
 	// takes that upstream's decision with it. It does not decide whether the
 	// model reasons when the field is absent: that is the upstream's default.
 	Reasoning string
@@ -78,6 +80,7 @@ const (
 	ReasoningClosed   = "closed"
 	ReasoningEffort   = "effort"
 	ReasoningTemplate = "template"
+	ReasoningBudget   = "budget"
 )
 
 // Messages settings for an upstream; see Upstream.Messages.
@@ -662,10 +665,10 @@ func upstreamsFromEnv(environ []string) (map[string]Upstream, []string) {
 		switch u.Reasoning {
 		case "":
 			u.Reasoning = ReasoningClosed
-		case ReasoningClosed, ReasoningEffort, ReasoningTemplate:
+		case ReasoningClosed, ReasoningEffort, ReasoningTemplate, ReasoningBudget:
 		default:
 			errs = append(errs, "upstream "+id+" has an unknown reasoning setting "+u.Reasoning+
-				" ("+ReasoningClosed+", "+ReasoningEffort+" or "+ReasoningTemplate+")")
+				" ("+ReasoningClosed+", "+ReasoningEffort+", "+ReasoningTemplate+" or "+ReasoningBudget+")")
 			delete(ups, id)
 			continue
 		}
