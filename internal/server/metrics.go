@@ -37,6 +37,7 @@ type counters struct {
 	// agent turn place.
 	messagesFieldsStripped atomic.Int64
 	chatLongInputPlaces    atomic.Int64
+	chatCountFailures      atomic.Int64
 }
 
 func (c *counters) observe(ev spool.Event) {
@@ -91,6 +92,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"messagesCountFailures":  s.metrics.messagesCountFailures.Load(),
 		"messagesFieldsStripped": s.metrics.messagesFieldsStripped.Load(),
 		"chatLongInputPlaces":    s.metrics.chatLongInputPlaces.Load(),
+		"chatCountFailures":      s.metrics.chatCountFailures.Load(),
 		"bodiesCaptured":         s.metrics.bodiesCaptured.Load(),
 		"spoolWriteFailures":     s.metrics.spoolWriteFailures.Load(),
 		"streamCostFilled":       s.metrics.streamCostFilled.Load(),

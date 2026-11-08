@@ -63,7 +63,8 @@ type Upstream struct {
 	// upstream take one of the same turn places when its input, counted by
 	// the upstream's tokenizer, is at least this long; 0 keeps chat out of
 	// the bound. A long chat prompt is the same prefill as an agent turn and
-	// holds the box the same way; a short one is what the bound protects.
+	// holds the box the same way; a short one stays outside, so it is never
+	// refused here and waits only in the serving process's own queue.
 	MessagesChatInputTokens int
 	// ProbeInterval controls the read-only GET /models observation loop. A
 	// private or loopback literal defaults to the on-prem cadence; a public

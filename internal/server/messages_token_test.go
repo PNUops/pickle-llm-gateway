@@ -41,6 +41,10 @@ func (u *selfHostedMessages) install(h *harness) {
 		hdr := http.Header{"Content-Type": {"application/json"}}
 		if r.URL.Path == "/tokenize" {
 			// The serving process's chat tokenizer, beside the versioned API.
+			if countStatus != 0 && countStatus != http.StatusOK {
+				return &http.Response{StatusCode: countStatus, Header: hdr, Request: r,
+					Body: io.NopCloser(strings.NewReader(`{"error":{"message":"tokenizer down"}}`))}, nil
+			}
 			return &http.Response{StatusCode: http.StatusOK, Header: hdr, Request: r,
 				Body: io.NopCloser(strings.NewReader(`{"count":` + itoa(count) + `,"max_model_len":131072,"tokens":[1,2,3]}`))}, nil
 		}
@@ -577,6 +581,18 @@ func TestSelfHostedChatShortInputOutsideBound(t *testing.T) {
 	if h.srv.metrics.chatLongInputPlaces.Load() != 0 {
 		t.Fatal("short chat took a place")
 	}
+	// A failed count leaves it outside the bound and is counted apart from
+	// the Messages counter.
+	u.mu.Lock()
+	u.count, u.countStatus = 64, http.StatusInternalServerError
+	u.mu.Unlock()
+	if rec := serveVariant(t, h, protoChat, nil, chatBody); rec.Code != 200 {
+		t.Fatalf("chat with a failed count: %d %s", rec.Code, rec.Body)
+	}
+	if h.srv.metrics.chatLongInputPlaces.Load() != 0 || h.srv.metrics.chatCountFailures.Load() != 1 ||
+		h.srv.metrics.messagesCountFailures.Load() != 0 {
+		t.Fatal("failed chat count misfiled")
+	}
 	// A body too short in bytes to reach the threshold is not counted.
 	h2, u2 := chatLongHarness(t)
 	up := h2.srv.cfg.Upstreams["mock"]
@@ -587,5 +603,19 @@ func TestSelfHostedChatShortInputOutsideBound(t *testing.T) {
 	}
 	if paths, _ := u2.calls(); len(paths) != 1 || paths[0] == "/tokenize" {
 		t.Fatalf("small chat was counted: %v", paths)
+	}
+}
+
+// A base URL without the /v1 suffix is used as it is.
+func TestSelfHostedChatTokenizerWithoutVersionSuffix(t *testing.T) {
+	h, u := chatLongHarness(t)
+	up := h.srv.cfg.Upstreams["mock"]
+	up.BaseURL = strings.TrimSuffix(up.BaseURL, "/v1")
+	h.srv.cfg.Upstreams["mock"] = up
+	if rec := serveVariant(t, h, protoChat, nil, chatBody); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if paths, _ := u.calls(); len(paths) == 0 || paths[0] != "/tokenize" {
+		t.Fatalf("calls: %v", paths)
 	}
 }

@@ -129,8 +129,10 @@ multipart는 그대로 넘기지 않고 해석한 뒤 아는 필드(`model`, `la
   `LLMGW_UPSTREAM_<REF>_MESSAGES_CHAT_INPUT_TOKENS`(기본 32768) 이상이면 같은 자리를 하나 잡아요.
   긴 Chat의 prefill은 에이전트 턴과 같은 무게라서요. 입력은 업스트림의 `/tokenize`(기본 URL 끝의
   `/v1`을 뗀 자리)로 세고, 본문 바이트가 기준보다 충분히 작으면 세지 않아요. 세기가 실패하면 자리 없이
-  보내요. 자리가 없으면 같은 429 `agent_busy`로 답하고 `/metrics`의 `chatLongInputPlaces`가 자리를 잡은
-  긴 Chat 수예요. 짧은 Chat은 이 한도와 무관해요.
+  보내요(`/metrics`의 `chatCountFailures`). 자리가 없으면 같은 429 `agent_busy`로 답하고
+  `chatLongInputPlaces`가 자리를 잡은 긴 Chat 수예요. 폴백이 있는 모델의 주 업스트림이 쉬는 중이면 세지도
+  자리를 잡지도 않아요. 그 밖에는 폴백이 응답하더라도 주 업스트림의 자리를 응답이 끝날 때까지 잡아요. 짧은
+  Chat은 이 한도와 무관해요.
 - **폴백**: 폴백 업스트림으로 보내지 않아요. 주 업스트림이 쉬는 동안의 턴은 실패해요.
 - **사용량**: `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`를 더한 값을 입력
   토큰으로 기록하고 분당 토큰과 일일 토큰 한도에 써요. 캐시에서 읽은 값은 캐시 입력으로 따로

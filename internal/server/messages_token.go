@@ -99,7 +99,7 @@ func (s *Server) noteStrippedFields(ev *spool.Event, names []string) {
 	}
 	for i, n := range names {
 		if len(n) > strippedFieldNameBytes {
-			names[i] = n[:strippedFieldNameBytes]
+			names[i] = strings.ToValidUTF8(n[:strippedFieldNameBytes], "")
 		}
 	}
 	s.log.Info("unknown fields removed", "keyId", ev.KeyID, "model", ev.PublicModelName, "fields", names)
@@ -329,21 +329,33 @@ func fitsWithoutCounting(bodyBytes, maxTokens int) bool {
 // chatInputIsLong reports whether a self-hosted chat request on up is long
 // enough to take an agent turn place: up serves agents with a turn bound and
 // a chat threshold, and the prompt counted by up's own tokenizer reaches it.
-// A body too short in bytes to reach it is not counted. A count that fails
-// leaves the request outside the bound, as a failed count admits a turn
-// past the input cap: the bound protects other callers' latency, and chat
-// was outside it until the threshold existed.
+// A body too short in bytes to reach it is not counted, and neither is one
+// whose primary is cooling down while a fallback stands ready: the fallback
+// is tried first, so the primary's counter would only add its timeout and
+// the place would bound a box the request does not reach. A count that fails
+// leaves the request outside the bound, as a failed count admits a turn past
+// the input cap: the bound protects other callers' latency, and chat was
+// outside it until the threshold existed.
 func (s *Server) chatInputIsLong(ctx context.Context, up config.Upstream, model *snapshot.Model, params map[string]json.RawMessage, bodyBytes int) bool {
 	limit := up.MessagesChatInputTokens
 	if up.Messages != config.MessagesOpen || up.MessagesMaxConcurrent <= 0 || limit <= 0 ||
 		fitsWithoutCounting(bodyBytes, limit-1) {
 		return false
 	}
+	if model.FallbackRef != "" && s.health.cooling(model.UpstreamRef) {
+		return false
+	}
 	n, ae := s.countChatTokens(ctx, up, model, params)
 	if ae != nil {
 		if ctx.Err() == nil {
-			s.metrics.messagesCountFailures.Add(1)
-			s.log.Warn("chat input count failed, leaving it outside the turn bound", "upstreamRef", up.Ref, "error", ae.err)
+			s.metrics.chatCountFailures.Add(1)
+			reason := "transport"
+			if ae.refusal != nil {
+				reason = ae.refusal.code
+			} else if ae.err != nil {
+				reason = ae.err.Error()
+			}
+			s.log.Warn("chat input count failed, leaving it outside the turn bound", "upstreamRef", up.Ref, "reason", reason)
 		}
 		return false
 	}
