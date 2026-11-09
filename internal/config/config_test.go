@@ -114,6 +114,8 @@ func TestReasoningParsing(t *testing.T) {
 		"LLMGW_UPSTREAM_B_REASONING=effort",
 		"LLMGW_UPSTREAM_C_BASE_URL=http://127.0.0.1:8000/v1",
 		"LLMGW_UPSTREAM_C_REASONING=template",
+		"LLMGW_UPSTREAM_D_BASE_URL=http://127.0.0.1:8001/v1",
+		"LLMGW_UPSTREAM_D_REASONING=budget",
 	})
 	if len(errs) != 0 {
 		t.Fatal(errs)
@@ -122,8 +124,8 @@ func TestReasoningParsing(t *testing.T) {
 	if ups["a"].Reasoning != ReasoningClosed {
 		t.Fatalf("default reasoning not applied: %+v", ups["a"])
 	}
-	if ups["b"].Reasoning != ReasoningEffort || ups["c"].Reasoning != ReasoningTemplate {
-		t.Fatalf("explicit reasoning lost: %+v %+v", ups["b"], ups["c"])
+	if ups["b"].Reasoning != ReasoningEffort || ups["c"].Reasoning != ReasoningTemplate || ups["d"].Reasoning != ReasoningBudget {
+		t.Fatalf("explicit reasoning lost: %+v %+v %+v", ups["b"], ups["c"], ups["d"])
 	}
 	ups, errs = upstreamsFromEnv([]string{
 		"LLMGW_UPSTREAM_E_BASE_URL=https://e.example/v1",
@@ -139,6 +141,51 @@ func TestReasoningParsing(t *testing.T) {
 		})
 		if len(errs) == 0 {
 			t.Fatalf("unknown reasoning setting %q accepted", bad)
+		}
+	}
+}
+
+func TestMessagesParsing(t *testing.T) {
+	ups, errs := upstreamsFromEnv([]string{
+		"LLMGW_UPSTREAM_A_BASE_URL=https://a.example/v1",
+		"LLMGW_UPSTREAM_DGX_BASE_URL=http://127.0.0.1:8000/v1",
+		"LLMGW_UPSTREAM_DGX_MESSAGES=open",
+		"LLMGW_UPSTREAM_TUNED_BASE_URL=http://127.0.0.1:8001/v1",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES=open",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_MAX_INPUT_TOKENS=0",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_MAX_CONCURRENT=2",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_QUEUE_WAIT=0s",
+		"LLMGW_UPSTREAM_TUNED_MESSAGES_CHAT_INPUT_TOKENS=0",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	// Unset is closed: no upstream starts serving agents because it was
+	// configured before this setting existed.
+	if ups["a"].Messages != MessagesClosed {
+		t.Fatalf("default messages setting not applied: %+v", ups["a"])
+	}
+	if got := ups["dgx"]; got.Messages != MessagesOpen || got.MessagesMaxInputTokens != 65536 ||
+		got.MessagesMaxConcurrent != 8 || got.MessagesQueueWait != 60*time.Second || got.MessagesChatInputTokens != 32768 {
+		t.Fatalf("defaults for an open upstream: %+v", got)
+	}
+	// An explicit 0 turns a bound off rather than falling back to the default.
+	if got := ups["tuned"]; got.MessagesMaxInputTokens != 0 || got.MessagesMaxConcurrent != 2 ||
+		got.MessagesQueueWait != 0 || got.MessagesChatInputTokens != 0 {
+		t.Fatalf("explicit values lost: %+v", got)
+	}
+	for _, bad := range [][]string{
+		{"LLMGW_UPSTREAM_D_MESSAGES=on"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_INPUT_TOKENS=-1"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_INPUT_TOKENS=64k"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_MAX_CONCURRENT=two"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_QUEUE_WAIT=10"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_QUEUE_WAIT=10m"},
+		{"LLMGW_UPSTREAM_D_MESSAGES_CHAT_INPUT_TOKENS=32k"},
+	} {
+		_, errs = upstreamsFromEnv(append([]string{"LLMGW_UPSTREAM_D_BASE_URL=https://d.example/v1"}, bad...))
+		if len(errs) == 0 {
+			t.Fatalf("bad messages setting accepted: %v", bad)
 		}
 	}
 }

@@ -84,7 +84,7 @@ func TestNamedStreamEndSet(t *testing.T) {
 		out, ev, _ := relayNamed(t, testNamedStream(),
 			"event: message_start\ndata: "+msgStart+"\n\nevent: content_block_delta\ndata: "+msgDelta+"\n\n")
 		wantTail := "event: error\ndata: " + string(anthropicErrorBody("api_error", "upstream_stream_interrupted",
-			"모델 서버 응답이 중간에 끊겼습니다. 응답이 불완전할 수 있습니다.", "req-1")) + "\n\n"
+			"모델 서버 응답이 중간에 끊겼어요. 응답이 불완전할 수 있어요.", "req-1")) + "\n\n"
 		if !strings.HasSuffix(out, wantTail) || strings.Count(out, "event: error") != 1 {
 			t.Fatalf("stream end: %q", out)
 		}

@@ -11,6 +11,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
@@ -60,6 +61,9 @@ func validReasoningEffort(raw json.RawMessage) bool {
 //   - template: replaced by the chat template's thinking switch, off for
 //     "none" and on for every other value. The template has no notion of
 //     effort, so low and high reach it as the same request.
+//   - budget: the template switch, plus a thinking budget for every value but
+//     "none" (see reasoningBudgets). The effort is spent as a ceiling on the
+//     thinking rather than as a hint the model may ignore.
 //   - closed: removed. Only a fallback can be closed here, since a closed
 //     primary refuses the field at admission; serving the request without
 //     reasoning is better than failing it for the route it took.
@@ -82,14 +86,33 @@ func reasoningForAttempt(params map[string]json.RawMessage, field string, up con
 	switch up.Reasoning {
 	case config.ReasoningEffort:
 		out[field] = raw
-	case config.ReasoningTemplate:
+	case config.ReasoningTemplate, config.ReasoningBudget:
 		var v string
 		_ = json.Unmarshal(raw, &v)
 		if v == "none" {
 			out["chat_template_kwargs"] = json.RawMessage(`{"enable_thinking":false}`)
-		} else {
-			out["chat_template_kwargs"] = json.RawMessage(`{"enable_thinking":true}`)
+			break
+		}
+		out["chat_template_kwargs"] = json.RawMessage(`{"enable_thinking":true}`)
+		if up.Reasoning == config.ReasoningBudget {
+			out["thinking_token_budget"] = json.RawMessage(strconv.Itoa(reasoningBudgets[v]))
 		}
 	}
 	return out
+}
+
+// reasoningBudgets are the thinking budgets a budget upstream gets for each
+// effort. On a model whose template only switches thinking on or off, low and
+// high otherwise produce the same answer, and thinking left unbounded
+// multiplied output four to eleven times on the self-hosted model's
+// benchmarks. The serving process ends the thinking once the budget is spent
+// and the answer follows, so the effort becomes a real ceiling on the
+// generation it costs. The caller cannot send a budget of its own: the field
+// is refused at admission on every setting.
+var reasoningBudgets = map[string]int{
+	"minimal": 1024,
+	"low":     1024,
+	"medium":  4096,
+	"high":    8192,
+	"xhigh":   8192,
 }

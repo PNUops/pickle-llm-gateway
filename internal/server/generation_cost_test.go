@@ -95,6 +95,10 @@ func generationHarnessFor(t *testing.T, doc func(*snapshot.Document), cfg func(*
 		}
 	})
 	g.setInner(h.mock.handler)
+	// A cost lookup still running when the test returns writes into the
+	// spool while its temporary directory is being removed. Cleanups run in
+	// reverse, so this one finishes them first.
+	t.Cleanup(func() { h.srv.DrainCostLookups(context.Background()) })
 	h.srv.costs.stream.delays = delays
 	h.srv.costs.passthrough.delays = delays
 	return h, g
