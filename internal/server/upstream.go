@@ -31,6 +31,9 @@ type attemptError struct {
 	// retryAfter is the vendor's own wait on a 429 or 503, in seconds, empty
 	// when it gave none. It is relayed only on the money axis.
 	retryAfter string
+	// status is the upstream's status when it answered one this function
+	// classified generically, 0 otherwise.
+	status int
 }
 
 // upstreamHealth tracks consecutive failures per upstream so a dead one stops
@@ -361,6 +364,10 @@ type attemptSpec struct {
 	// name forwarded is already the caller's own.
 	upstreamModel string
 	publicModel   string
+	// pass names statuses besides 200 that come back as a response for the
+	// caller to read rather than being classified here: an async submit's
+	// 201 or 202, and the 404, 409 and 410 an object route acts on itself.
+	pass map[int]bool
 }
 
 // attemptFor is the shape of one call on a surface for a model. Client
@@ -448,7 +455,7 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		}
 		return nil, &attemptError{err: err, timeout: timedOut, kind: kind}
 	}
-	if resp.StatusCode == http.StatusOK {
+	if resp.StatusCode == http.StatusOK || spec.pass[resp.StatusCode] {
 		return resp, nil
 	}
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, rejectionReadLimit))
@@ -508,7 +515,7 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if resp.StatusCode >= http.StatusInternalServerError {
 			kind = failureUpstream
 		}
-		ae := &attemptError{err: errUpstreamStatus, kind: kind}
+		ae := &attemptError{err: errUpstreamStatus, kind: kind, status: resp.StatusCode}
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			ae.retryAfter = upstreamRetryAfter(resp.Header)
 		}

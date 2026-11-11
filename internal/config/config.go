@@ -276,6 +276,14 @@ type Config struct {
 	PassthroughHeaderWait          time.Duration
 	PassthroughMaxInFlight         int
 
+	// OwnershipTimeout bounds each call to the api's ownership ledger, which
+	// sits on a client's request path on the async routes, and
+	// OwnershipBindBudget bounds the retried bind after a vendor accepted a
+	// submit. The async routes need CONTROL_BASE_URL and CONTROL_TOKEN; a
+	// gateway without them answers those routes 503 and serves the rest.
+	OwnershipTimeout    time.Duration
+	OwnershipBindBudget time.Duration
+
 	// Fallback limits for keys whose snapshot entry sets none.
 	DefaultRpm         int
 	DefaultTpm         int
@@ -335,6 +343,8 @@ func FromEnv() (*Config, error) {
 		ControlBaseURL:       strings.TrimRight(getenv("CONTROL_BASE_URL", ""), "/"),
 		ControlToken:         getenv("CONTROL_TOKEN", ""),
 		ControlTimeout:       10 * time.Second,
+		OwnershipTimeout:     2 * time.Second,
+		OwnershipBindBudget:  12 * time.Second,
 		SnapshotPollInterval: 5 * time.Second,
 		RequestBodyMaxBytes:  2 << 20,
 		// The passthrough's value. Long reasoning and vendor server-tool
@@ -457,6 +467,8 @@ func FromEnv() (*Config, error) {
 		{"UPSTREAM_HEADER_WAIT", &cfg.UpstreamHeaderWait},
 		{"PASSTHROUGH_HEADER_WAIT", &cfg.PassthroughHeaderWait},
 		{"REQUEST_MAX_DURATION", &cfg.RequestMaxDuration},
+		{"OWNERSHIP_TIMEOUT", &cfg.OwnershipTimeout},
+		{"OWNERSHIP_BIND_BUDGET", &cfg.OwnershipBindBudget},
 	} {
 		if v := getenv(opt.name, ""); v != "" {
 			d, err := time.ParseDuration(v)

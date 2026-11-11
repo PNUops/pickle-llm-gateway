@@ -519,8 +519,8 @@ func TestMessagesCountTokensIsUnknown(t *testing.T) {
 	h, v := messagesHarness(t, nil)
 	for _, c := range []struct{ path, token string }{
 		{"/v1/messages/count_tokens?beta=true", testToken},
-		{"/v1/messages/batches", testToken},
 		{"/v1/messages/", testToken},
+		{"/v1/messages/batchesx", testToken},
 	} {
 		token := c.token
 		req, _ := http.NewRequest(http.MethodPost, h.gw.URL+c.path,

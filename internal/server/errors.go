@@ -123,7 +123,26 @@ var (
 		"모델 서버 응답이 허용 크기를 넘었거나 큰 응답을 처리할 자리가 없어요. 한 번에 만드는 개수(n)나 요청한 크기를 줄여 주세요."}
 	errNotFound = apiError{http.StatusNotFound, "invalid_request_error", "unknown_endpoint",
 		"지원하지 않는 경로예요. 지원 경로: GET /v1/models, POST /v1/chat/completions, POST /v1/completions, POST /v1/messages, POST /v1/responses, " +
-			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions."}
+			"POST /v1/images, POST /v1/images/generations, GET /v1/images/models, POST /v1/embeddings, POST /v1/rerank, POST /v1/audio/speech, POST /v1/audio/transcriptions, " +
+			"POST /v1/batches, GET /v1/batches, GET /v1/batches/{id}, DELETE /v1/batches/{id}, " +
+			"POST /v1/messages/batches, GET /v1/messages/batches, GET /v1/messages/batches/{id}, GET /v1/messages/batches/{id}/results, DELETE /v1/messages/batches/{id}, " +
+			"POST /v1/videos, GET /v1/videos/{id}, GET /v1/videos/{id}/content, GET /v1/videos/models."}
+	// The ownership ledger could not be asked, so a request that names or
+	// creates an async object cannot be decided. Only those requests stop;
+	// everything else keeps serving. Waiting is the remedy.
+	errOwnershipUnavailable = apiError{http.StatusServiceUnavailable, "server_error",
+		"ownership_unavailable",
+		"작업 소유 기록을 확인할 수 없어요. 잠시 후 다시 시도해 주세요."}
+	// Another key's object and no object at all get the same answer, so the
+	// answer cannot be used to find out what other keys have made.
+	errObjectNotFound = apiError{http.StatusNotFound, "invalid_request_error", "object_not_found",
+		"요청한 작업을 찾을 수 없어요. 이 API 키로 만든 작업의 id인지 확인해 주세요."}
+	errBatchModelUnavailable = apiError{http.StatusBadRequest, "invalid_request_error", "batch_model_unavailable",
+		"이 모델은 지금 배치로 보낼 수 없어요. 공급사가 배치를 제공하지 않거나 별도 공급사 키가 필요한 모델이에요. 다른 모델을 골라 주세요."}
+	errModelNotOnBatches = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
+		"이 모델은 배치로 보낼 수 없어요. 공급사 모델 ID를 직접 지정해 주세요."}
+	errBatchNotFinished = apiError{http.StatusConflict, "invalid_request_error", "batch_not_finished",
+		"아직 끝나지 않은 배치는 지울 수 없어요. 배치가 끝난 뒤 다시 시도해 주세요."}
 	// Every self-hosted agent place on the upstream is taken and the short
 	// wait for one ran out. 429 with a Retry-After: waiting is the remedy.
 	errAgentBusy = apiError{http.StatusTooManyRequests, "rate_limit_error", "agent_busy",
@@ -165,6 +184,9 @@ var retryAfterSeconds = map[string]int{
 	// A self-hosted agent turn holds its place through its whole answer,
 	// seconds to minutes; this is the retry pace after the queue wait.
 	"agent_busy": 10,
+	// The api answers again within seconds of a restart, and a cache miss is
+	// all that waits on it.
+	"ownership_unavailable": 5,
 }
 
 // Internal sentinels for upstream failure reasons. They never reach a client;
@@ -422,8 +444,18 @@ func errMissingParam(name string) apiError {
 		"필수 파라미터가 없어요: " + name}
 }
 
+// noRetryCodes are refusals an SDK would retry by status (409) that waiting a
+// moment does not change: the client has to poll first.
+var noRetryCodes = map[string]bool{
+	"batch_not_finished": true,
+	"video_not_ready":    true,
+}
+
 func writeAPIError(w http.ResponseWriter, e apiError) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if noRetryCodes[e.code] {
+		w.Header().Set("X-Should-Retry", "false")
+	}
 	if seconds := retryAfterSeconds[e.code]; seconds > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	}

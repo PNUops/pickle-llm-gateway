@@ -312,7 +312,8 @@ func TestEveryDocumentedEnvVarIsAccepted(t *testing.T) {
 	value := func(n string) string {
 		switch {
 		case strings.HasSuffix(n, "_INTERVAL"), strings.HasSuffix(n, "_WAIT"),
-			strings.HasSuffix(n, "_DURATION"), strings.HasSuffix(n, "_TIMEOUT"):
+			strings.HasSuffix(n, "_DURATION"), strings.HasSuffix(n, "_TIMEOUT"),
+			strings.HasSuffix(n, "_BUDGET"):
 			return "5s"
 		case n == "LLMGW_SNAPSHOT_SOURCE":
 			return "file"

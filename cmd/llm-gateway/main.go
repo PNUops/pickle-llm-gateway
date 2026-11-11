@@ -17,6 +17,7 @@ import (
 	"github.com/pnuops/pickle-llm-gateway/internal/bodies"
 	"github.com/pnuops/pickle-llm-gateway/internal/config"
 	"github.com/pnuops/pickle-llm-gateway/internal/limits"
+	"github.com/pnuops/pickle-llm-gateway/internal/ownership"
 	"github.com/pnuops/pickle-llm-gateway/internal/reporter"
 	"github.com/pnuops/pickle-llm-gateway/internal/server"
 	"github.com/pnuops/pickle-llm-gateway/internal/snapshot"
@@ -62,6 +63,15 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.New(cfg, store, limits.New(nil), sp, log)
+	// The async routes ask the api who owns an object, so they exist only
+	// where the gateway has the control link. Without it they answer 503 and
+	// every other route serves as before.
+	if cfg.ControlBaseURL != "" && cfg.ControlToken != "" {
+		srv.SetOwnership(ownership.New(cfg.ControlBaseURL, cfg.ControlToken, ownership.Options{
+			Timeout:    cfg.OwnershipTimeout,
+			BindBudget: cfg.OwnershipBindBudget,
+		}))
+	}
 	srv.RunUpstreamProbes(ctx)
 	srv.RunVendorCatalog(ctx)
 
