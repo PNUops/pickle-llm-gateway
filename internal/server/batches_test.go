@@ -25,11 +25,12 @@ type fakeLedger struct {
 	lookups  int
 	releases []map[string]any
 	fail     map[string]int // path suffix -> status to answer
+	failCode map[string]string
 }
 
 func newFakeLedger(t *testing.T, h *harness) *fakeLedger {
 	t.Helper()
-	l := &fakeLedger{owned: map[string]bool{}, fail: map[string]int{}}
+	l := &fakeLedger{owned: map[string]bool{}, fail: map[string]int{}, failCode: map[string]string{}}
 	srv := httptest.NewServer(http.HandlerFunc(l.handle))
 	t.Cleanup(srv.Close)
 	h.srv.SetOwnership(ownership.New(srv.URL, "ledger-token", ownership.Options{
@@ -58,6 +59,14 @@ func (l *fakeLedger) setFail(path string, status int) {
 	l.fail[path] = status
 }
 
+// refuse makes a path answer a refusal carrying a code.
+func (l *fakeLedger) refuse(path string, status int, code string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fail[path] = status
+	l.failCode[path] = code
+}
+
 func (l *fakeLedger) counts() (intents, binds, lookups int, releases []map[string]any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,6 +91,12 @@ func (l *fakeLedger) handle(w http.ResponseWriter, r *http.Request) {
 		l.releases = append(l.releases, body)
 	}
 	if status := l.fail[path]; status != 0 {
+		if code := l.failCode[path]; code != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"code":"`+code+`"}`)
+			return
+		}
 		w.WriteHeader(status)
 		return
 	}

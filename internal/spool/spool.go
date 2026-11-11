@@ -139,6 +139,13 @@ const (
 	EndpointBatches    = "batches"
 	EndpointBatchReads = "batches_read"
 	EndpointBatchCost  = "batches_cost"
+	// EndpointVideos is a video job submit; its status and content reads are
+	// EndpointVideoReads, a finished job's price EndpointVideoCost, and the
+	// model list EndpointVideoModels.
+	EndpointVideos      = "videos"
+	EndpointVideoReads  = "videos_read"
+	EndpointVideoCost   = "videos_cost"
+	EndpointVideoModels = "videos_models"
 )
 
 // costLiteralMax bounds the marshaled price. A real one is a handful of

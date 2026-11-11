@@ -40,12 +40,16 @@ type asyncCall struct {
 	r       *http.Request
 	ev      spool.Event
 	doc     snapshot.Document
+	models  func(string) *snapshot.Model
 	key     *snapshot.Key
 	up      config.Upstream
 	cred    string
 	large   *passthroughLargeHold
 	latency time.Duration
 	start   time.Time
+	// anthropic is set on the Anthropic-shaped batch routes: the key may come
+	// in x-api-key and refusals use the Anthropic error envelope.
+	anthropic bool
 	// done releases the gateway-wide slot and the large-body slot.
 	done func()
 }
@@ -54,9 +58,16 @@ type asyncCall struct {
 // recorded, and returns nil; otherwise the caller owns the call and must run
 // its done.
 func (s *Server) beginAsync(w http.ResponseWriter, r *http.Request, endpoint, capability string) *asyncCall {
+	return s.beginAsyncAs(w, r, endpoint, capability, false)
+}
+
+// beginAsyncAs is beginAsync for a route of either shape; anthropic selects
+// the Anthropic client's key header and error envelope.
+func (s *Server) beginAsyncAs(w http.ResponseWriter, r *http.Request, endpoint, capability string,
+	anthropic bool) *asyncCall {
 	start := s.now()
 	noAttempts := 0
-	c := &asyncCall{s: s, w: w, r: r, start: start, latency: -1, done: func() {}}
+	c := &asyncCall{s: s, w: w, r: r, start: start, latency: -1, done: func() {}, anthropic: anthropic}
 	c.ev = spool.Event{
 		EventUUID:   spool.NewEventUUID(),
 		RequestedAt: start,
@@ -65,14 +76,26 @@ func (s *Server) beginAsync(w http.ResponseWriter, r *http.Request, endpoint, ca
 	}
 	w.Header().Set("X-Request-Id", c.ev.EventUUID)
 
-	doc, keyLookup, _ := s.store.Current()
+	doc, keyLookup, modelLookup := s.store.Current()
 	c.doc = doc
+	c.models = modelLookup
 	c.ev.Generation = doc.Generation
 	if !doc.ServiceEnabled {
 		c.refuse(errServiceDisabled, spool.StatusAuthRejected)
 		return nil
 	}
-	key, authErr := s.authenticate(r, keyLookup)
+	var key *snapshot.Key
+	var authErr *apiError
+	if anthropic {
+		token, missing := messagesToken(r)
+		if missing != nil {
+			authErr = missing
+		} else {
+			key, authErr = s.authenticateToken(token, keyLookup)
+		}
+	} else {
+		key, authErr = s.authenticate(r, keyLookup)
+	}
 	if key != nil {
 		c.ev.KeyID = key.KeyID
 	}
@@ -159,7 +182,11 @@ func (c *asyncCall) refuse(e apiError, status string) {
 }
 
 func (c *asyncCall) refuseAs(e apiError, status, errorType string) {
-	writeAPIError(c.w, e)
+	if c.anthropic {
+		writeAnthropicError(c.w, e, c.ev.EventUUID)
+	} else {
+		writeAPIError(c.w, e)
+	}
 	c.ev.Status = status
 	c.ev.ErrorType = errorType
 	c.record()
@@ -336,7 +363,14 @@ func (c *asyncCall) writeJSON(status int, body []byte) {
 // object any number of times on any instance, so the event's id is derived
 // from the object: every read after the first produces the same id and the
 // api keeps one. The request's own event stays a separate, unpriced call.
-func (c *asyncCall) settle(endpoint string, kind ownership.Kind, objectID, model string, u usage) {
+//
+// The usage is read leniently (lenientUsage): a member of a type this
+// gateway does not expect costs that member, never the owner's answer.
+func (c *asyncCall) settle(endpoint string, kind ownership.Kind, objectID, model string, raw json.RawMessage) {
+	u, ok := lenientUsage(raw)
+	if !ok {
+		return
+	}
 	cost := spool.CostLiteral(u.Cost)
 	if cost == "" {
 		return
@@ -446,17 +480,37 @@ func (c *asyncCall) readRequest() ([]byte, bool) {
 // fenceModel runs the passthrough surface's model fence over a submit's
 // top-level model and the body fields that can name another one. It returns
 // nil after answering a refusal.
-func (c *asyncCall) fenceModel(publicModel string, params map[string]json.RawMessage) *snapshot.Model {
+//
+// curated is set when the model is a chat model (a batch that targets chat,
+// Responses or Messages): it is then resolved and judged as the chat route
+// judges it, through the catalogue and the key's curation list, so a batch
+// cannot reach a model the same key's chat would refuse. A self-hosted
+// catalogue model is refused: the vendor cannot serve it.
+func (c *asyncCall) fenceModel(publicModel string, params map[string]json.RawMessage, curated bool) *snapshot.Model {
 	if snapshot.IsPresetModelName(publicModel) {
 		c.refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
 		return nil
 	}
-	model := passthroughModel(&c.doc, publicModel)
+	var model *snapshot.Model
+	if curated && c.models != nil {
+		model = c.models(publicModel)
+		if model != nil && !model.CreditAxis() {
+			c.refuseAs(errCreditModelNotAllowed, spool.StatusBadRequest, "credit_model_not_allowed")
+			return nil
+		}
+	}
+	if model == nil {
+		model = passthroughModel(&c.doc, publicModel)
+	}
 	if model == nil {
 		c.refuse(errModelNotFound, spool.StatusBadRequest)
 		return nil
 	}
 	c.ev.PublicModelName = model.PublicName
+	if curated && !c.key.AllowsModel(model) {
+		c.refuse(errModelNotAllowed, spool.StatusBadRequest)
+		return nil
+	}
 	if !c.key.ServesCreditModel(model) {
 		if snapshot.IsRouterModelName(publicModel) {
 			c.refuseAs(errRouterModelNotSupported(publicModel), spool.StatusBadRequest,
@@ -470,19 +524,109 @@ func (c *asyncCall) fenceModel(publicModel string, params map[string]json.RawMes
 		c.refuseAs(errPresetNotAllowed, spool.StatusBadRequest, "preset_not_allowed")
 		return nil
 	}
-	noLookup := func(string) *snapshot.Model { return nil }
-	if bad, ok := fenceCandidateModels(&c.doc, noLookup, c.key, params); !ok {
+	lookup := c.lookup()
+	if bad, ok := fenceCandidateModels(&c.doc, lookup, c.key, params); !ok {
 		c.refuseAs(errCandidateModelNotAllowed(bad), spool.StatusBadRequest,
 			"credit_model_not_allowed")
 		return nil
 	}
-	if e := c.s.fenceServerTools(&c.doc, noLookup, c.key, params); e != nil {
+	if e := c.s.fenceServerTools(&c.doc, lookup, c.key, params); e != nil {
 		c.refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 		return nil
 	}
-	if e := c.s.fencePlugins(&c.doc, noLookup, c.key, params); e != nil {
+	if e := c.s.fencePlugins(&c.doc, lookup, c.key, params); e != nil {
 		c.refuseAs(*e, spool.StatusBadRequest, toolRefusalType(*e))
 		return nil
 	}
 	return model
+}
+
+// lenientUsage reads a vendor usage object member by member. A member that is
+// missing or of an unexpected type reads as zero, and the cost is taken from a
+// number or a numeric string; only an absent or non-object usage, or one
+// without a cost, reports false.
+func lenientUsage(raw json.RawMessage) (usage, bool) {
+	var u usage
+	var m map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil || m == nil {
+		return u, false
+	}
+	count := func(v json.RawMessage) int {
+		var f float64
+		if json.Unmarshal(v, &f) != nil || f < 0 || f > 1<<40 {
+			return 0
+		}
+		return int(f)
+	}
+	u.PromptTokens = count(m["prompt_tokens"])
+	u.CompletionTokens = count(m["completion_tokens"])
+	u.TotalTokens = count(m["total_tokens"])
+	var details map[string]json.RawMessage
+	if json.Unmarshal(m["prompt_tokens_details"], &details) == nil {
+		u.PromptTokensDetails.CachedTokens = count(details["cached_tokens"])
+	}
+	details = nil
+	if json.Unmarshal(m["completion_tokens_details"], &details) == nil {
+		u.CompletionTokensDetails.ReasoningTokens = count(details["reasoning_tokens"])
+	}
+	cost := bytes.TrimSpace(m["cost"])
+	if len(cost) > 1 && cost[0] == '"' {
+		var s string
+		if json.Unmarshal(cost, &s) != nil {
+			return u, false
+		}
+		cost = []byte(strings.TrimSpace(s))
+	}
+	var n json.Number
+	if len(cost) == 0 || json.Unmarshal(cost, &n) != nil {
+		return u, false
+	}
+	u.Cost = n
+	return u, true
+}
+
+// asyncTerminal reports whether a vendor status is one an object does not
+// leave: the work is over and whatever it billed is final.
+func asyncTerminal(status string) bool {
+	switch status {
+	case "completed", "failed", "expired", "cancelled", "canceled":
+		return true
+	}
+	return false
+}
+
+// lookup is the catalogue lookup the body fences resolve a named model with:
+// the request's snapshot, so a catalogue model named as a fallback or by a
+// server tool is judged with its own flags, as it is on chat.
+func (c *asyncCall) lookup() func(string) *snapshot.Model {
+	if c.models == nil {
+		return func(string) *snapshot.Model { return nil }
+	}
+	return c.models
+}
+
+// boundedName echoes a client-supplied parameter name in a refusal only when
+// it is short enough to be a real one.
+func boundedName(name string) string {
+	if len(name) > maxPassthroughNameBytes {
+		return "(이름이 너무 긴 파라미터)"
+	}
+	return name
+}
+
+// noRetry tells an SDK not to retry this answer. It is set once a submit may
+// have reached the vendor: the object may exist and be billed, so a retry
+// would make a second one. Both the OpenAI and the Anthropic SDK honour it.
+func (c *asyncCall) noRetry() {
+	c.w.Header().Set("X-Should-Retry", "false")
+}
+
+// successStatuses is every 2xx, the statuses an async submit treats as the
+// vendor's acceptance.
+func successStatuses() map[int]bool {
+	m := make(map[int]bool, 100)
+	for s := 200; s < 300; s++ {
+		m[s] = true
+	}
+	return m
 }

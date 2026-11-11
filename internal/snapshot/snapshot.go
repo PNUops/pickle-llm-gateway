@@ -111,6 +111,8 @@ const (
 	// which the route checks per batch. Batches take their requests inline,
 	// so this grant does not involve file upload.
 	EndpointBatches = "batches"
+	// EndpointVideos governs the vendor's video generation route.
+	EndpointVideos = "videos"
 )
 
 // reservedModelPrefixes are the prefixes reserved for curated self-serve

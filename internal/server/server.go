@@ -139,6 +139,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 	mux.HandleFunc("/v1/messages/", s.handleMessagesUnknown)
+	// The Anthropic-shaped batch route (messages_batches.go), a translation
+	// of the batch route below.
+	mux.HandleFunc("/v1/messages/batches", s.handleMessagesBatches)
+	mux.HandleFunc("/v1/messages/batches/", s.handleMessagesBatches)
 	// The OpenAI Responses surface. Every subpath reads a stored response,
 	// and nothing is stored, so all of them are answered as unknown.
 	mux.HandleFunc("/v1/responses", s.handleResponses)
@@ -158,6 +162,10 @@ func (s *Server) Handler() http.Handler {
 	// an object's status, results and delete on the subtree.
 	mux.HandleFunc("/v1/batches", s.handleBatches)
 	mux.HandleFunc("/v1/batches/", s.handleBatches)
+	// The video route (videos.go) and its model list.
+	mux.HandleFunc("/v1/videos", s.handleVideos)
+	mux.HandleFunc("/v1/videos/", s.handleVideos)
+	mux.HandleFunc("/v1/videos/models", s.handlePassthrough(routeVideoModels))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound)
 	})
