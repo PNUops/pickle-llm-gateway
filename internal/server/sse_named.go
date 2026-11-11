@@ -115,7 +115,7 @@ func anthropicErrorType(e apiError) string {
 	// retried by Claude Code whatever the headers say, so these take the type
 	// it does not single out, and writeAnthropicError adds the header both it
 	// and the SDK obey.
-	if anthropicNoRetry[e.code] || noRetryCodes[e.code] {
+	if anthropicNoRetry[e.code] {
 		return "api_error"
 	}
 	switch e.typ {
@@ -180,7 +180,7 @@ func anthropicErrorBody(typ, code, msg, requestID string) []byte {
 // same status and Retry-After the OpenAI-shaped refusal carries.
 func writeAnthropicError(w http.ResponseWriter, e apiError, requestID string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if anthropicNoRetry[e.code] {
+	if anthropicNoRetry[e.code] || noRetryCodes[e.code] {
 		w.Header().Set("X-Should-Retry", "false")
 	}
 	if seconds := retryAfterSeconds[e.code]; seconds > 0 {

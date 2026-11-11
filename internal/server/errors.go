@@ -137,6 +137,8 @@ var (
 	// answer cannot be used to find out what other keys have made.
 	errObjectNotFound = apiError{http.StatusNotFound, "invalid_request_error", "object_not_found",
 		"요청한 작업을 찾을 수 없어요. 이 API 키로 만든 작업의 id인지 확인해 주세요."}
+	errBatchModelUnavailable = apiError{http.StatusBadRequest, "invalid_request_error", "batch_model_unavailable",
+		"이 모델은 지금 배치로 보낼 수 없어요. 공급사가 배치를 제공하지 않거나 별도 공급사 키가 필요한 모델이에요. 다른 모델을 골라 주세요."}
 	errModelNotOnBatches = apiError{http.StatusBadRequest, "invalid_request_error", "model_not_available_on_route",
 		"이 모델은 배치로 보낼 수 없어요. 공급사 모델 ID를 직접 지정해 주세요."}
 	errBatchNotFinished = apiError{http.StatusConflict, "invalid_request_error", "batch_not_finished",

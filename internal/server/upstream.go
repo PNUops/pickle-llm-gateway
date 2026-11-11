@@ -31,6 +31,9 @@ type attemptError struct {
 	// retryAfter is the vendor's own wait on a 429 or 503, in seconds, empty
 	// when it gave none. It is relayed only on the money axis.
 	retryAfter string
+	// status is the upstream's status when it answered one this function
+	// classified generically, 0 otherwise.
+	status int
 }
 
 // upstreamHealth tracks consecutive failures per upstream so a dead one stops
@@ -512,7 +515,7 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if resp.StatusCode >= http.StatusInternalServerError {
 			kind = failureUpstream
 		}
-		ae := &attemptError{err: errUpstreamStatus, kind: kind}
+		ae := &attemptError{err: errUpstreamStatus, kind: kind, status: resp.StatusCode}
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			ae.retryAfter = upstreamRetryAfter(resp.Header)
 		}

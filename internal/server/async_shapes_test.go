@@ -573,3 +573,60 @@ func TestVideoRefusesUndocumentedMembers(t *testing.T) {
 		t.Fatalf("undocumented member: %d %s", status, raw)
 	}
 }
+
+// A catalogue model's output bound applies to batch items as it does on chat:
+// a larger cap is refused, and an item naming none gets the bound.
+func TestBatchItemsTakeTheModelsOutputBound(t *testing.T) {
+	h := newHarness(t, func(d *snapshot.Document) {
+		passthroughDoc(snapshot.EndpointBatches)(d)
+		d.Models = append(d.Models, snapshot.Model{PublicName: "vendor/bounded", UpstreamRef: "mock",
+			UpstreamModel: "vendor/bounded", BudgetAxis: snapshot.AxisCredit, MaxOutputTokens: 100})
+	}, nil)
+	newFakeLedger(t, h)
+	acceptBatches(h)
+	over := `{"endpoint":"/v1/chat/completions","model":"vendor/bounded","requests":[{"custom_id":"a",` +
+		`"body":{"max_tokens":500,"messages":[{"role":"user","content":"hi"}]}}]}`
+	status, raw := h.passthrough(t, http.MethodPost, "/v1/batches", testToken, over)
+	if status != http.StatusBadRequest || errCode(t, raw) != "output_limit_exceeded" {
+		t.Fatalf("over the bound: %d %s", status, raw)
+	}
+	none := `{"endpoint":"/v1/chat/completions","model":"vendor/bounded","requests":[{"custom_id":"a",` +
+		`"body":{"messages":[{"role":"user","content":"hi"}]}}]}`
+	if status, raw := h.passthrough(t, http.MethodPost, "/v1/batches", testToken, none); status != http.StatusAccepted {
+		t.Fatalf("no cap: %d %s", status, raw)
+	}
+	_, _, _, sent := h.mock.lastRequest()
+	if !strings.Contains(string(sent), `"max_tokens":100`) {
+		t.Fatalf("the bound was not written: %s", sent)
+	}
+}
+
+// The vendor fails a whole batch when one request is invalid; its results
+// answer says why instead of an empty file.
+func TestMessagesBatchFailedAsAWholeSaysWhy(t *testing.T) {
+	h, ledger := batchHarness(t)
+	ledger.own("k-test", "BATCH", "batch_f")
+	useVendor(t, h, func(w http.ResponseWriter, r *http.Request) {
+		writeVendor(w, http.StatusOK, `{"id":"batch_f","status":"failed","request_counts":{"total":2,"completed":0,"failed":1},`+
+			`"results":null,"error":{"message":"Batch request 'bad-1' has no input."}}`)
+	})
+	status, raw, _ := anthropicCall(t, h, http.MethodGet, "/v1/messages/batches/batch_f/results", "")
+	if status != http.StatusBadRequest || !strings.Contains(string(raw), "batch_failed") ||
+		!strings.Contains(string(raw), "bad-1") {
+		t.Fatalf("failed batch results: %d %s", status, raw)
+	}
+}
+
+func TestBatchModelWithoutABatchProviderIsARefusal(t *testing.T) {
+	h, ledger := batchHarness(t)
+	useVendor(t, h, func(w http.ResponseWriter, r *http.Request) {
+		writeVendor(w, http.StatusNotFound, `{"error":{"code":404,"message":"only has :batch endpoints that require your own provider key"}}`)
+	})
+	status, raw := h.passthrough(t, http.MethodPost, "/v1/batches", testToken, batchBody)
+	if status != http.StatusBadRequest || errCode(t, raw) != "batch_model_unavailable" {
+		t.Fatalf("no batch provider: %d %s", status, raw)
+	}
+	if _, _, _, releases := ledger.counts(); len(releases) != 1 || releases[0]["reason"] != "NOT_CREATED" {
+		t.Fatalf("releases: %v", releases)
+	}
+}

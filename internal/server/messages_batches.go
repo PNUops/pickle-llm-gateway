@@ -38,6 +38,16 @@ const anthropicBatchDeadline = 24 * time.Hour
 // anthropicListMaxLimit is the Anthropic list's own bound on a page.
 const anthropicListMaxLimit = 1000
 
+// batchErrorMax bounds the vendor's batch-level error relayed in a refusal.
+const batchErrorMax = 500
+
+// errBatchFailed answers the results of a batch the vendor failed as a whole,
+// with the vendor's reason (it names the request at fault).
+func errBatchFailed(reason string) apiError {
+	return apiError{http.StatusBadRequest, "invalid_request_error", "batch_failed",
+		"배치 전체가 실패해서 결과가 없어요. 공급사가 알려 준 이유: " + strings.ToValidUTF8(reason, "")}
+}
+
 var (
 	errBatchMixedModels = apiError{http.StatusBadRequest, "invalid_request_error", "batch_mixed_models",
 		"한 배치의 요청은 모두 같은 모델을 써야 해요. 모델마다 배치를 나눠 보내 주세요."}
@@ -194,6 +204,13 @@ func (s *Server) readMessagesBatch(w http.ResponseWriter, r *http.Request, id st
 		c.refuse(errBatchNotFinished, spool.StatusBadRequest)
 		return
 	}
+	// The vendor validates a whole batch before running it, and one bad
+	// request fails all of it with a batch-level error and no results; the
+	// Anthropic shape has no place for that, so it is the answer here.
+	if !batch.resultsPresent && batch.ErrMsg != "" {
+		c.refuse(errBatchFailed(batch.ErrMsg), spool.StatusBadRequest)
+		return
+	}
 	var out bytes.Buffer
 	for _, item := range batch.Results {
 		line, err := json.Marshal(anthropicResultLine(item, batch.Status))
@@ -302,6 +319,8 @@ type vendorBatch struct {
 	Failed         int
 	Results        []vendorBatchResult
 	resultsPresent bool
+	// ErrMsg is the vendor's batch-level error, bounded.
+	ErrMsg string
 }
 
 type vendorBatchResult struct {
@@ -330,6 +349,15 @@ func (b *vendorBatch) UnmarshalJSON(raw []byte) error {
 		b.Total = int(jsonInt(counts["total"]))
 		b.Completed = int(jsonInt(counts["completed"]))
 		b.Failed = int(jsonInt(counts["failed"]))
+	}
+	var batchErr struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(m["error"], &batchErr) == nil {
+		b.ErrMsg = batchErr.Message
+		if len(b.ErrMsg) > batchErrorMax {
+			b.ErrMsg = b.ErrMsg[:batchErrorMax]
+		}
 	}
 	var results []json.RawMessage
 	if json.Unmarshal(m["results"], &results) == nil && results != nil {

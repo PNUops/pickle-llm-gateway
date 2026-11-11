@@ -691,7 +691,7 @@ workspace 단위로 묶으므로, 어느 Key가 만든 객체인지는 관리 AP
 - 벤더가 제출을 받았을 수 있는 뒤의 실패에는 `X-Should-Retry: false`를 붙여요. SDK가 자동으로 다시
   보내면 배치가 두 번 만들어지고 두 번 과금되기 때문이에요.
 - 카탈로그 모델 중 다른 이름이나 다른 업스트림으로 서빙되는 모델은 배치로 보낼 수 없어요(400
-  `model_not_available_on_route`). 모델의 출력 상한을 넘는 `max_tokens`는 채팅처럼 거절해요.
+  `model_not_available_on_route`). 모델의 출력 상한을 넘는 `max_tokens`는 채팅처럼 거절하고, 상한을 지정하지 않은 요청에는 모델 상한을 넣어요.
 - 금액은 실패, 만료, 취소로 끝난 배치에서도 `usage.cost`가 있으면 기록해요. 끝난 배치를 상태 조회나
   목록으로 한 번이라도 읽을 때 기록하므로, 끝난 뒤 한 번도 읽지 않은 배치의 금액은 사용량 기록에
   남지 않아요(벤더 키의 금액 한도에는 그대로 반영돼요). `usage`의 멤버 형식이
@@ -702,6 +702,10 @@ workspace 단위로 묶으므로, 어느 Key가 만든 객체인지는 관리 AP
 - 목록이 다섯 쪽을 읽고도 끝나지 않으면 `truncated: true`를 붙여요. 이 Key의 배치를 하나도 찾지 못한
   채 멈췄다면 `created_after`나 `created_before`로 범위를 좁혀 다시 조회해 주세요.
 - 관리 API 연결(`LLMGW_CONTROL_BASE_URL`, `LLMGW_CONTROL_TOKEN`)이 없으면 배치와 동영상 경로는 503이에요.
+
+배치를 받는 모델은 벤더가 정해요. 같은 회사 모델이라도 플랫폼 과금 배치가 있는 모델과 사업 계정의
+자체 공급사 키(BYOK)가 있어야 하는 모델이 있어요. 벤더가 이런 모델을 404로 거절하면 400
+`batch_model_unavailable`로 답해요.
 
 **Anthropic 형식 배치.** `/v1/messages/batches`는 Anthropic SDK의 `client.messages.batches`가 부르는
 경로예요. 벤더에는 이 경로가 없어서, 같은 배치를 `/v1/messages` 대상 배치로 바꿔 제출하고 응답을
@@ -714,6 +718,8 @@ workspace 단위로 묶으므로, 어느 Key가 만든 객체인지는 관리 AP
 - 끝난 배치의 `results_url`은 `/v1/messages/batches/{id}/results`예요. SDK가 자기 기본 주소에 이어
   붙여 불러요. 결과 파일은 벤더 배치에 담겨 온 결과를 한 줄에 하나씩 Anthropic 형식
   (`succeeded`, `errored`, `expired`, `canceled`)으로 바꾼 JSONL이에요. 끝나지 않은 배치는 409예요.
+- 벤더는 배치를 실행하기 전에 전체를 검사하고, 요청 하나가 잘못되면 배치 전체를 결과 없이 실패시켜요.
+  이때 결과 경로는 벤더가 알려 준 이유를 담아 400 `batch_failed`로 답해요.
 - 취소(`.../cancel`)는 벤더에 대응 경로가 없어 400 `batch_cancel_unsupported`이고, 목록의
   `before_id`도 400이에요. 목록 한 쪽은 Anthropic처럼 1000개까지 요청할 수 있지만 최대 500개를 돌려줘요.
 - 오류는 Anthropic 오류 형식으로 답하고, Key는 `x-api-key`나 `Authorization: Bearer`로 받아요.

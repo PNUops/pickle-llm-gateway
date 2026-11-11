@@ -275,6 +275,14 @@ func (c *asyncCall) createBatch(endpoint, publicModel string, params map[string]
 	upCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestMaxDuration)
 	defer cancel()
 	resp, ae := c.call(upCtx, http.MethodPost, "/batches", body, batchSubmitPass)
+	if ae != nil && ae.status == http.StatusNotFound {
+		// The vendor has no batch provider it may bill for this model: the
+		// model has no batch variant on the platform, or only on a provider
+		// key the business account does not hold.
+		c.releaseIntent(ownership.KindBatch, intentID)
+		c.refuse(errBatchModelUnavailable, spool.StatusBadRequest)
+		return nil, 0, false
+	}
 	if ae != nil {
 		if submitRefused(ae) {
 			c.releaseIntent(ownership.KindBatch, intentID)
@@ -350,7 +358,8 @@ func (c *asyncCall) fenceBatchBody(field string, body map[string]json.RawMessage
 		}
 	}
 	// The fences judge a copy that names the model, as the request would on
-	// its own route; what is forwarded is the body as sent.
+	// its own route; what is forwarded is the body as sent, with the
+	// model's output bound added below when it names none.
 	judged := make(map[string]json.RawMessage, len(body)+1)
 	for k, v := range body {
 		judged[k] = v
@@ -360,9 +369,23 @@ func (c *asyncCall) fenceBatchBody(field string, body map[string]json.RawMessage
 		judged["model"] = named
 	}
 	lookup := c.lookup()
-	if target.proto != nil && model.MaxOutputTokens > 0 {
+	if target.proto != nil && model.MaxOutputTokens > 0 && len(target.proto.capReadFields) > 0 {
 		// The model's output bound, as chat applies it: a larger cap is
-		// refused rather than forwarded to be billed.
+		// refused rather than forwarded to be billed, and a body naming none
+		// gets the bound written in.
+		capped := false
+		for _, f := range target.proto.capReadFields {
+			if raw, ok := body[f]; ok && string(bytes.TrimSpace(raw)) != "null" {
+				capped = true
+			}
+		}
+		if !capped {
+			field := target.proto.capWriteField
+			if field == "" {
+				field = "max_tokens"
+			}
+			body[field], _ = json.Marshal(model.MaxOutputTokens)
+		}
 		for _, f := range target.proto.capReadFields {
 			raw, ok := body[f]
 			if !ok || string(bytes.TrimSpace(raw)) == "null" {
@@ -754,7 +777,8 @@ func (c *asyncCall) scanOwnedBatches(vendor url.Values, after, cursorName string
 // object: a refusal it answered, not a timeout, a dropped connection or a
 // server error, after which the object may exist.
 func submitRefused(ae *attemptError) bool {
-	if ae.timeout || errors.Is(ae.err, context.DeadlineExceeded) {
+	// A 408 is a timeout on the way, not the vendor declining to create.
+	if ae.timeout || errors.Is(ae.err, context.DeadlineExceeded) || ae.status == http.StatusRequestTimeout {
 		return false
 	}
 	if ae.refusal != nil || ae.throttled {
