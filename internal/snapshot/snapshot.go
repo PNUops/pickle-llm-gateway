@@ -106,6 +106,13 @@ const (
 	// derived from a session value, so two keys can land in the same container.
 	// It stays ungranted until each key gets containers of its own.
 	EndpointContainers = "containers"
+	// EndpointBatches governs the vendor's batch route. A batch also needs
+	// the grant of the endpoint its requests target (chat or embeddings),
+	// which the route checks per batch. Batches take their requests inline,
+	// so this grant does not involve file upload.
+	EndpointBatches = "batches"
+	// EndpointVideos governs the vendor's video generation route.
+	EndpointVideos = "videos"
 )
 
 // reservedModelPrefixes are the prefixes reserved for curated self-serve

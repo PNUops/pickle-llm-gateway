@@ -700,6 +700,14 @@ func TestPassthroughUpstreamRefusals(t *testing.T) {
 		t.Fatalf("402: %d %s", status, body)
 	}
 	h.mock.set(func(o *mockOpts) {
+		o.status = http.StatusForbidden
+		o.errBody = `{"error":{"code":403,"message":"Key limit exceeded (total limit)"}}`
+	})
+	status, body = h.passthrough(t, http.MethodPost, "/v1/images", testToken, imageBody)
+	if status != http.StatusTooManyRequests || errCode(t, body) != "credit_exhausted" {
+		t.Fatalf("key-limit 403: %d %s", status, body)
+	}
+	h.mock.set(func(o *mockOpts) {
 		o.status = http.StatusBadRequest
 		o.errBody = `{"error":{"type":"invalid_request_error"}}`
 	})

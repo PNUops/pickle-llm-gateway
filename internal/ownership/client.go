@@ -7,7 +7,7 @@
 // A submit is recorded in two phases. Intent runs before the vendor call: if
 // the api cannot be reached the vendor is never called, so nothing is spent
 // and nothing exists that nobody owns. Bind runs after the vendor accepted
-// and is retried for about ten seconds, because a bind that never lands
+// and is retried within a twelve-second budget, because a bind that never lands
 // leaves an object its owner cannot reach. Lookups are answered from a cache
 // of confirmed ownership when they can be, and otherwise from the api.
 //
@@ -76,8 +76,9 @@ const maxLookupIDs = 100
 // confirmed ownership is kept five minutes, long enough that a client polling
 // a job asks the api a few times an hour and short enough that a release on
 // another instance is seen soon; ten thousand entries is a couple of MiB.
-// They become configuration when a route wires the client, not before: a knob
-// nothing reads is not documented.
+// The timeout and the bind budget are configuration (LLMGW_OWNERSHIP_TIMEOUT,
+// LLMGW_OWNERSHIP_BIND_BUDGET); the cache bounds are not, since nothing has
+// needed another value.
 const (
 	DefaultTimeout    = 2 * time.Second
 	DefaultCacheTTL   = 5 * time.Minute
@@ -89,8 +90,8 @@ const (
 // cannot be owned, so a lookup answers it absent without asking.
 const maxObjectIDBytes = 255
 
-// defaultBindDelays are the pauses between bind attempts: six attempts over
-// roughly ten seconds with the per-attempt timeout.
+// defaultBindDelays are the pauses between bind attempts: six attempts, the
+// pauses and the per-attempt timeouts held inside the bind budget.
 var defaultBindDelays = []time.Duration{
 	200 * time.Millisecond, 600 * time.Millisecond, 1500 * time.Millisecond,
 	3 * time.Second, 4 * time.Second,

@@ -31,6 +31,9 @@ type attemptError struct {
 	// retryAfter is the vendor's own wait on a 429 or 503, in seconds, empty
 	// when it gave none. It is relayed only on the money axis.
 	retryAfter string
+	// status is the upstream's status when it answered one this function
+	// classified generically, 0 otherwise.
+	status int
 }
 
 // upstreamHealth tracks consecutive failures per upstream so a dead one stops
@@ -361,6 +364,10 @@ type attemptSpec struct {
 	// name forwarded is already the caller's own.
 	upstreamModel string
 	publicModel   string
+	// pass names statuses besides 200 that come back as a response for the
+	// caller to read rather than being classified here: an async submit's
+	// 201 or 202, and the 404, 409 and 410 an object route acts on itself.
+	pass map[int]bool
 }
 
 // attemptFor is the shape of one call on a surface for a model. Client
@@ -448,7 +455,7 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		}
 		return nil, &attemptError{err: err, timeout: timedOut, kind: kind}
 	}
-	if resp.StatusCode == http.StatusOK {
+	if resp.StatusCode == http.StatusOK || spec.pass[resp.StatusCode] {
 		return resp, nil
 	}
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, rejectionReadLimit))
@@ -473,6 +480,13 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		return nil, &attemptError{err: errUpstreamThrottled, throttled: true, kind: kind,
 			retryAfter: upstreamRetryAfter(resp.Header)}
 	case http.StatusUnauthorized, http.StatusForbidden:
+		if creditAxis && resp.StatusCode == http.StatusForbidden && keyLimitSpent(detail) {
+			// The key's own vendor limit is spent. The vendor says so with a
+			// 403 rather than a 402, but it is the same fact as the 402 below
+			// and gets the same answer: the student's budget, not a fault,
+			// so no retry and nothing toward the shared upstream's cooldown.
+			return nil, &attemptError{refusal: &errCreditExhausted, kind: failureCreditExhausted}
+		}
 		// Our credential, not the student's problem — and not something a
 		// retry fixes. Fall through to another upstream if one exists.
 		kind := failureCredential
@@ -501,12 +515,34 @@ func (s *Server) do(ctx context.Context, up config.Upstream, spec attemptSpec) (
 		if resp.StatusCode >= http.StatusInternalServerError {
 			kind = failureUpstream
 		}
-		ae := &attemptError{err: errUpstreamStatus, kind: kind}
+		ae := &attemptError{err: errUpstreamStatus, kind: kind, status: resp.StatusCode}
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			ae.retryAfter = upstreamRetryAfter(resp.Header)
 		}
 		return nil, ae
 	}
+}
+
+// keyLimitSpent reports whether a vendor 403 is the per-key limit running
+// out rather than a refused credential, a guardrail or a moderation block.
+// OpenRouter names the source in error.metadata.limit_source, and its message
+// opens with "Key limit exceeded" (observed: "Key limit exceeded (total
+// limit)"). Either is enough; anything else keeps the credential meaning.
+// Workspace and guardrail budgets are not the key's own and do not match.
+func keyLimitSpent(detail []byte) bool {
+	var body struct {
+		Error struct {
+			Message  string `json:"message"`
+			Metadata struct {
+				LimitSource string `json:"limit_source"`
+			} `json:"metadata"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(detail, &body) != nil {
+		return false
+	}
+	return body.Error.Metadata.LimitSource == "openrouter_key_limit" ||
+		strings.HasPrefix(body.Error.Message, "Key limit exceeded")
 }
 
 // upstreamReason reduces an upstream's error body to the part that is safe to

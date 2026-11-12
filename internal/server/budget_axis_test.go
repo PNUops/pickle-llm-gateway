@@ -641,3 +641,64 @@ func TestOneKeyCanHoldEveryGatewaySlot(t *testing.T) {
 		t.Fatalf("the holding call ended %d", got)
 	}
 }
+
+// OpenRouter answers a spent per-key limit with a 403, not a 402. It is the
+// same fact as the 402 above and gets the same answer, whichever of the two
+// documented signals the body carries.
+func TestKeyLimit403IsACreditRefusal(t *testing.T) {
+	for _, errBody := range []string{
+		`{"error":{"code":403,"message":"Key limit exceeded (total limit). Manage it using https://openrouter.ai/settings/keys"}}`,
+		`{"error":{"code":403,"message":"Budget limit exceeded.","metadata":{"limit_source":"openrouter_key_limit"}}}`,
+	} {
+		h := newHarness(t, creditDoc, func(c *config.Config) { c.UpstreamRetries = 1 })
+		h.mock.set(func(u *mockOpts) { u.status = 403; u.errBody = errBody })
+
+		status, body := h.chat(t, testToken, creditChatBody)
+
+		if status != 429 || errCode(t, body) != "credit_exhausted" {
+			t.Fatalf("key-limit 403: got %d %s", status, body)
+		}
+		if h.mock.callCount() != 1 {
+			t.Fatalf("a key-limit 403 was retried: %d upstream calls", h.mock.callCount())
+		}
+		if n := h.srv.health.failures["mock"]; n != 0 {
+			t.Fatalf("a key-limit 403 counted %d toward the upstream cooldown", n)
+		}
+		evs := h.spoolEvents(t)
+		if len(evs) == 0 {
+			t.Fatal("no usage event was spooled")
+		}
+		if last := evs[len(evs)-1]; last.Status != "RATE_LIMITED" {
+			t.Fatalf("event recorded as %q, want RATE_LIMITED", last.Status)
+		}
+	}
+}
+
+// Any other 403 is still a refused credential: an upstream fault, retried and
+// counted, and so is a key-limit 403 on a TOKEN-axis model, where the key is
+// the platform's own.
+func TestOtherForbiddenStaysAnUpstreamFault(t *testing.T) {
+	for _, tc := range []struct {
+		name, errBody, chat string
+	}{
+		{"credential", `{"error":{"code":403,"message":"Forbidden"}}`, creditChatBody},
+		{"guardrail", `{"error":{"code":403,"message":"Request blocked: prompt injection patterns detected"}}`, creditChatBody},
+		{"workspace budget", `{"error":{"code":403,"message":"Budget limit exceeded (weekly limit).","metadata":{"limit_source":"openrouter_workspace_budget"}}}`, creditChatBody},
+		{"token axis", `{"error":{"code":403,"message":"Key limit exceeded (total limit)"}}`, chatBody},
+	} {
+		h := newHarness(t, creditDoc, func(c *config.Config) { c.UpstreamRetries = 1 })
+		h.mock.set(func(u *mockOpts) { u.status = 403; u.errBody = tc.errBody })
+
+		status, body := h.chat(t, testToken, tc.chat)
+
+		if status != 502 || errCode(t, body) != "upstream_error" {
+			t.Fatalf("%s: got %d %s", tc.name, status, body)
+		}
+		if h.mock.callCount() != 2 {
+			t.Fatalf("%s: want the retry, got %d upstream calls", tc.name, h.mock.callCount())
+		}
+		if n := h.srv.health.failures["mock"]; n != 2 {
+			t.Fatalf("%s: counted %d failures toward the cooldown, want 2", tc.name, n)
+		}
+	}
+}
